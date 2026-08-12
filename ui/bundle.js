@@ -444,7 +444,18 @@
     // was running as it said so. Nothing in Rill knows the wall clock; only the caller does.
     var freshness = "SELECT max(created_at) AS last_activity FROM src_fct_message";
 
-    return [cost, external, timing, peers, order, modelTiming, presence, freshness];
+    // WHICH STEP TIMELINE THIS CARD GOT. Two sources with very different trustworthiness:
+    // Kandev's real transition ledger (exact intervals, sees manual moves) or the old
+    // reconstruction from message stamps (approximate, blind to manual moves, and blind to
+    // everything before a session's first stamp). A reader deciding whether to act on a
+    // per-step figure should know which one produced it.
+    var stepSource =
+      "SELECT max(CASE WHEN p.basis LIKE 'ledger%' THEN 1 ELSE 0 END) AS from_ledger," +
+      " max(CASE WHEN p.basis = 'message stamp' THEN 1 ELSE 0 END) AS from_stamps" +
+      " FROM kandev_step_points p JOIN src_dim_session s ON s.session_id = p.session_id" +
+      " WHERE s.task_id = '" + id + "'";
+
+    return [cost, external, timing, peers, order, modelTiming, presence, freshness, stepSource];
   }
 
   // Below this much recorded agent time, a throughput figure is one or two turns' luck and is
@@ -482,8 +493,16 @@
    * null, and null always means "could not read", never "no rows".
    */
   function assembleLedger(cost, external, timing, peers, order, modelTiming, presence,
-                                 freshness) {
+                                 freshness, stepSource) {
     var snapshotAt = freshness && freshness.length ? freshness[0].last_activity || null : null;
+    var src = stepSource && stepSource.length ? stepSource[0] : null;
+    // "ledger" | "stamps" | "mixed" | null. Mixed means a card whose sessions straddle the
+    // 2026-08-12 cutover; its rail is part exact and part reconstructed.
+    var stepBasis = !src ? null
+      : Number(src.from_ledger || 0) && Number(src.from_stamps || 0) ? "mixed"
+      : Number(src.from_ledger || 0) ? "ledger"
+      : Number(src.from_stamps || 0) ? "stamps"
+      : null;
     // The cost query decides whether the panel can say anything at all. A null answer means
     // the read was refused, not that the task was free.
     if (cost === null) return { state: "blocked" };
@@ -681,6 +700,7 @@
       out: sum("out"),
       peers: (peers && peers[0]) || null,
       snapshotAt: snapshotAt,
+      stepBasis: stepBasis,
       models: models,
       profiles: profiles,
       undefinedSteps: undefinedSteps,
@@ -764,7 +784,8 @@
     var run = query || rillQuery;
     return Promise.all(ledgerQueries(taskId).map(function (sql) { return run(sql); }))
       .then(function (res) {
-        return assembleLedger(res[0], res[1], res[2], res[3], res[4], res[5], res[6], res[7]);
+        return assembleLedger(res[0], res[1], res[2], res[3], res[4], res[5], res[6], res[7],
+                              res[8]);
       });
   }
 
@@ -1586,7 +1607,21 @@
           // handling time, and any step placed by it is inferred from a window, not recorded.
           jsx("div", null, "Kandev records no step and no turn on a cost event, and timestamps " +
             "it when an async subscriber handles it rather than when the spend occurred. Steps " +
-            "here are inferred from that window; no per-turn figure exists."),
+            "here are placed by that window; no per-turn figure exists."),
+          // WHICH TIMELINE PRODUCED THIS RAIL. Not decoration: on ledger sessions 83% of spend
+          // lands in a single step exactly and none is unattributable; on stamp sessions that
+          // is 58%, with 38% majority verdicts and 5% unplaceable.
+          data.stepBasis === "ledger"
+            ? jsx("div", null, "Steps come from Kandev's transition ledger — exact intervals, " +
+                "including manual moves.")
+            : data.stepBasis === "stamps"
+              ? jsx("div", null, "Kandev recorded no transitions for this card's sessions, so " +
+                  "steps are reconstructed from workflow message stamps: approximate, and " +
+                  "blind to manual card moves.")
+              : data.stepBasis === "mixed"
+                ? jsx("div", null, "This card straddles the transition-ledger cutover — some " +
+                    "sessions have exact intervals, others are reconstructed from message stamps.")
+                : null,
           data.verdict > 0
             ? jsx("div", null, fmtUsd(data.verdict) + " of that billed windows covering more " +
                 "than one step — those labels (dotted) are a majority verdict, not a fact.")

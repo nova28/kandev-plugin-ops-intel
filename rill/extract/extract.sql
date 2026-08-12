@@ -136,6 +136,41 @@ LEFT JOIN workflows wf ON wf.id = ws.workflow_id;
 
 
 -- ---------------------------------------------------------------------------
+-- fct_step_transition — the REAL step-transition ledger. One row per transition.
+--
+-- This table was zero rows for the entire life of the analysis that built this project, and
+-- everything downstream was engineered around its absence: the step timeline was
+-- reconstructed from `workflow_step_name` stamps that Kandev writes only when the workflow
+-- ENGINE injects a message, which covered ~400 messages across 42 of 67 sessions and could
+-- never see a human dragging a card.
+--
+-- It started filling on 2026-08-12 (kandev `feature/wire-session-step-hi-u06`, now on
+-- local/integration). It records what the stamps could not:
+--
+--   * `from_step_id` — so the step a session was in BEFORE its first transition is knowable,
+--     which is exactly the window that used to swallow spend. One card put $74.87 there.
+--   * `trigger` — 'manual' vs 'auto_complete'. Manual moves are invisible to message stamps
+--     by construction, and they are half the rows.
+--
+-- Step IDs, not names: joined to dim_workflow_step downstream rather than flattened here,
+-- because a step can be renamed and the id is the stable key.
+--
+-- `metadata` is NOT selected. It is free-form TEXT and this file's whitelist rule applies:
+-- an identifier, a timestamp, a number, or a low-cardinality enum — otherwise it is prose.
+-- ---------------------------------------------------------------------------
+.output data/fct_step_transition.csv
+SELECT
+    h.id                                              AS transition_id,
+    h.session_id                                      AS session_id,
+    COALESCE(h.from_step_id, '')                      AS from_step_id,
+    h.to_step_id                                      AS to_step_id,
+    COALESCE(NULLIF(h.trigger, ''), '(none)')         AS trigger,
+    CASE WHEN COALESCE(h.actor_id, '') <> '' THEN 'yes' ELSE 'no' END AS has_actor,
+    strftime('%Y-%m-%dT%H:%M:%SZ', h.created_at)      AS occurred_at
+FROM session_step_history h;
+
+
+-- ---------------------------------------------------------------------------
 -- dim_session — one row per agent session.
 --
 -- `cost_subcents` / `tokens_in` / `tokens_out` are carried ONLY so the Rill layer can

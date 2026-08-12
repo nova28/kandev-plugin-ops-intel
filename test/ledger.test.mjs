@@ -291,12 +291,12 @@ test("a task id carrying a quote cannot break out of the SQL", () => {
 
 test("every per-card query names a task id, so none can scan the whole store", () => {
   var qs = ledgerQueries("task-1");
-  assert.equal(qs.length, 8);
+  assert.equal(qs.length, 9);
   // All but the last are per-card and must say so. The last is the snapshot-freshness probe:
   // a global property of the extract, not of any card, so it cannot be task-scoped. It is
   // carved out by name rather than by loosening the check, which is the whole guard against
   // a per-card query quietly becoming a full scan.
-  qs.slice(0, 7).forEach((sql, i) => {
+  qs.slice(0, 7).concat([qs[8]]).forEach((sql, i) => {
     assert.ok(sql.includes("task-1"), `query ${i} is not scoped to the task`);
   });
   var freshness = qs[7];
@@ -432,4 +432,34 @@ test("spend whose account came from the session is counted separately", () => {
   var r = assembleLedger(cost, [], [], [], ORDER, []);
   assert.equal(r.inferredProfile, 400, "only the half read off the session");
   assert.equal(r.total, 1000);
+});
+
+// ---------------------------------------------------------------------------------------
+// Step-timeline source. Two sources with different trustworthiness — on ledger sessions 83%
+// of spend lands in one step exactly and none is unplaceable; on stamp sessions that is 58%,
+// with 38% majority verdicts. A reader acting on a per-step figure must know which they got.
+// ---------------------------------------------------------------------------------------
+
+function withSource(rows) {
+  var cost = [costRow("Build", "sonnet", 100, "2026-08-08T15:00:00Z")];
+  return assembleLedger(cost, [], [], [], ORDER, [], [{ in_snapshot: 1 }], [], rows);
+}
+
+test("a card whose steps come from the ledger says so", () => {
+  assert.equal(withSource([{ from_ledger: 1, from_stamps: 0 }]).stepBasis, "ledger");
+});
+
+test("a card still on reconstructed message stamps says so", () => {
+  assert.equal(withSource([{ from_ledger: 0, from_stamps: 1 }]).stepBasis, "stamps");
+});
+
+test("a card straddling the cutover is reported as mixed, not as either one", () => {
+  // Claiming "exact" for a card that is half reconstructed would be the worst of the three.
+  assert.equal(withSource([{ from_ledger: 1, from_stamps: 1 }]).stepBasis, "mixed");
+});
+
+test("no step points at all yields null, not a false claim of exactness", () => {
+  assert.equal(withSource([{ from_ledger: 0, from_stamps: 0 }]).stepBasis, null);
+  assert.equal(withSource([]).stepBasis, null);
+  assert.equal(withSource(null).stepBasis, null);
 });

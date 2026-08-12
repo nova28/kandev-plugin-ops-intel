@@ -1,0 +1,12 @@
+# Raw extract, loaded verbatim. All derivation happens downstream in the kandev_* models,
+# so this file never needs editing when the analysis changes.
+#
+# The REAL step-transition ledger — `session_step_history`, which was zero rows until
+# 2026-08-12 and is what `kandev_step_points` now prefers over reconstructed message stamps.
+# Carries `from_step_id` (so the pre-first-transition window is knowable) and `trigger`
+# ('manual' vs 'auto_complete'), neither of which the stamp reconstruction could see.
+type: model
+
+connector: local_file
+path: data/fct_step_transition.csv
+invalidate_on_change: true

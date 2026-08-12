@@ -45,7 +45,7 @@ mkdir -p "$WORK/data"
 
 # Promote only if every expected file arrived. A missing file here means extract.sql
 # failed partway, and a partial promotion is the failure mode worth engineering against.
-EXPECTED=(dim_task.csv dim_workflow_step.csv dim_session.csv fct_turn.csv fct_cost_event.csv fct_pull_request.csv fct_git_snapshot.csv fct_plan_revision.csv fct_message.csv _manifest.csv)
+EXPECTED=(dim_task.csv dim_workflow_step.csv fct_step_transition.csv dim_session.csv fct_turn.csv fct_cost_event.csv fct_pull_request.csv fct_git_snapshot.csv fct_plan_revision.csv fct_message.csv _manifest.csv)
 for f in "${EXPECTED[@]}"; do
     [[ -s "$WORK/data/$f" ]] || { echo "error: extract produced no $f — not promoting" >&2; exit 1; }
 done

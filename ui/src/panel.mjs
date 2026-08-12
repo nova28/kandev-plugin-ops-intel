@@ -715,7 +715,21 @@ export function createTaskCostPanel(host) {
         // handling time, and any step placed by it is inferred from a window, not recorded.
         jsx("div", null, "Kandev records no step and no turn on a cost event, and timestamps " +
           "it when an async subscriber handles it rather than when the spend occurred. Steps " +
-          "here are inferred from that window; no per-turn figure exists."),
+          "here are placed by that window; no per-turn figure exists."),
+        // WHICH TIMELINE PRODUCED THIS RAIL. Not decoration: on ledger sessions 83% of spend
+        // lands in a single step exactly and none is unattributable; on stamp sessions that
+        // is 58%, with 38% majority verdicts and 5% unplaceable.
+        data.stepBasis === "ledger"
+          ? jsx("div", null, "Steps come from Kandev's transition ledger — exact intervals, " +
+              "including manual moves.")
+          : data.stepBasis === "stamps"
+            ? jsx("div", null, "Kandev recorded no transitions for this card's sessions, so " +
+                "steps are reconstructed from workflow message stamps: approximate, and " +
+                "blind to manual card moves.")
+            : data.stepBasis === "mixed"
+              ? jsx("div", null, "This card straddles the transition-ledger cutover — some " +
+                  "sessions have exact intervals, others are reconstructed from message stamps.")
+              : null,
         data.verdict > 0
           ? jsx("div", null, fmtUsd(data.verdict) + " of that billed windows covering more " +
               "than one step — those labels (dotted) are a majority verdict, not a fact.")
