@@ -1,0 +1,13 @@
+# Raw extract, loaded verbatim. All derivation happens downstream in the kandev_* models,
+# so this file never needs editing when the analysis changes.
+#
+# DELIBERATELY HAS NO DOWNSTREAM MODEL OR METRICS VIEW. Plan revisions are an exploratory
+# feature: 47% card coverage, and a count that may reflect autosave, card duration or agent
+# profile rather than rework. Loading it makes it queryable for the analysis that would
+# establish whether it predicts anything; publishing a measure would skip that step and put a
+# number on a dashboard that nobody has shown means what its name implies.
+type: model
+
+connector: local_file
+path: data/fct_plan_revision.csv
+invalidate_on_change: true

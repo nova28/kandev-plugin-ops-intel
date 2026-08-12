@@ -1,0 +1,221 @@
+# One row per metered cost event — the ONLY trustworthy cost and token grain in this store.
+#
+# Do not be tempted back to `task_sessions.tokens_in`. That rollup column excludes cached
+# input entirely and understates real input volume by >99.99%; on one measured card it read
+# 481 against an actual 98,805,109. It is the obvious column and it is wrong by roughly five
+# orders of magnitude. `src_dim_session` carries it only so the data-quality view can show
+# the gap, and it is named `rollup_tokens_in_UNTRUSTED` there for that reason.
+#
+# 1 subcent = $0.0001, read from Kandev's own frontend currency formatter. It was previously
+# back-derived from token prices and that answer was wrong by 10x — an undocumented unit is
+# not something to infer from a plausible-looking arithmetic check.
+#
+# STEP ATTRIBUTION: WHY THIS IS NOT AN ASOF JOIN ANY MORE.
+#
+# It used to be `ASOF JOIN ... ON occurred_at >= effective_from` — attribute the spend to the
+# most recent step stamp at or before the event. That is wrong, and measurably so. Cost events
+# are FLUSHED AT A STEP TRANSITION: 122 of the 313 New Feature Dev events — $1,409 of $2,787 —
+# carry a timestamp equal to a step stamp to the second. An ASOF join resolves that tie in
+# favour of the step being ENTERED, so every flush was billed to the step that had just
+# started and had by definition done no work yet. One event stamped 2026-08-09T17:19:21
+# carried 156M cached-input and 196k output tokens against a window that had been in Build
+# since 16:12. The tokens cannot have been spent by a step that began at the instant the event
+# was written.
+#
+# The visible damage: `Testing` read $797 and ranked first in the New Feature Dev step table
+# while actually costing $331 and ranking third; `Build` read $771 against an actual $924. On
+# a workflow that cycles Build → Testing → Review → Build (one card did it 19 times in 26
+# hours) the error is systematic — spend is shifted one hop forward around the loop, every
+# loop.
+#
+# WHAT REPLACES IT. An event bills the work done since the previous event in the same session,
+# so the question is which step owned that WINDOW, not which stamp is nearest. The window runs
+# from the previous cost event (or, for a session's first event, the session start) to the
+# event itself, and is attributed to the step that holds the most messages inside it.
+#
+# Two things about that choice:
+#
+#   * It is a SUMMARY of a window that may span several steps — 142 of 668 events do — not a
+#     claim that the whole window was one step. `step_attribution_basis` says which case a row
+#     is, so a reader can see when the label is a majority verdict rather than a fact. Fully
+#     apportioning each event across the steps it covers, weighted the same way, moves the New
+#     Feature Dev step totals by under 1% ($922 vs $924 for Build, $331 vs $331 for Testing) —
+#     not enough to justify breaking the one-row-per-cost-event grain that `cost_events`,
+#     `kandev_cards` and `kandev_step_diagnostics` all count on.
+#
+#   * Message count is a proxy for model round-trips, not a meter. It is the only per-step
+#     volume signal in the store — `office_cost_events` has no turn_id and never will.
+#
+# 17 events lose attribution entirely under this rule (503 attributed, down from 520): their
+# only stamp is at or after the event, so nothing is known to have preceded them. That is the
+# honest answer, and it is what `step_attributed = 'no'` is for.
+#
+# `kandev_turns` keeps its ASOF join and should. A turn's work happens AFTER its `started_at`,
+# so a turn that starts at the same second as a stamp really does belong to the step being
+# entered. The tie breaks the other way for cost because a cost event looks backwards.
+type: model
+materialize: true
+
+sql: |
+  WITH
+  -- The window an event bills: from the previous event in the same session to this one. A
+  -- session's first event falls back to the session start; if that is missing too the window
+  -- collapses to the instant, which no slice can dominate, and the row goes unattributed.
+  win AS (
+      SELECT
+          e.cost_event_id,
+          e.session_id,
+          e.occurred_at,
+          COALESCE(
+              LAG(e.occurred_at) OVER (PARTITION BY e.session_id ORDER BY e.occurred_at),
+              s.session_started_at,
+              e.occurred_at
+          ) AS window_from
+      FROM src_fct_cost_event e
+      LEFT JOIN src_dim_session s ON s.session_id = e.session_id
+  ),
+  -- The step timeline as half-open intervals. The last slice of a session stays open.
+  slice AS (
+      SELECT
+          session_id,
+          step,
+          effective_from,
+          LEAD(effective_from) OVER (PARTITION BY session_id ORDER BY effective_from) AS effective_to
+      FROM kandev_step_points
+  ),
+  -- Every step slice overlapping an event's window, clipped to the overlap. `effective_from <
+  -- occurred_at` is the strict inequality that stops a same-instant flush from being billed to
+  -- the step it is announcing. It is sufficient because extract.sql formats every timestamp
+  -- with `strftime('%Y-%m-%dT%H:%M:%SZ', ...)` — whole seconds, so a flush and the stamp it
+  -- accompanies land on the identical value rather than milliseconds apart. Keep that
+  -- truncation if you touch the extractor, or this needs a tolerance instead.
+  cover AS (
+      SELECT
+          w.cost_event_id,
+          w.session_id,
+          sl.step,
+          sl.effective_from,
+          GREATEST(w.window_from, sl.effective_from)                          AS overlap_from,
+          LEAST(w.occurred_at, COALESCE(sl.effective_to, w.occurred_at))      AS overlap_to
+      FROM win w
+      JOIN slice sl
+        ON  sl.session_id     = w.session_id
+        AND sl.effective_from < w.occurred_at
+        AND COALESCE(sl.effective_to, TIMESTAMP '9999-12-31') > w.window_from
+  ),
+  weighted AS (
+      SELECT
+          cv.cost_event_id,
+          cv.step,
+          cv.effective_from,
+          COUNT(m.message_id) AS msgs
+      FROM cover cv
+      LEFT JOIN src_fct_message m
+        ON  m.session_id  = cv.session_id
+        AND m.created_at  > cv.overlap_from
+        AND m.created_at <= cv.overlap_to
+      GROUP BY 1, 2, 3
+  ),
+  -- Majority verdict. The tie-break on `effective_from DESC` means a window with no messages
+  -- at all degrades to the latest step in it, which is the old behaviour.
+  attributed AS (
+      SELECT
+          cost_event_id,
+          step,
+          COUNT(*) OVER (PARTITION BY cost_event_id) AS steps_in_window
+      FROM weighted
+      QUALIFY ROW_NUMBER() OVER (
+          PARTITION BY cost_event_id ORDER BY msgs DESC, effective_from DESC
+      ) = 1
+  )
+  SELECT
+      c.cost_event_id,
+      c.occurred_at,
+      c.session_id,
+      c.task_id,
+
+      c.model,
+      c.provider,
+      -- THE ACCOUNT THE SPEND BILLED TO, falling back to the session's profile.
+      --
+      -- `office_cost_events.agent_profile_id` is null on 353 of 669 events — $2,161 of
+      -- $4,964, more than the recorded half — so reading it alone reports "(none)" for most
+      -- of the money on a machine running several accounts, which is the one question the
+      -- column exists to answer.
+      --
+      -- 248 of those 353 ($1,341) belong to a session that DOES carry a profile, and a
+      -- session runs under one profile for its whole life, so the session's answer is the
+      -- event's answer. That lifts account coverage from 56% of spend to 84%.
+      --
+      -- The remaining 105 events ($820.41) have no session either. That is not a coincidence:
+      -- it is exactly the orphaned-spend bucket below — cost events outliving the cards and
+      -- sessions they belonged to. Nothing can recover those, so they stay '(none)'.
+      --
+      -- `agent_profile_basis` publishes which of the three a row is, because a profile read
+      -- off the event is a fact and one inherited from the session is an inference — a sound
+      -- one, but a reader deciding whose bill to query should be able to see the difference.
+      COALESCE(
+          NULLIF(c.agent_profile, '(none)'),
+          NULLIF(s.agent_profile, '(none)'),
+          '(none)'
+      ) AS agent_profile,
+      CASE
+          WHEN COALESCE(c.agent_profile, '(none)') <> '(none)' THEN 'on the cost event'
+          WHEN COALESCE(s.agent_profile, '(none)') <> '(none)' THEN 'inherited from the session'
+          ELSE                                                      'unrecorded'
+      END AS agent_profile_basis,
+      -- 'metered' | 'estimated'. An estimated row is the provider's guess, not a bill.
+      c.token_basis,
+
+      c.tokens_in,
+      c.tokens_cached_in,
+      c.tokens_out,
+      c.tokens_in + c.tokens_cached_in AS tokens_input_total,
+      c.cost_subcents,
+
+      d.workspace,
+      d.workflow,
+      d.current_step,
+      d.stage_type,
+      d.task_title,
+      d.task_state,
+      d.priority,
+      d.origin,
+      d.autopilot_enabled,
+      d.is_child_task,
+
+      s.repository,
+      s.base_branch,
+      s.session_state,
+      s.review_status,
+
+      -- Cost events OUTLIVE the cards they belong to: deleting a card leaves its spend in the
+      -- ledger with a task_id that no longer resolves. 17% of all spend in this store is in
+      -- that state. Every per-card view silently drops it, so the orphan rate is published as
+      -- a dimension — a card-level total that quietly excludes a sixth of the money is worse
+      -- than one that shows the hole.
+      CASE
+          WHEN c.task_id IS NULL OR c.task_id = '' THEN 'no task_id recorded'
+          WHEN d.task_id IS NULL                   THEN 'orphaned — card deleted'
+          ELSE                                          'attributed to a card'
+      END AS cost_attribution,
+
+      -- Which step owned the window this event bills. See the attribution note in the header —
+      -- this is what makes "what does Review cost" answerable at all, because the cost table
+      -- has no step column and the card's `current_step` is where the card ended up, not where
+      -- the money went.
+      COALESCE(a.step, '(step not attributable)') AS step_at_event,
+      CASE WHEN a.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
+
+      -- Whether that label is a fact about the window or a majority verdict over a window that
+      -- crossed a step boundary. Read it before quoting a single step's total as exact.
+      CASE
+          WHEN a.step IS NULL          THEN 'not attributable'
+          WHEN a.steps_in_window = 1   THEN 'window sat in one step'
+          ELSE                              'dominant of ' || a.steps_in_window || ' steps in window'
+      END AS step_attribution_basis
+
+  FROM src_fct_cost_event c
+  LEFT JOIN src_dim_task    d ON d.task_id    = c.task_id
+  LEFT JOIN src_dim_session s ON s.session_id = c.session_id
+  LEFT JOIN attributed      a ON a.cost_event_id = c.cost_event_id

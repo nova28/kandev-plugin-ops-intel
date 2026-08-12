@@ -1,0 +1,15 @@
+compiler: rillv1
+
+display_name: Kandev operational telemetry
+
+olap_connector: duckdb
+
+# `/extract` holds the SQLite -> CSV extractor. Rill parses every .sql file in the project
+# as a model, and extract.sql is SQLite dot-command script, not a DuckDB SELECT — without
+# this it fails the build with a syntax error that reads like a broken model.
+#
+# `/data` is the extractor's output. The models load those CSVs explicitly by path, so
+# leaving the directory parseable only invites Rill to also auto-detect them as sources.
+ignore_paths:
+  - /extract
+  - /data

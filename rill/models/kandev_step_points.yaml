@@ -1,0 +1,21 @@
+# The step timeline: every point at which a card was observed to be in a named step.
+#
+# This exists so cost and turns — neither of which records a step — can be attributed to one
+# by asking "which step was this session in at that instant". Downstream models ASOF-join
+# against it.
+#
+# It is a reconstruction, and its resolution is exactly as good as how often Kandev happens
+# to stamp a step onto a message: ~400 stamps across 42 of 67 sessions. A step that was
+# entered and left without a single stamped message is invisible, and a cost event before a
+# session's first stamp attributes to nothing. Both cases are labelled downstream rather than
+# guessed.
+type: model
+materialize: true
+
+sql: |
+  SELECT
+      session_id,
+      created_at AS effective_from,
+      stamped_step AS step
+  FROM src_fct_message
+  WHERE stamped_step IS NOT NULL

@@ -1,0 +1,11 @@
+.DS_Store
+
+# Rill
+.env
+tmp
+
+# Extractor output. Regenerable in seconds from any Kandev store via extract/extract.sh,
+# and not ours to commit: it is derived operational data carrying card titles, repo-relative
+# file paths and scratch directory names from a live machine. The extractor is the artifact
+# under review here; its output is a cache.
+data/

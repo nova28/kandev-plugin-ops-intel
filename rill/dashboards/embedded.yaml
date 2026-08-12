@@ -1,0 +1,321 @@
+# The page the Kandev plugin tab embeds. Built to answer five questions and to be worth a
+# tab NEXT TO Kandev's own dashboards rather than instead of them.
+#
+# WHAT KANDEV ALREADY DOES, AND IS NOT REPEATED HERE:
+#   * Settings > Workspace > Costs — spend broken down by model and provider, plus budgets
+#     and budget policy. Total spend per model is THAT page's job; go there for it.
+#   * The agent dashboard — runs succeeded/failed/other per day and a success-rate band.
+#     Deliberately not mirrored: that success signal counts budget-blocked, idle-skipped and
+#     user-pressed-Stop runs as successes, so reproducing it here would launder a number
+#     this project exists to distrust.
+#
+# WHAT THIS ADDS, AND WHY EACH IS ABSENT UPSTREAM:
+#   1. Cost per unit of OUTPUT, not per model total. Kandev groups spend by model; that
+#      answers "which model did I use most", never "which model was expensive".
+#   2. Cost per BUILD STEP. Kandev cannot do this at all — session_step_history is empty.
+#      Reconstructed here from step stamps.
+#   3. Agent time vs idle time. Nothing upstream measures waiting.
+#   4. Anomaly detection. Nothing upstream does this in any form.
+#   5. The two blind spots — external agents (codex) that bill elsewhere, and spend stranded
+#      on deleted cards.
+type: canvas
+
+display_name: Kandev — cost, steps & anomalies
+
+max_width: 1600
+
+filters:
+  pinned:
+    - workspace
+
+time_ranges:
+  - P7D
+  - P14D
+  - P30D
+  - inf
+
+defaults:
+  time_range: inf
+
+rows:
+  - height: 150px
+    items:
+      - width: 12
+        markdown:
+          content: |
+            ## Cost, models, steps and anomalies
+
+            Complements Kandev's built-in views rather than repeating them — **Settings >
+            Workspace > Costs** already gives spend by model and provider. What is here is
+            what that page cannot show: cost **per unit of output**, cost **per build step**
+            (Kandev stores no step on a cost event), the **agent-vs-idle** split, and
+            **anomaly detection**.
+
+            No success or completion rate appears anywhere on this page, deliberately: this
+            store has no outcome label, and the one signal Kandev computes counts
+            user-pressed-Stop as a success.
+
+  # ---------------------------------------------------------------- 1 · costing
+  - height: 200px
+    items:
+      - width: 9
+        kpi_grid:
+          metrics_view: cost_and_tokens
+          measures:
+            - total_cost_usd
+            - usd_per_m_output_tokens
+            - input_per_output_ratio
+            - orphaned_cost_usd
+          sparkline: bottom
+      - width: 3
+        kpi_grid:
+          metrics_view: anomalies
+          measures:
+            - total_anomalies
+            - extreme_count
+          sparkline: bottom
+
+  # ---------------------------------------------------------------- 2 · models
+  - height: 400px
+    items:
+      - width: 5
+        leaderboard:
+          metrics_view: cost_and_tokens
+          title: Model efficiency — not model totals
+          description: >-
+            Sort by "$ per M output tokens", not by spend. The two orderings disagree in this
+            data: the model with the lower list price reads three times the context per token
+            it produces, and ends up costing more per unit of work.
+          dimensions:
+            - model
+          measures:
+            - usd_per_m_output_tokens
+            - input_per_output_ratio
+            - total_cost_usd
+            - output_tokens
+          num_rows: 8
+      - width: 7
+        stacked_bar:
+          metrics_view: cost_and_tokens
+          title: Spend over time by model
+          x:
+            type: temporal
+            field: occurred_at
+          y:
+            type: quantitative
+            field: total_cost_usd
+          color:
+            type: nominal
+            field: model
+
+  # ---------------------------------------------------------------- 3 · build steps
+  #
+  # Full width and one table, because the diagnosis is in the RATIOS between these columns and
+  # not in any one of them. $400 over three long runs and $400 over three hundred six-second
+  # retries are the same total and different problems; only $/turn against turns tells them
+  # apart. Cost and timing used to sit in two half-width tables side by side, which meant
+  # reading a step's number in one and finding the same step's row in the other.
+  - height: 420px
+    items:
+      # A `table`, not a `leaderboard`, specifically so the model can be a COLUMN. A leaderboard
+      # renders one ranked block per dimension — give it two and you get two stacked lists, not
+      # one table with a model column (which is exactly what the anomalies widget below does).
+      - width: 12
+        table:
+          metrics_view: step_diagnostics
+          title: Cost per build step — what drove it
+          description: >-
+            Cost and clock on one row, attributed against the same reconstructed step
+            timeline — turns by where the turn started, cost by which step owned the window
+            the event bills. About a fifth of spend has no step stamp before it and is
+            excluded here. No dollar is attributed to a turn — cost events carry no turn_id —
+            so $/turn is a step-level ratio, not a per-turn bill. A step splits into one row
+            per model where its spend was mixed; "(no metered spend)" is turns billed to
+            another account — codex/agy. Lines come from the branch diffstat between
+            consecutive git snapshots, so a rewritten line counts again and a re-based branch
+            contributes nothing; read $ per 1k lines only on the steps that build, and check
+            the baseline share beside it before quoting a line count.
+          # Ordered for reading left-to-right, not by category: twelve measures overflow even a
+          # full-width table, so the columns that decide what to do next come first and the raw
+          # volumes — which are evidence for those ratios, not findings themselves — go last.
+          columns:
+            - step
+            - top_model
+            - total_cost_usd
+            - usd_per_turn
+            - total_turns
+            - idle_share
+            # Code output sits directly after the effort columns and ahead of the token
+            # volumes: it is the only denominator here that is not itself a measure of
+            # effort. `baseline_line_share` travels immediately beside the line count on
+            # purpose — a step whose lines are mostly a first-snapshot delta has a soft
+            # number, and separating the caveat from the figure is how it gets quoted
+            # without one.
+            - usd_per_1k_lines
+            - lines_added
+            - baseline_line_share
+            - commits_landed
+            - input_per_output_ratio
+            - usd_per_m_output_tokens
+            - avg_turn_minutes
+            - agent_hours
+            - idle_hours
+            # Input before output, in the order the tokens actually flow: context read first
+            # (uncached, then the cache re-reads that dominate it), tokens produced last.
+            - fresh_input_tokens
+            - cached_input_tokens
+            - output_tokens
+          hide_totals_row: false
+
+  # ---------------------------------------------------------------- 4 · turn shape
+  #
+  # Kept alongside the table above rather than folded into it: a median and a p90 cannot be
+  # recovered from a day-grained aggregate, and the distribution is what separates "one run
+  # that hung" from "every run is slow" — which the averages above cannot show.
+  - height: 320px
+    items:
+      - width: 12
+        leaderboard:
+          metrics_view: turn_timing
+          title: Turn length distribution per step
+          description: >-
+            The averages in the table above hide their own shape. A median far below the mean
+            is a few long runs dragging the total; a p90 close to the median is a step that is
+            uniformly slow.
+          dimension_filters: step_attributed IN ('yes')
+          dimensions:
+            - step_at_event
+          measures:
+            - total_turns
+            - median_agent_minutes
+            - p90_agent_minutes
+            - longest_idle_hours
+            - overlapping_turns
+          num_rows: 14
+
+  # ---------------------------------------------------------------- 5 · outcomes
+  #
+  # The only row on this page with a denominator that means shipped work. Everything above
+  # divides money by effort — tokens, turns, hours — which can rank a card that was
+  # abandoned above one that shipped. Placed after the step tables because it reframes them:
+  # a step is only expensive relative to what came out the other end.
+  - height: 150px
+    items:
+      - width: 12
+        markdown:
+          content: |
+            ## What the spend produced
+
+            Card spend joined to GitHub PR state. **Coverage is partial and that is the
+            finding, not a caveat** — most cards never open a PR and are carried below at
+            full cost under "no PR observed" rather than dropped from a denominator. A merged
+            PR is evidence work landed, not that it was correct: nothing here counts a
+            revert or a follow-up fix.
+          alignment:
+            horizontal: left
+            vertical: top
+
+  - height: 200px
+    items:
+      - width: 12
+        kpi_grid:
+          metrics_view: outcomes
+          measures:
+            - cost_per_merged_pr
+            - closed_unmerged_cost_usd
+            - closed_unmerged_share_of_pr_cost
+            - merged_cost_share
+            - usd_per_1k_lines
+          sparkline: none
+
+  - height: 300px
+    items:
+      - width: 12
+        table:
+          metrics_view: outcomes
+          title: Cost by outcome
+          description: >-
+            Read `outcome` before any ratio. "no PR observed" is 55 cards carrying real spend
+            that no cost-per-PR figure represents; "closed unmerged" is work that reached
+            review and did not land — why it did not land is recorded nowhere, so this is a
+            bucket to investigate, not a bill for waste.
+            Deleted-card spend is absent entirely — the card it belonged to is gone, so it
+            cannot be joined to an outcome; the Total cost KPI at the top of this page still
+            counts it.
+          # `usd_per_1k_lines_by_outcome`, NOT `usd_per_1k_lines`: the latter is merged-only, so
+          # it renders blank on the abandoned row and hides the only size-normalised comparison
+          # on this page. Per card the closed-unmerged group looks 5.3x a merged one; per line
+          # it is 1.2x, and the per-card figure is mostly measuring that those two pull requests
+          # were large. Cards and PRs are both shown because they disagree — one pull request
+          # here is shared by two cards.
+          columns:
+            - outcome
+            - cards
+            - merged_prs
+            - total_cost_usd
+            - usd_per_1k_lines_by_outcome
+            - lines_added
+            - lines_deleted
+            - median_hours_to_merge
+            - unresolved_threads
+          hide_totals_row: false
+
+  # ---------------------------------------------------------------- 6 · anomalies
+  - height: 380px
+    items:
+      - width: 4
+        leaderboard:
+          metrics_view: anomalies
+          title: Anomalies by type
+          description: >-
+            Detected with median/MAD robust statistics, threshold z = 3.5. Nothing here means
+            "broken" — only "unlike its peers".
+          dimensions:
+            - anomaly_kind
+            - severity
+          measures:
+            - total_anomalies
+            - max_severity_score
+          num_rows: 12
+      - width: 8
+        table:
+          metrics_view: anomalies
+          title: Triage list — worst first
+          description: Read the evidence column; the score only orders the list.
+          columns:
+            - severity
+            - anomaly_kind
+            - entity_label
+            - evidence
+            - max_severity_score
+          hide_totals_row: true
+
+  - height: 360px
+    items:
+      - width: 6
+        leaderboard:
+          metrics_view: anomalies
+          title: Where anomalies cluster
+          dimensions:
+            - workspace
+            - step
+          measures:
+            - total_anomalies
+            - entities_affected
+          num_rows: 12
+      - width: 6
+        leaderboard:
+          metrics_view: agent_activity
+          title: External agents — spend that lands on another bill
+          description: >-
+            codex and agy run as subprocesses on a separate account, so none of their tokens
+            reach the cost panels above. They concentrate in Review and Spec Review, which
+            means the two cheapest-looking steps are the two most understated.
+          dimension_filters: external_agent IN ('codex', 'agy')
+          dimensions:
+            - external_agent
+            - step_at_event
+          measures:
+            - external_agent_calls
+            - distinct_cards
+          num_rows: 12

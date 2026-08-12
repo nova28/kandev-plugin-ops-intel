@@ -1,0 +1,219 @@
+# One row per detected anomaly. The thing Kandev's own dashboards do not do at all.
+#
+# WHY ROBUST STATISTICS AND NOT mean ± stddev. This data is violently skewed: the top five
+# cards carry half of all spend, and one idle gap is 84 hours. A mean and a standard
+# deviation computed over that are both dragged by the very outliers they are supposed to
+# find — the classic result is a threshold so high that nothing trips it, and a reassuring
+# empty dashboard. Every detector below therefore uses the median and the MAD (median
+# absolute deviation), which have a 50% breakdown point: half the data would have to be
+# outliers before the baseline moves.
+#
+# The robust z is 0.6745 * (x - median) / MAD, scaled so it is comparable to a normal z.
+# Threshold 3.5 is the conventional Iglewicz-Hoaglin cut. It is a convention, not a law —
+# it is here so the number has a stated provenance rather than being a round number someone
+# liked.
+#
+# WHAT AN ANOMALY IS NOT. Every row here says "this is unlike its peers", never "this is
+# wrong". A £900 card may be the most valuable work in the dataset. Since this store has no
+# outcome label at all, nothing here can distinguish an expensive success from an expensive
+# failure — so each row carries the evidence that triggered it and the reader does the
+# judging. A detector that cannot explain itself in one sentence was not worth adding.
+#
+# MAD = 0 IS A REAL CASE, NOT AN EDGE CASE. When more than half of a group shares one value
+# the MAD is zero and the z is a division by zero. Those are dropped rather than reported as
+# infinitely anomalous, which is why every detector guards with NULLIF.
+type: model
+materialize: true
+
+sql: |
+  WITH
+  -- ---------------------------------------------------------------- baselines
+  card_pop AS (
+      SELECT
+          median(cost_subcents)                                         AS med_cost,
+          median(abs(cost_subcents - (SELECT median(cost_subcents) FROM kandev_cards WHERE did_run)))
+                                                                        AS mad_cost,
+          median(turns)                                                 AS med_turns,
+          median(abs(turns - (SELECT median(turns) FROM kandev_cards WHERE did_run)))
+                                                                        AS mad_turns
+      FROM kandev_cards WHERE did_run
+  ),
+
+  -- Context churn is compared WITHIN a model, never across. Opus and Sonnet have
+  -- structurally different input-per-output ratios (218 vs 507 in this dataset), so a
+  -- global baseline would flag every Sonnet session as anomalous and find nothing that is
+  -- actually unusual for Sonnet.
+  sess_churn AS (
+      SELECT session_id, model,
+             SUM(tokens_input_total) / NULLIF(SUM(tokens_out), 0) AS ratio,
+             SUM(cost_subcents)                                   AS cost_subcents,
+             MAX(occurred_at)                                     AS at
+      FROM kandev_cost
+      GROUP BY session_id, model
+      HAVING SUM(tokens_out) > 10000          -- tiny sessions have meaningless ratios
+  ),
+  -- NOTE ON WHAT THIS DETECTOR CURRENTLY FINDS: nothing, and that is the finding. The
+  -- highest context-churn session in this dataset scores z = 2.29, below the 3.5 cut. Churn
+  -- is not concentrated in a few bad sessions — it is uniformly high (a median of 202
+  -- input tokens per output token on Opus and 435 on Sonnet). A baseline problem cannot be
+  -- fixed by hunting outliers, and the threshold has deliberately NOT been lowered to
+  -- produce rows: a detector tuned until it fires is measuring its own tuning.
+  churn_stats AS (
+      SELECT model, median(ratio) AS med_ratio,
+             median(abs(ratio - (SELECT median(s2.ratio) FROM sess_churn s2 WHERE s2.model = s1.model))) AS mad_ratio,
+             count(*) AS n
+      FROM sess_churn s1 GROUP BY model
+      HAVING count(*) >= 5                    -- fewer than five peers is not a baseline
+  ),
+
+  -- ---------------------------------------------------------------- detectors
+  a_card_cost AS (
+      SELECT 'card' AS entity_type, c.task_id AS entity_id, c.task_title AS entity_label,
+             c.workspace, c.workflow, c.current_step AS step,
+             'Cost outlier' AS anomaly_kind,
+             c.task_created_at AS detected_at,
+             c.cost_subcents / 10000.0 AS observed,
+             p.med_cost / 10000.0      AS baseline,
+             0.6745 * (c.cost_subcents - p.med_cost) / NULLIF(p.mad_cost, 0) AS robust_z,
+             'Card cost $' || round(c.cost_subcents / 10000.0, 2)
+               || ' against a median card of $' || round(p.med_cost / 10000.0, 2)
+               || ' over ' || c.turns || ' turns.' AS evidence
+      FROM kandev_cards c CROSS JOIN card_pop p
+      WHERE c.did_run
+        AND 0.6745 * (c.cost_subcents - p.med_cost) / NULLIF(p.mad_cost, 0) > 3.5
+  ),
+
+  a_card_turns AS (
+      SELECT 'card', c.task_id, c.task_title, c.workspace, c.workflow, c.current_step,
+             'Turn runaway', c.task_created_at,
+             c.turns, p.med_turns,
+             0.6745 * (c.turns - p.med_turns) / NULLIF(p.mad_turns, 0),
+             c.turns || ' turns against a median card of ' || p.med_turns
+               || '. Long conversations are where context churn compounds.'
+      FROM kandev_cards c CROSS JOIN card_pop p
+      WHERE c.did_run
+        AND 0.6745 * (c.turns - p.med_turns) / NULLIF(p.mad_turns, 0) > 3.5
+  ),
+
+  a_churn AS (
+      SELECT 'session', s.session_id, COALESCE(k.task_title, s.session_id),
+             k.workspace, k.workflow, k.step_at_event,
+             'Context churn', s.at,
+             s.ratio, b.med_ratio,
+             0.6745 * (s.ratio - b.med_ratio) / NULLIF(b.mad_ratio, 0),
+             'Read ' || round(s.ratio, 0) || ' input tokens per output token on ' || s.model
+               || ', against ' || round(b.med_ratio, 0) || ' typical for that model. '
+               || 'Re-reading context rather than producing.'
+      FROM sess_churn s
+      JOIN churn_stats b ON b.model = s.model
+      LEFT JOIN (SELECT DISTINCT session_id, task_title, workspace, workflow, step_at_event
+                 FROM kandev_cost) k ON k.session_id = s.session_id
+      WHERE 0.6745 * (s.ratio - b.med_ratio) / NULLIF(b.mad_ratio, 0) > 3.5
+  ),
+
+  -- Fixed threshold, not a z-score: two hours of silence is operationally meaningful
+  -- regardless of what the rest of the distribution looks like, and the distribution of
+  -- gaps is so bimodal (seconds, or hours) that a z would be noise.
+  a_stall AS (
+      SELECT 'turn', t.turn_id, t.task_title, t.workspace, t.workflow, t.step_at_event,
+             'Long stall', t.started_at,
+             t.idle_seconds_before / 3600.0, 2.0,
+             t.idle_seconds_before / 7200.0,
+             'Turn ' || t.turn_index || ' began after ' || round(t.idle_seconds_before / 3600.0, 1)
+               || ' h of silence, in step ' || t.step_at_event
+               || '. The store does not record why.'
+      FROM kandev_turns t
+      WHERE t.idle_seconds_before > 7200
+  ),
+
+  a_overlap AS (
+      SELECT 'turn', t.turn_id, t.task_title, t.workspace, t.workflow, t.step_at_event,
+             'Overlapping turns', t.started_at,
+             t.idle_seconds_before / 60.0, 0.0, 4.0,
+             'Turn started ' || round(abs(t.idle_seconds_before) / 60.0, 1)
+               || ' min BEFORE the previous turn finished — concurrent turns or a bad clock.'
+      FROM kandev_turns t
+      WHERE t.idle_seconds_before < 0
+  ),
+
+  -- A session that spent a meaningful number of round trips waiting. Ratio-based so a long
+  -- session is not flagged merely for being long.
+  a_poll AS (
+      SELECT 'session', a.session_id, COALESCE(MAX(a.task_title), a.session_id),
+             MAX(a.workspace), MAX(a.workflow), MAX(a.step_at_event),
+             'Poll storm', MAX(a.created_at),
+             COUNT(*) FILTER (WHERE a.is_wait_poll), 0.0,
+             4.0,
+             COUNT(*) FILTER (WHERE a.is_wait_poll) || ' of '
+               || COUNT(*) FILTER (WHERE a.message_type = 'tool_execute')
+               || ' shell calls were echo/sleep/true — round trips spent waiting, not working.'
+      FROM kandev_activity a
+      GROUP BY a.session_id
+      HAVING COUNT(*) FILTER (WHERE a.is_wait_poll) >= 25
+         AND COUNT(*) FILTER (WHERE a.is_wait_poll)
+             > 0.30 * NULLIF(COUNT(*) FILTER (WHERE a.message_type = 'tool_execute'), 0)
+  ),
+
+  -- Editing the same handful of files over and over: the signature of an agent that cannot
+  -- get a change to stick. Guarded on volume so a 3-edit card cannot trip it.
+  a_thrash AS (
+      SELECT 'card', c.task_id, c.task_title, c.workspace, c.workflow, c.current_step,
+             'Edit thrash', c.task_created_at,
+             c.edits::DOUBLE / NULLIF(c.files_edited, 0), 3.0,
+             (c.edits::DOUBLE / NULLIF(c.files_edited, 0)) / 3.0,
+             c.edits || ' edits across only ' || c.files_edited || ' files ('
+               || round(c.edits::DOUBLE / NULLIF(c.files_edited, 0), 1)
+               || ' per file) — rewriting the same code repeatedly.'
+      FROM kandev_cards c
+      WHERE c.edits >= 30 AND c.files_edited > 0
+        AND c.edits::DOUBLE / NULLIF(c.files_edited, 0) > 12
+  ),
+
+  -- Spend that no card-level view can ever show, because the card is gone.
+  a_orphan AS (
+      SELECT 'session', o.session_id, '(deleted card)',
+             NULL, NULL, MAX(o.step_at_event),
+             'Spend on deleted card', MAX(o.occurred_at),
+             SUM(o.cost_subcents) / 10000.0, 0.0,
+             4.0,
+             '$' || round(SUM(o.cost_subcents) / 10000.0, 2)
+               || ' of spend whose card no longer exists. Invisible to every per-card total.'
+      FROM kandev_cost o
+      WHERE o.cost_attribution <> 'attributed to a card'
+      GROUP BY o.session_id
+      HAVING SUM(o.cost_subcents) > 100000
+  ),
+
+  unioned AS (
+      SELECT * FROM a_card_cost
+      UNION ALL SELECT * FROM a_card_turns
+      UNION ALL SELECT * FROM a_churn
+      UNION ALL SELECT * FROM a_stall
+      UNION ALL SELECT * FROM a_overlap
+      UNION ALL SELECT * FROM a_poll
+      UNION ALL SELECT * FROM a_thrash
+      UNION ALL SELECT * FROM a_orphan
+  )
+  SELECT
+      entity_type,
+      entity_id,
+      entity_label,
+      COALESCE(workspace, '(unknown)') AS workspace,
+      COALESCE(workflow,  '(none)')    AS workflow,
+      COALESCE(step,      '(unknown)') AS step,
+      anomaly_kind,
+      detected_at,
+      observed,
+      baseline,
+      robust_z,
+      evidence,
+      -- Severity is a presentation band over the same score, so a triage list can be sorted
+      -- without the reader holding the z-score convention in their head.
+      CASE
+          WHEN robust_z >= 10 THEN '1 · extreme'
+          WHEN robust_z >= 6  THEN '2 · high'
+          WHEN robust_z >= 4  THEN '3 · moderate'
+          ELSE                     '4 · notable'
+      END AS severity
+  FROM unioned
+  WHERE robust_z IS NOT NULL AND isfinite(robust_z)

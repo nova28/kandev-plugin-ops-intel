@@ -1,0 +1,193 @@
+# What a card costs. Grain: one card.
+#
+# READ THIS BEFORE RANKING ANYTHING. Every measure here is a COST-SIDE measure, because
+# nothing in the Kandev store records whether a card succeeded. There is no correctness
+# signal, no rework signal, and Kandev's own success chart counts budget-blocked,
+# idle-skipped and user-pressed-Stop runs as successes — so it is not merely missing, it is
+# misleading, and it is deliberately not reproduced here.
+#
+# The consequence is sharp: a dashboard that ranks cards by cost alone rewards giving up
+# early. The cheapest card in this dataset may be the one that was abandoned. Until an
+# outcome label exists, use this to find where spend concentrates and then go read the card
+# — never to decide which card went well.
+#
+# `did_run` exists so the never-ran cards can be excluded before averaging. Leaving them in
+# drags every per-card mean toward zero.
+type: metrics_view
+
+display_name: Card economics
+description: >-
+  Per-card cost, time and activity, joined across the cost ledger, the turn timing table
+  and the message stream. Cost-side only — this store carries no outcome label, so nothing
+  here can tell you whether the spend was worth it.
+
+model: kandev_cards
+timeseries: task_created_at
+smallest_time_grain: day
+
+dimensions:
+  - name: task_title
+    display_name: Card
+    column: task_title
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: current_step
+    display_name: Current step
+    column: current_step
+  - name: stage_type
+    display_name: Stage type
+    column: stage_type
+  - name: task_state
+    display_name: Card state
+    column: task_state
+    description: >-
+      COMPLETED / REVIEW / IN_PROGRESS. Carries no notion of correctness — a COMPLETED card
+      is one that reached the end of the board, not one that was right.
+  - name: priority
+    display_name: Priority
+    column: priority
+  - name: origin
+    display_name: Origin
+    column: origin
+  - name: cost_bucket
+    display_name: Cost bucket
+    column: cost_bucket
+  - name: autopilot_enabled
+    display_name: Autopilot
+    column: autopilot_enabled
+  - name: is_child_task
+    display_name: Is child card
+    column: is_child_task
+  - name: is_archived
+    display_name: Archived
+    column: is_archived
+  - name: is_ephemeral
+    display_name: Ephemeral
+    column: is_ephemeral
+  - name: did_run
+    display_name: Ever ran
+    column: did_run
+
+measures:
+  - name: total_cards
+    display_name: Cards
+    expression: COUNT(*)
+    format_preset: humanize
+
+  - name: cards_that_ran
+    display_name: Cards that ran
+    expression: COUNT(*) FILTER (WHERE did_run)
+    format_preset: humanize
+
+  - name: total_cost_usd
+    display_name: Total cost
+    expression: SUM(cost_subcents) / 10000.0
+    format_preset: currency_usd
+
+  - name: avg_cost_per_card_usd
+    display_name: Avg cost per card that ran
+    expression: >-
+      (SUM(cost_subcents) / 10000.0) / NULLIF(COUNT(*) FILTER (WHERE did_run), 0)
+    format_preset: currency_usd
+    valid_percent_of_total: false
+
+  - name: median_cost_per_card_usd
+    display_name: Median cost per card that ran
+    description: >-
+      Card cost is heavily skewed, so the median is the honest centre and the mean is the
+      one that gets quoted. Look at both.
+    expression: MEDIAN(cost_subcents) FILTER (WHERE did_run) / 10000.0
+    format_preset: currency_usd
+    valid_percent_of_total: false
+
+  - name: max_cost_per_card_usd
+    display_name: Most expensive card
+    expression: MAX(cost_subcents) / 10000.0
+    format_preset: currency_usd
+    valid_percent_of_total: false
+
+  - name: total_turns
+    display_name: Turns
+    expression: SUM(turns)
+    format_preset: humanize
+
+  - name: avg_turns_per_card
+    display_name: Avg turns per card that ran
+    expression: SUM(turns)::DOUBLE / NULLIF(COUNT(*) FILTER (WHERE did_run), 0)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: agent_hours
+    display_name: Agent hours
+    expression: SUM(agent_seconds) / 3600.0
+    format_d3: ",.1f"
+
+  - name: idle_hours
+    display_name: Idle hours
+    expression: SUM(idle_seconds) / 3600.0
+    format_d3: ",.1f"
+    lower_is_better: true
+
+  - name: idle_share
+    display_name: Idle share of elapsed
+    expression: SUM(idle_seconds) / NULLIF(SUM(idle_seconds) + SUM(agent_seconds), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: cost_per_agent_hour_usd
+    display_name: Cost per agent hour
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(agent_seconds) / 3600.0, 0)
+    format_preset: currency_usd
+    valid_percent_of_total: false
+
+  - name: total_human_gates
+    display_name: Human gates
+    expression: SUM(human_gates)
+    format_preset: humanize
+
+  - name: human_gates_per_card
+    display_name: Human gates per card that ran
+    expression: SUM(human_gates)::DOUBLE / NULLIF(COUNT(*) FILTER (WHERE did_run), 0)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: total_step_moves
+    display_name: Explicit card moves
+    description: Agent-driven moves only. The nearest available rework proxy, and a weak one.
+    expression: SUM(step_moves)
+    format_preset: humanize
+
+  - name: total_wait_polls
+    display_name: Wait / poll shell calls
+    expression: SUM(wait_polls)
+    format_preset: humanize
+    lower_is_better: true
+
+  - name: total_files_edited
+    display_name: Files edited
+    expression: SUM(files_edited)
+    format_preset: humanize
+
+  - name: output_tokens
+    display_name: Output tokens
+    expression: SUM(tokens_out)
+    format_preset: humanize
+
+explore:
+  display_name: Card economics
+  defaults:
+    measures:
+      - total_cost_usd
+      - avg_cost_per_card_usd
+      - agent_hours
+      - idle_share
+    dimensions:
+      - task_title
+      - workspace
+      - workflow
+      - cost_bucket
