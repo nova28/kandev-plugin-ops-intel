@@ -289,12 +289,19 @@ test("a task id carrying a quote cannot break out of the SQL", () => {
   assert.ok(sql.includes("abc''; DROP TABLE kandev_cost; --"), "it is doubled, not stripped");
 });
 
-test("every query names a task id, so none can scan the whole store", () => {
+test("every per-card query names a task id, so none can scan the whole store", () => {
   var qs = ledgerQueries("task-1");
-  assert.equal(qs.length, 7);
-  qs.forEach((sql, i) => {
+  assert.equal(qs.length, 8);
+  // All but the last are per-card and must say so. The last is the snapshot-freshness probe:
+  // a global property of the extract, not of any card, so it cannot be task-scoped. It is
+  // carved out by name rather than by loosening the check, which is the whole guard against
+  // a per-card query quietly becoming a full scan.
+  qs.slice(0, 7).forEach((sql, i) => {
     assert.ok(sql.includes("task-1"), `query ${i} is not scoped to the task`);
   });
+  var freshness = qs[7];
+  assert.ok(/^SELECT max\(created_at\)/.test(freshness), "the global query is the freshness probe");
+  assert.ok(!/task_id/.test(freshness), "and it is deliberately not card-scoped");
 });
 
 // ---------------------------------------------------------------------------------------

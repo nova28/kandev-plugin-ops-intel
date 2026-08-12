@@ -12,7 +12,7 @@
 # rill/ alongside this manifest and must be started separately — see README.md.
 id: "kandev-plugin-opscost"
 api_version: 1
-version: "0.16.0"
+version: "0.20.0"
 display_name: "Ops Cost"
 description: "Operational cost and efficiency intelligence — spend per model, per build step, and anomaly detection."
 author: "henry"

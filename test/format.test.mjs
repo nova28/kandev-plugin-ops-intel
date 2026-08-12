@@ -10,7 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { sqlQuote, isUnattributed, fmtUsd, fmtDuration } from "../ui/src/format.mjs";
 import { fmtCount, fmtMTok, fmtTokenSplit, modelColor, MODEL_HUES } from "../ui/src/format.mjs";
-import { fmtUsdShort } from "../ui/src/format.mjs";
+import { fmtUsdShort, snapshotAge } from "../ui/src/format.mjs";
 
 test("1 subcent is $0.0001, and the scale holds at both ends", () => {
   assert.equal(fmtUsd(10000), "$1.00");
@@ -95,4 +95,19 @@ test("compact money fits a card badge, and never fakes a measured zero", () => {
   assert.equal(fmtUsdShort(2398), "<$1");
   assert.equal(fmtUsdShort(0), null, "no badge beats a $0.00 that reads as measured");
   assert.equal(fmtUsdShort(null), null);
+});
+
+
+test("snapshot age is measured from the newest activity in the extract", () => {
+  var now = Date.parse("2026-08-12T12:32:00Z");
+  assert.equal(snapshotAge("2026-08-12T10:12:00Z", now), 8400); // 2h20m
+  assert.equal(snapshotAge("2026-08-12T12:32:00Z", now), 0);
+});
+
+test("an unknowable age is null, never a fabricated number", () => {
+  var now = Date.parse("2026-08-12T12:32:00Z");
+  assert.equal(snapshotAge(null, now), null);
+  assert.equal(snapshotAge("not a date", now), null);
+  // Clock skew, or a snapshot stamped in the future. Better to say nothing than "-3.0h old".
+  assert.equal(snapshotAge("2026-08-12T14:00:00Z", now), null);
 });

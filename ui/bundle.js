@@ -147,6 +147,23 @@
     return "<$1";
   }
 
+  /**
+   * How stale the snapshot is, as "2.3h old" — or null when it cannot be told.
+   *
+   * Rill reads a point-in-time copy and nothing inside it knows the wall clock, so this is the
+   * only way the panel can say whether "no run recorded" means "never ran" or "ran since the
+   * extract". A negative age (clock skew, or a snapshot from the future) yields null rather
+   * than a nonsense figure.
+   */
+  function snapshotAge(lastActivityIso, nowMs) {
+    if (!lastActivityIso) return null;
+    var t = Date.parse(lastActivityIso);
+    if (isNaN(t)) return null;
+    var secs = ((nowMs == null ? Date.now() : nowMs) - t) / 1000;
+    if (secs < 0) return null;
+    return secs;
+  }
+
   /** "in 1,417 · cache 62.62M · out 219K" — the three that bill differently. */
   function fmtTokenSplit(fresh, cached, out) {
     return "in " + fmtMTok(fresh) + " · cache " + fmtMTok(cached) + " · out " + fmtMTok(out);
@@ -421,7 +438,13 @@
     var presence =
       "SELECT count(*) AS in_snapshot FROM src_dim_task WHERE task_id = '" + id + "'";
 
-    return [cost, external, timing, peers, order, modelTiming, presence];
+    // HOW OLD IS THE SNAPSHOT? The newest message in it, which is effectively when the extract
+    // ran. Without this the empty state cannot tell "no agent has ever run on this card" from
+    // "the agent started after the extract" — and it asserted the first, on a card whose agent
+    // was running as it said so. Nothing in Rill knows the wall clock; only the caller does.
+    var freshness = "SELECT max(created_at) AS last_activity FROM src_fct_message";
+
+    return [cost, external, timing, peers, order, modelTiming, presence, freshness];
   }
 
   // Below this much recorded agent time, a throughput figure is one or two turns' luck and is
@@ -458,7 +481,9 @@
    * Five result sets in, one readout out. Pure — every argument is either an array of rows or
    * null, and null always means "could not read", never "no rows".
    */
-  function assembleLedger(cost, external, timing, peers, order, modelTiming, presence) {
+  function assembleLedger(cost, external, timing, peers, order, modelTiming, presence,
+                                 freshness) {
+    var snapshotAt = freshness && freshness.length ? freshness[0].last_activity || null : null;
     // The cost query decides whether the panel can say anything at all. A null answer means
     // the read was refused, not that the task was free.
     if (cost === null) return { state: "blocked" };
@@ -490,6 +515,7 @@
         inSnapshot: known,
         turns: ranTurns,
         external: extCalls,
+        snapshotAt: snapshotAt,
       };
     }
 
@@ -654,6 +680,7 @@
       fresh: sum("fresh"),
       out: sum("out"),
       peers: (peers && peers[0]) || null,
+      snapshotAt: snapshotAt,
       models: models,
       profiles: profiles,
       undefinedSteps: undefinedSteps,
@@ -737,7 +764,7 @@
     var run = query || rillQuery;
     return Promise.all(ledgerQueries(taskId).map(function (sql) { return run(sql); }))
       .then(function (res) {
-        return assembleLedger(res[0], res[1], res[2], res[3], res[4], res[5], res[6]);
+        return assembleLedger(res[0], res[1], res[2], res[3], res[4], res[5], res[6], res[7]);
       });
   }
 
@@ -1307,6 +1334,9 @@
         var absent = data.inSnapshot === false;
         var ran = data.turns > 0;
 
+        var age = snapshotAge(data.snapshotAt);
+        var ageText = age == null ? null : fmtDuration(age) + " old";
+
         var heading = absent ? "Not in this snapshot yet" : "No metered spend yet";
 
         var body = absent
@@ -1319,13 +1349,27 @@
             // flushes, which happens at a step transition, so a card still working through its
             // first step has no cost row anywhere, live database included.
             ? "This card is in the snapshot and has " + data.turns + " recorded turn" +
-              (data.turns === 1 ? "" : "s") + ", but no cost event. Spend is written when a " +
-              "session flushes, at a step transition — a card still working through its first " +
-              "step has none yet, in Rill or in Kandev. Re-running the extract will not " +
-              "change that; completing a step will."
-            // Present, never ran. Nothing to bill, and nothing to fix.
-            : "This card is in the snapshot and no agent has run on it, so there is nothing to " +
-              "bill. Nothing is wrong and nothing needs re-extracting.";
+              (data.turns === 1 ? "" : "s") + ", but no cost event anywhere — not in Rill, and " +
+              "not in Kandev either. Kandev writes spend only when an agent response completes, " +
+              "which on this store takes about an hour from session start on average. " +
+              "Re-extracting cannot conjure a number that has not been written yet."
+            // Present, but the snapshot records no run.
+            //
+            // THIS CANNOT DISTINGUISH "never ran" FROM "ran after the extract", and it used to
+            // assert the first — on a card whose agent was running as it said so, because the
+            // snapshot was two hours older than the turn. Report what the snapshot contains and
+            // how old it is; let the reader draw the conclusion.
+            // DO NOT REFLEXIVELY SEND THE READER TO RE-EXTRACT. That is the advice that turns
+            // this panel into a chore: on this store a session takes ~55 minutes on average to
+            // write its first cost event, and 25 of 82 sessions never wrote one at all. A
+            // freshly started card is blank no matter how recently the extract ran, so the
+            // honest framing is "there may be nothing to find yet", not "go fetch it again".
+            : "No agent run is recorded for this card" +
+              (ageText ? " in this snapshot, which is " + ageText : " in this snapshot") +
+              ". A run that started since the extract would not appear — but note that cost is " +
+              "only written when a session flushes, roughly an hour into it, so a card started " +
+              "recently has nothing to find yet either way. Kandev writes spend only when an " +
+              "agent response completes.";
 
         return shell([
           jsx(Label, { key: "l" }, heading),
@@ -1346,8 +1390,10 @@
                 jsx("span", null, data.external + " call" + (data.external === 1 ? "" : "s") +
                   " to codex/agy — billed to a separate account, never to this card"))
             : null,
-          // The command is only shown when re-running it is actually the fix.
-          absent ? commandBlock("c") : null,
+          // Shown when re-running the extract could actually change the answer: the card is
+          // missing entirely, or the snapshot records no run and may simply be older than one.
+          // Withheld for a card that ran and did not flush, where it changes nothing.
+          absent || !ran ? commandBlock("c") : null,
           jsx("div", { key: "b" },
             jsx(Button, { size: "sm", variant: "outline", onClick: load }, "Check again")),
         ]);
@@ -1452,24 +1498,67 @@
         // Spend before the card's first step stamp. Shown, never folded into a step —
         // attributing it to whichever step happened to come first would be a guess presented
         // as a measurement.
-        data.unattributed
-          ? jsx("div", { key: "un", style: {
+        // UNATTRIBUTED SPEND, SIZED TO ITS SHARE.
+        //
+        // This was a dim 10px footnote at 0.6 opacity — fine when it is a rounding error, badly
+        // wrong when it is most of the card. One real card put $74.87 of $80.75 here (93%)
+        // while the rail showed a $5.88 step as though that were the story: Kandev stamped no
+        // step for the first 44 minutes of the session, and the first stamp landed one second
+        // AFTER the flush it would have explained.
+        //
+        // So it scales. Below a quarter of the card it stays a footnote; at or above, it gets a
+        // step row's weight and a bar, because at that point it IS the finding — not a caveat
+        // to one.
+        (function () {
+          if (!data.unattributed) return null;
+          var amt = stepTotal(data.unattributed, selected, selectedProfile);
+          var share = shownTotal > 0 ? amt / shownTotal : 0;
+          var dim = (selected || selectedProfile) && amt === 0;
+          var hatch = "repeating-linear-gradient(45deg, currentColor 0 1.5px," +
+            " transparent 1.5px 4px)";
+
+          if (share < 0.25) {
+            return jsx("div", { key: "un", style: {
               display: "flex", alignItems: "center", gap: "7px", fontFamily: MONO,
-              fontSize: "10px",
-              opacity: (selected || selectedProfile) &&
-                stepTotal(data.unattributed, selected, selectedProfile) === 0 ? 0.25 : 0.6,
-              paddingTop: "8px", borderTop: "1px solid " + BORDER,
+              fontSize: "10px", opacity: dim ? 0.25 : 0.6, paddingTop: "8px",
+              borderTop: "1px solid " + BORDER,
             } },
               jsx("span", { style: {
                 width: "16px", height: "9px", flex: "none", borderRadius: "2px",
-                border: "1px solid currentColor",
-                backgroundImage: "repeating-linear-gradient(45deg, currentColor 0 1.5px," +
-                  " transparent 1.5px 4px)", opacity: 0.5,
+                border: "1px solid currentColor", backgroundImage: hatch, opacity: 0.5,
               } }),
-              jsx("span", { style: { fontVariantNumeric: "tabular-nums" } },
-                fmtUsd(stepTotal(data.unattributed, selected, selectedProfile))),
-              jsx("span", null, "before the first step stamp — not attributable"))
-          : null,
+              jsx("span", { style: { fontVariantNumeric: "tabular-nums" } }, fmtUsd(amt)),
+              jsx("span", null, "before the first step stamp — not attributable"));
+          }
+
+          return jsx("div", { key: "un", style: {
+            display: "grid", gridTemplateColumns: "14px 1fr", gap: "9px",
+            padding: "9px 0", borderTop: "1px solid " + BORDER, opacity: dim ? 0.32 : 1,
+          } },
+            jsx("div", { style: { display: "flex", justifyContent: "center", paddingTop: "5px" } },
+              jsx("div", { style: {
+                width: "7px", height: "7px", borderRadius: "50%",
+                border: "1px solid " + OFF_LEDGER, backgroundImage: hatch, color: OFF_LEDGER,
+              } })),
+            jsx("div", { style: { display: "flex", flexDirection: "column", gap: "6px", minWidth: 0 } },
+              jsx("div", { style: { display: "flex", alignItems: "baseline", gap: "7px" } },
+                jsx("span", { style: { fontFamily: MONO, fontSize: "12px", color: OFF_LEDGER } },
+                  "no step recorded"),
+                jsx("span", { style: {
+                  marginLeft: "auto", fontFamily: MONO, fontSize: "12.5px", fontWeight: 600,
+                  fontVariantNumeric: "tabular-nums", flex: "none", color: OFF_LEDGER,
+                } }, fmtUsd(amt))),
+              jsx("div", { style: {
+                height: "5px", background: SUNK, borderRadius: "1px", overflow: "hidden",
+              } },
+                jsx("div", { style: {
+                  height: "100%", width: Math.min(100, share * 100) + "%", color: OFF_LEDGER,
+                  border: "1px solid " + OFF_LEDGER + "80", backgroundImage: hatch, opacity: 0.9,
+                } })),
+              jsx("div", { style: { fontFamily: MONO, fontSize: "9.5px", opacity: 0.6 } },
+                Math.round(share * 100) + "% of this card billed before Kandev stamped any " +
+                "step, so it belongs to no step here")));
+        })(),
 
         jsx("div", { key: "sep2", style: { height: "1px", background: BORDER } }),
 
@@ -1487,9 +1576,17 @@
           // event in its session, and that window is attributed to the step holding most of its
           // messages — NOT to the nearest preceding stamp. Cost events flush at a step
           // transition, so "nearest stamp" bills the step that just started and has done no work.
-          jsx("div", null, "Kandev records no step on a cost event. Each event bills the window " +
-            "since the previous one, attributed to the step that held most of it. Cost carries " +
-            "no turn id, so no per-turn figure exists."),
+          (function () {
+            var a = snapshotAge(data.snapshotAt);
+            return a == null ? null : jsx("div", null,
+              "As of a snapshot " + fmtDuration(a) + " old — anything since is not here.");
+          })(),
+          // A cost event's `occurred_at` is stamped `time.Now()` by an ASYNCHRONOUS subscriber
+          // when it handles the event, not when the spend happened — so the timestamp is a
+          // handling time, and any step placed by it is inferred from a window, not recorded.
+          jsx("div", null, "Kandev records no step and no turn on a cost event, and timestamps " +
+            "it when an async subscriber handles it rather than when the spend occurred. Steps " +
+            "here are inferred from that window; no per-turn figure exists."),
           data.verdict > 0
             ? jsx("div", null, fmtUsd(data.verdict) + " of that billed windows covering more " +
                 "than one step — those labels (dotted) are a majority verdict, not a fact.")

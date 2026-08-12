@@ -118,7 +118,13 @@ export function ledgerQueries(taskId) {
   var presence =
     "SELECT count(*) AS in_snapshot FROM src_dim_task WHERE task_id = '" + id + "'";
 
-  return [cost, external, timing, peers, order, modelTiming, presence];
+  // HOW OLD IS THE SNAPSHOT? The newest message in it, which is effectively when the extract
+  // ran. Without this the empty state cannot tell "no agent has ever run on this card" from
+  // "the agent started after the extract" — and it asserted the first, on a card whose agent
+  // was running as it said so. Nothing in Rill knows the wall clock; only the caller does.
+  var freshness = "SELECT max(created_at) AS last_activity FROM src_fct_message";
+
+  return [cost, external, timing, peers, order, modelTiming, presence, freshness];
 }
 
 // Below this much recorded agent time, a throughput figure is one or two turns' luck and is
@@ -155,7 +161,9 @@ export function modelRates(models, timingRows) {
  * Five result sets in, one readout out. Pure — every argument is either an array of rows or
  * null, and null always means "could not read", never "no rows".
  */
-export function assembleLedger(cost, external, timing, peers, order, modelTiming, presence) {
+export function assembleLedger(cost, external, timing, peers, order, modelTiming, presence,
+                               freshness) {
+  var snapshotAt = freshness && freshness.length ? freshness[0].last_activity || null : null;
   // The cost query decides whether the panel can say anything at all. A null answer means
   // the read was refused, not that the task was free.
   if (cost === null) return { state: "blocked" };
@@ -187,6 +195,7 @@ export function assembleLedger(cost, external, timing, peers, order, modelTiming
       inSnapshot: known,
       turns: ranTurns,
       external: extCalls,
+      snapshotAt: snapshotAt,
     };
   }
 
@@ -351,6 +360,7 @@ export function assembleLedger(cost, external, timing, peers, order, modelTiming
     fresh: sum("fresh"),
     out: sum("out"),
     peers: (peers && peers[0]) || null,
+    snapshotAt: snapshotAt,
     models: models,
     profiles: profiles,
     undefinedSteps: undefinedSteps,
@@ -434,6 +444,6 @@ export function loadTaskLedger(taskId, query) {
   var run = query || rillQuery;
   return Promise.all(ledgerQueries(taskId).map(function (sql) { return run(sql); }))
     .then(function (res) {
-      return assembleLedger(res[0], res[1], res[2], res[3], res[4], res[5], res[6]);
+      return assembleLedger(res[0], res[1], res[2], res[3], res[4], res[5], res[6], res[7]);
     });
 }

@@ -77,6 +77,23 @@ export function fmtUsdShort(subcents) {
   return "<$1";
 }
 
+/**
+ * How stale the snapshot is, as "2.3h old" — or null when it cannot be told.
+ *
+ * Rill reads a point-in-time copy and nothing inside it knows the wall clock, so this is the
+ * only way the panel can say whether "no run recorded" means "never ran" or "ran since the
+ * extract". A negative age (clock skew, or a snapshot from the future) yields null rather
+ * than a nonsense figure.
+ */
+export function snapshotAge(lastActivityIso, nowMs) {
+  if (!lastActivityIso) return null;
+  var t = Date.parse(lastActivityIso);
+  if (isNaN(t)) return null;
+  var secs = ((nowMs == null ? Date.now() : nowMs) - t) / 1000;
+  if (secs < 0) return null;
+  return secs;
+}
+
 /** "in 1,417 · cache 62.62M · out 219K" — the three that bill differently. */
 export function fmtTokenSplit(fresh, cached, out) {
   return "in " + fmtMTok(fresh) + " · cache " + fmtMTok(cached) + " · out " + fmtMTok(out);
