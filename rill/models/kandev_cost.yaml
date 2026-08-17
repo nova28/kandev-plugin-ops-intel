@@ -135,6 +135,11 @@ sql: |
       c.task_id,
 
       c.model,
+      -- Alias ids folded to one family — see models/dim_model_family.yaml for why `default`
+      -- and `opus[1m]` are the same model. Use `model_family` to ask what something cost, and
+      -- the raw `model` above to ask which context lane it ran in; the raw id is kept
+      -- deliberately so the second question stays askable.
+      COALESCE(mf.model_family, c.model) AS model_family,
       c.provider,
       -- THE ACCOUNT THE SPEND BILLED TO, falling back to the session's profile.
       --
@@ -216,6 +221,7 @@ sql: |
       END AS step_attribution_basis
 
   FROM src_fct_cost_event c
-  LEFT JOIN src_dim_task    d ON d.task_id    = c.task_id
-  LEFT JOIN src_dim_session s ON s.session_id = c.session_id
-  LEFT JOIN attributed      a ON a.cost_event_id = c.cost_event_id
+  LEFT JOIN src_dim_task      d  ON d.task_id       = c.task_id
+  LEFT JOIN src_dim_session   s  ON s.session_id    = c.session_id
+  LEFT JOIN attributed        a  ON a.cost_event_id = c.cost_event_id
+  LEFT JOIN dim_model_family  mf ON mf.model        = c.model

@@ -21,8 +21,16 @@ timeseries: started_at
 smallest_time_grain: hour
 
 dimensions:
-  - name: model
+  # Default to the family: `default` and `opus[1m]` are one model, and leaving them apart
+  # files half of Opus's turns under an alias that reads like a separate product.
+  - name: model_family
     display_name: Model
+    column: model_family
+  # The configured id, suffix intact. Use this — not the family — for anything about the
+  # context lane: `[1m]` vs bare decides the served window, and on 2026-08-14 that difference
+  # was the whole cause of a step dying.
+  - name: model
+    display_name: Model id (raw)
     column: model
   - name: mode
     display_name: Mode
@@ -178,6 +186,6 @@ explore:
       - idle_share
     dimensions:
       - idle_bucket
-      - model
+      - model_family
       - workspace
       - task_title

@@ -17,8 +17,16 @@ timeseries: occurred_at
 smallest_time_grain: hour
 
 dimensions:
-  - name: model
+  # Default to the family. `default` is the id the "Opus - Low" profile carries so the workflow
+  # YAML's (agent_name, model, mode) triple can resolve to a second Opus profile — left apart it
+  # reads as its own product and Opus's spend reads low by whatever Opus - Low burned.
+  - name: model_family
     display_name: Model
+    column: model_family
+  # The configured id, suffix intact. Use this — not the family — for anything about the context
+  # lane: `[1m]` vs bare decides the served window.
+  - name: model
+    display_name: Model id (raw)
     column: model
   - name: provider
     display_name: Provider
@@ -184,7 +192,7 @@ explore:
       - output_tokens
       - input_per_output_ratio
     dimensions:
-      - model
+      - model_family
       - workspace
       - workflow
       - task_title

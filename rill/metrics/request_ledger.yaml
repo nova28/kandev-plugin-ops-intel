@@ -1,0 +1,166 @@
+# The per-step ledger, at request grain. Reads and writes split, context size visible.
+#
+# HOW TO USE IT. Filter `Card` to one card and pivot rows by `Step` for that card's ledger —
+# requests, read, write, out, average and peak context, cost. Filter `Step` to Build and pivot
+# by `Card` to ask whether one card's Build was typical. Same two readings as Card x step, one
+# grain finer, and with the three columns Kandev's store cannot produce at all.
+#
+# READ `Peak context` AND `Avg context` TOGETHER, NEVER SEPARATELY. They diverge in the way
+# that matters: on the card this was built for, Build #2 had the HIGHEST peak of any step
+# (716K) and the LOWEST average (133K), because a compaction cut it 709K -> 58K partway
+# through and the rest of the step ran cheap. Peak alone called it the worst step on the card;
+# average alone missed that it had ever been in trouble. The pair says what happened.
+#
+# COVERAGE IS CLAUDE CODE ONLY. Codex and agy write no transcripts, so their steps are absent
+# here — absent, not zero. A step that ran on codex will show no rows rather than a cheap row,
+# and `kandev_cost` remains the only place that sees that spend at all. Never read a total on
+# this page as a card's cost.
+#
+# SUBAGENTS ARE INCLUDED and separable by `Agent kind`. A Review step that fans out to three
+# reviewers does most of its spending in subagent transcripts; counting only the parent reports
+# roughly half the step. Filter to `main` to ask what the parent alone did.
+type: metrics_view
+display_name: Request ledger
+model: kandev_requests
+timeseries: occurred_at
+
+dimensions:
+  - name: task_title
+    display_name: Card
+    column: task_title
+  - name: step_at_event
+    display_name: Step
+    column: step_at_event
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: model
+    display_name: Model
+    column: model
+  - name: effort
+    display_name: Reasoning effort
+    column: effort
+  - name: agent_kind
+    display_name: Agent kind
+    description: >-
+      `main` is the session that owns the step; `subagent` is a Task fan-out billed to the same
+      step through its parent. Both are real spend.
+    column: agent_kind
+  - name: context_band
+    display_name: Context band
+    column: context_band
+  - name: over_200k
+    display_name: Over 200K context
+    column: over_200k
+  - name: step_attributed
+    display_name: Step attributed
+    column: step_attributed
+  - name: task_state
+    display_name: Card state
+    column: task_state
+
+measures:
+  - name: requests
+    display_name: Requests
+    description: >-
+      Distinct API round trips. The multiplier on everything: cost is requests times window
+      size, and this is the half nothing else in this project can count.
+    expression: COUNT(*)
+    format_preset: humanize
+
+  - name: total_cost_usd
+    display_name: Cost
+    description: >-
+      Priced from tokens per model, at rates chosen to reconcile against Kandev's own cost
+      events. A list-price equivalent on a subscription account — a measure of resource and
+      quota burn rather than a bill. Read it with Transcript coverage.
+    expression: SUM(cost_usd)
+    format_preset: currency_usd
+
+  - name: transcript_coverage
+    display_name: Transcript coverage
+    description: >-
+      How much of these sessions survives on disk, measured against the cache reads Kandev
+      recorded for them. Claude Code PRUNES TRANSCRIPTS, so an older card is present only in
+      part — the reference card's Opus session retains 58%. Below ~90% every total on this page
+      is a floor, and the shortfall shows up nowhere else: a pruned session simply looks cheap.
+      Check this before concluding a step was inexpensive.
+    expression: >-
+      SUM(tokens_read) * 1.0 / NULLIF(SUM(tokens_read / NULLIF(session_transcript_coverage, 0)), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: avg_context
+    display_name: Avg context
+    description: Mean prefix re-sent per request. Read with Peak context, never alone.
+    expression: AVG(context_tokens)
+    format_preset: humanize
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: peak_context
+    display_name: Peak context
+    expression: MAX(context_tokens)
+    format_preset: humanize
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: over_200k_share
+    display_name: Share of requests over 200K
+    description: >-
+      How much of the step ran above a standard window. The single most actionable ratio here:
+      every point of it is context being re-read that a bounded session would not have re-read.
+    expression: COUNT(*) FILTER (WHERE over_200k = 'yes') * 1.0 / NULLIF(COUNT(*), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: usd_per_request
+    display_name: $ per request
+    expression: SUM(cost_usd) / NULLIF(COUNT(*), 0)
+    format_d3: "$,.3f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # ------------------------------------------------------------------ the tokens, split
+  #
+  # The split Kandev cannot make. Writes are kept in two columns because a 1h write is 20x a
+  # read and 1.6x a 5m write, and a step that rebuilds a long-lived prefix is a different
+  # animal from one that churns a short one.
+  - name: tokens_read
+    display_name: Cache read
+    expression: SUM(tokens_read)
+    format_preset: humanize
+
+  - name: tokens_write_1h
+    display_name: Cache write (1h)
+    expression: SUM(tokens_write_1h)
+    format_preset: humanize
+
+  - name: tokens_write_5m
+    display_name: Cache write (5m)
+    expression: SUM(tokens_write_5m)
+    format_preset: humanize
+
+  - name: tokens_output
+    display_name: Output
+    expression: SUM(tokens_output)
+    format_preset: humanize
+
+  - name: read_cost_share
+    display_name: Read share of cost
+    description: >-
+      How much of this step's bill was re-reading context rather than producing anything. On
+      the card that prompted this model it ran past 85% on the long steps.
+    expression: SUM(read_cost_usd) / NULLIF(SUM(cost_usd), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: cards
+    display_name: Cards
+    expression: COUNT(DISTINCT task_id)
+    format_preset: humanize

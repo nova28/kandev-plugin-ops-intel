@@ -1,0 +1,129 @@
+# What each tool actually costs, split into the request that issued it and the tail it leaves.
+#
+# THE TWO COSTS IMPLY OPPOSITE FIXES, WHICH IS WHY THEY ARE NOT SUMMED BY DEFAULT.
+#
+#   Gen $   scales with the WINDOW. You pay to re-send the whole context in order to decide to
+#           run one command. The fix is FEWER REQUESTS — batch independent calls into one
+#           message, and front-load them while the window is still small.
+#   Tail $  scales with the RESULT. The fix is SMALLER PAYLOADS — read by range, not whole
+#           files.
+#
+# Reading only the total tells you a tool is expensive without telling you which lever moves
+# it. The card this was built for is the clearest possible case: `grep` returned 152 tokens on
+# average and its whole tail came to $1.00, yet it was the second most expensive tool at
+# $12.58 — because 99 separate requests each re-sent a ~349K window. "Return references, not
+# excerpts" would have bought nothing. Batching would have bought most of it. `Read` inverts
+# it: 1,168 tokens average and nearly half its cost in tail, where range-reading genuinely
+# pays.
+#
+# `Calls per request` IS THE HEADLINE MEASURE, not a diagnostic. At 1.09 it means 94% of
+# requests carried exactly one tool call, so the window was re-sent once per action all the way
+# up. It is the cheapest thing on this page to change and the one nothing else can see.
+#
+# NOT A LEADERBOARD OF BAD TOOLS. Every tool here was doing its job; what varies is how much
+# window it was made to carry. A high $ per call usually says the step was long, not that the
+# tool was wrong.
+type: metrics_view
+display_name: Tool economics
+model: kandev_tool_economics
+timeseries: occurred_at
+
+dimensions:
+  - name: tool_name
+    display_name: Tool
+    column: tool_name
+  - name: tool_class
+    display_name: Purpose
+    description: recon / verify / edit / vcs / agent control, classified where the command line was still readable.
+    column: tool_class
+  - name: task_title
+    display_name: Card
+    column: task_title
+  - name: step_at_event
+    display_name: Step
+    column: step_at_event
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: agent_kind
+    display_name: Agent kind
+    column: agent_kind
+  - name: model
+    display_name: Model
+    column: model
+
+measures:
+  - name: calls
+    display_name: Calls
+    expression: COUNT(*)
+    format_preset: humanize
+
+  - name: total_cost_usd
+    display_name: Total $
+    expression: SUM(gen_cost_usd) + SUM(tail_cost_usd)
+    format_preset: currency_usd
+
+  - name: gen_cost_usd
+    display_name: Gen $
+    description: >-
+      The window re-sent to issue these calls, split evenly across calls sharing a request.
+      Moved by batching and by keeping the window small — never by shrinking results.
+    expression: SUM(gen_cost_usd)
+    format_preset: currency_usd
+
+  - name: tail_cost_usd
+    display_name: Tail $
+    description: >-
+      The results re-read by every later request in the same step. Moved by smaller payloads.
+      An upper bound — a compaction mid-step evicts a result early and this does not model that.
+    expression: SUM(tail_cost_usd)
+    format_preset: currency_usd
+
+  - name: usd_per_call
+    display_name: $ per call
+    expression: (SUM(gen_cost_usd) + SUM(tail_cost_usd)) / NULLIF(COUNT(*), 0)
+    format_d3: "$,.3f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: calls_per_request
+    display_name: Calls per request
+    description: >-
+      Batching. 1.0 means every action re-sent the whole window on its own. Independent
+      reconnaissance batches well; edits, tests and commits are genuinely sequential and do
+      not, so a low figure on a Build step is a finding while a low figure on Create PR may not
+      be.
+    expression: COUNT(*) * 1.0 / NULLIF(COUNT(DISTINCT request_id), 0)
+    format_d3: ",.2f"
+    valid_percent_of_total: false
+
+  - name: avg_result_tokens
+    display_name: Avg result
+    description: >-
+      Result size. The lever for Tail $ and irrelevant to Gen $ — which is why a tool can be
+      expensive with tiny results.
+    expression: AVG(result_tokens)
+    format_d3: ",.0f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: avg_context
+    display_name: Avg ctx at call
+    expression: AVG(context_tokens)
+    format_preset: humanize
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: peak_context
+    display_name: Peak ctx at call
+    expression: MAX(context_tokens)
+    format_preset: humanize
+    valid_percent_of_total: false
+
+  - name: requests
+    display_name: Requests
+    expression: COUNT(DISTINCT request_id)
+    format_preset: humanize

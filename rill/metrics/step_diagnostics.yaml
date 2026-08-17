@@ -87,6 +87,20 @@ measures:
     valid_percent_of_total: false
     lower_is_better: true
 
+  - name: usd_per_tool_call
+    display_name: $ per tool call
+    description: >-
+      The marginal price of one agent action. A turn is elastic — it may hold one tool call or
+      eighty — but every tool call re-sends the whole context prefix, so this is the unit that
+      actually bills. Read it beside $ per turn, not instead of it: a step can look cheap per
+      turn and ruinous per call, and that gap is where a long unreset session hides. Carries
+      the same step-window attribution caveat as $ per turn, so read it with Clean attribution
+      share.
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(tool_calls), 0)
+    format_d3: "$,.3f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
   # ------------------------------------------------------------------ the tokens
   #
   # Declared input-before-output, in the order the tokens flow: context read first, tokens
@@ -190,6 +204,58 @@ measures:
     expression: SUM(clean_cost_subcents) / NULLIF(SUM(cost_subcents), 0)
     format_preset: percentage
     valid_percent_of_total: false
+
+  # ------------------------------------------------------------------ the round trips
+  #
+  # What the step actually DID, at the grain that bills. These three exist to answer the
+  # question `$ per turn` cannot: a turn may hold one tool call or eighty, so a step with a
+  # comfortable per-turn figure can still be spending most of its money re-reading context
+  # across hundreds of round trips.
+  #
+  # None of them is a quality score, and Explore-to-edit especially is not. A subsystem the
+  # agent has never touched legitimately costs more to search than a familiar one, and nothing
+  # in this store knows which case a row is. Treat a high ratio as a place to look — usually at
+  # whether the step is running too long in one context — never as a verdict on the run.
+  - name: tool_calls
+    display_name: Tool calls
+    description: >-
+      Round trips that carried an action: shell, read, edit, search, MCP and todo writes.
+      Prose and thinking are excluded — they are parts of a reply, not requests of their own.
+    expression: SUM(tool_calls)
+    format_preset: humanize
+
+  - name: explore_edit_ratio
+    display_name: Explore-to-edit ratio
+    description: >-
+      Recon calls (reads, searches, greps) per editing call. High means the step spent its
+      round trips finding things rather than changing them — and because every result stays in
+      the context window, that search is paid for again on every later call in the same
+      session. A prompt to look, not a defect: an unfamiliar subsystem earns a high ratio
+      honestly.
+    expression: SUM(recon_calls) / NULLIF(SUM(edit_calls), 0)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: recon_share
+    display_name: Recon share of calls
+    expression: SUM(recon_calls) / NULLIF(SUM(tool_calls), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: unscoped_share
+    display_name: Unscoped search/test share
+    description: >-
+      Of the calls where breadth was both a meaningful question and readable from the command —
+      searches and test runs — how many were aimed at the whole tree. The denominator excludes
+      calls whose breadth could not be determined as well as calls where it does not apply, so
+      it is a sample rather than a census; read it with Tool calls beside it. Most useful for
+      ruling a theory OUT: a low figure means an expensive step is expensive for some reason
+      other than sloppy commands, which is the more common case.
+    expression: SUM(unscoped_calls) / NULLIF(SUM(scopeable_calls), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
 
   # ------------------------------------------------------------------ what came out
   #

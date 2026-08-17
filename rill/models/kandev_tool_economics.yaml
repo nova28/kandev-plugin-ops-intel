@@ -1,0 +1,55 @@
+# One row per tool call, with the two costs a call actually carries.
+#
+# THE DISTINCTION THIS MODEL EXISTS TO MAKE. A tool call is billed twice and the halves behave
+# nothing alike:
+#
+#   GEN  — the request that ISSUED the call. You pay to re-send the entire window in order to
+#          decide to run one grep. This scales with the WINDOW, and not at all with the tool.
+#   TAIL — the result's tokens, re-read by every later request in the same step. This scales
+#          with the RESULT SIZE, and not at all with the window.
+#
+# Keeping them apart is the whole point, because they imply opposite fixes and the aggregate
+# hides which one applies. On the card this was built for, greps returned 152 tokens on average
+# and their entire tail across the step came to $1.00 — yet grep was the second most expensive
+# tool on the board at $12.58, because there were 99 separate requests. Payload discipline
+# would have saved almost nothing there; batching would have saved most of it. `Read` is the
+# mirror case: 1,168 tokens average and nearly half its cost in tail, where reading by range
+# genuinely pays. A single blended "$ per call" recommends the wrong fix in both directions.
+#
+# GEN IS SPLIT EVENLY across the calls in a request. A request carrying four parallel calls
+# pays its window once, and there is no basis in the transcript for apportioning that window
+# unequally between them. The even split is an assumption and it is the honest one; it also
+# means a batched call is correctly cheaper per call, which is exactly the behaviour being
+# measured.
+#
+# TAIL IS AN UPPER BOUND. It assumes the result stays in the prefix for the rest of the step.
+# A compaction mid-step evicts it early, so a step containing one is overstated here. That is
+# the safe direction — it never makes a large result look cheap — and `requests_after_in_step`
+# is carried so the assumption can be checked rather than taken on trust.
+type: model
+materialize: true
+
+sql: |
+  SELECT
+      c.request_id,
+      c.tool_name,
+      c.tool_class,
+      c.result_tokens,
+
+      r.task_id, r.task_title, r.workspace, r.workflow,
+      r.step_at_event, r.step_attributed, r.agent_kind, r.model,
+      r.occurred_at,
+      r.context_tokens,
+      r.requests_after_in_step,
+
+      -- Calls sharing this request. The denominator of the even split, and a measure in its
+      -- own right: 1.0 means nothing was ever batched.
+      COUNT(*) OVER (PARTITION BY c.request_id)                AS calls_in_request,
+
+      r.cost_usd / COUNT(*) OVER (PARTITION BY c.request_id)   AS gen_cost_usd,
+
+      -- Cache read rate, matching kandev_requests. A result is re-read at read price by every
+      -- request that follows it in the step; it is never re-WRITTEN, so no write rate applies.
+      c.result_tokens * r.requests_after_in_step * 0.30 / 1000000.0 AS tail_cost_usd
+  FROM src_fct_tool_call c
+  JOIN kandev_requests r ON r.request_id = c.request_id

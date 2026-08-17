@@ -31,6 +31,15 @@ export var STEPS_MODEL = "src_dim_workflow_step";
 export var VIEWS = [
   { id: "embedded", label: "Cost, steps & anomalies", path: "/canvas/embedded" },
   { id: "steps", label: "Workspace & step deep dive", path: "/canvas/step_deep_dive" },
+  // An explore, not a canvas, and deliberately. It serves two opposite readings of one grain
+  // — one card down its steps, or one step across every card — and a fixed layout would have
+  // to promote one and demote the other. See the header of metrics/card_steps.yaml.
+  { id: "cardsteps", label: "Card × step (explore)", path: "/explore/card_steps" },
+  // The two request-grain views. Both read Claude Code transcripts rather than Kandev's store
+  // — see models/kandev_requests.yaml for why that second source exists — so both are blank
+  // for steps that ran on codex or agy. Blank meaning "not observable", never "free".
+  { id: "requests", label: "Request ledger (explore)", path: "/explore/request_ledger" },
+  { id: "tooleconomics", label: "Tool economics (explore)", path: "/explore/tool_economics" },
   { id: "overview", label: "Overview", path: "/canvas/overview" },
   { id: "anomalies", label: "Anomalies (explore)", path: "/explore/anomalies" },
 ];

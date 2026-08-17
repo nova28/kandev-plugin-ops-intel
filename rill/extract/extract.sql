@@ -287,6 +287,13 @@ LEFT JOIN agent_profiles ap ON ap.id = e.agent_profile_id;
 --
 -- `tool_target` is populated for read/edit/search only. For `tool_execute` we keep the
 -- leading binary and drop the rest of the command line.
+--
+-- FOUR ENUMS ARE DERIVED HERE RATHER THAN DOWNSTREAM — `external_agent`, `wait_kind`,
+-- `tool_purpose` and `scope_discipline`. All four answer questions that live in the command
+-- ARGUMENTS, which are dropped before anything downstream can see them, and the leading token
+-- is `cd` on most commands here so the published binary cannot stand in for them. Each emits a
+-- low-cardinality enum and never the text it was read from. When adding another classifier of
+-- this kind, put it here for the same reason and hold to the same output rule.
 -- ---------------------------------------------------------------------------
 .output data/fct_message.csv
 WITH m AS (
@@ -373,6 +380,94 @@ SELECT
           OR m.title LIKE '%gh api%'                              THEN 'state check'
         ELSE NULL
     END                                             AS wait_kind,
+
+    -- WHAT A ROUND TRIP WAS FOR. Classified here for exactly the reason `wait_kind` is: the
+    -- leading token is `cd` on most commands in this store, so the downstream `shell_binary`
+    -- cannot answer it. Only the enum leaves the database.
+    --
+    -- THE SPLIT THAT EARNS THIS COLUMN IS RECON AGAINST EDIT. A tool call is both the unit of
+    -- agent action and the unit of context re-read — every call re-sends the whole prefix — so
+    -- a step that searches a lot pays for that search again on every later round trip, because
+    -- the results stay in the window. On the card this was built for, Build issued 164 recon
+    -- calls against 48 edits, and the recon carried about a third of the step's cost.
+    --
+    -- READ A HIGH RECON SHARE AS A PROMPT, NEVER A SCORE. An unfamiliar subsystem legitimately
+    -- costs more to search than a familiar one, and nothing in this store knows which it was.
+    -- This column says where the round trips went, not whether they were deserved.
+    --
+    -- PRECEDENCE IS DELIBERATE. `verify` is tested before `recon` because a test run piped to
+    -- a filter (`go test ./... | grep FAIL`) is verification wearing a search's clothes, and
+    -- the pipe is the more common shape here. `recon` is tested before `vcs` for the mirror
+    -- reason: `git grep` is a search, whatever binary it starts with.
+    CASE
+        WHEN m.type IN ('tool_read', 'tool_search')                 THEN 'recon'
+        WHEN m.type = 'tool_edit'                                   THEN 'edit'
+        -- An MCP call and a todo write are round trips like any other: they re-send the whole
+        -- prefix and they bill. They are classified rather than left NULL so that `tool_calls`
+        -- counts every request the step actually paid for. `thinking` and `message` stay NULL
+        -- because they are parts of a reply, not requests of their own.
+        WHEN m.type IN ('tool_call', 'todo')                        THEN 'agent control'
+        WHEN m.type <> 'tool_execute'                               THEN NULL
+        WHEN m.title LIKE '%go test%' OR m.title LIKE '%go build%'
+          OR m.title LIKE '%go vet%'  OR m.title LIKE '%gofmt%'
+          OR m.title LIKE '%make %'   OR m.title LIKE '%pytest%'
+          OR m.title LIKE '%pnpm %'   OR m.title LIKE '%npm %'
+          OR m.title LIKE '%cargo %'  OR m.title LIKE '%playwright%' THEN 'verify'
+        -- SHORT BINARY NAMES NEED A WORD BOUNDARY, and LIKE cannot express one. A bare
+        -- `LIKE '%rg %'` also matches `--arg ` and `LIKE '%ls %'` matches `tools `, which is
+        -- the both-directions failure the `wait_kind` note above was written about. GLOB has
+        -- character classes, so a short name is anchored either at the start of the command or
+        -- behind a shell separator. `grep` is long enough to be safe unanchored.
+        WHEN m.title LIKE '%grep%'                                  THEN 'recon'
+        WHEN m.title GLOB 'rg *'   OR m.title GLOB '*[ &|;(]rg *'   THEN 'recon'
+        WHEN m.title GLOB 'ls *'   OR m.title GLOB '*[ &|;(]ls *'   THEN 'recon'
+        WHEN m.title GLOB 'find *' OR m.title GLOB '*[ &|;(]find *' THEN 'recon'
+        WHEN m.title GLOB 'tree *' OR m.title GLOB '*[ &|;(]tree *' THEN 'recon'
+        WHEN m.title LIKE '%git %'                                  THEN 'vcs'
+        ELSE 'other shell'
+    END                                             AS tool_purpose,
+
+    -- HOW BROADLY A SEARCH OR TEST WAS AIMED. Same placement, same reason, same redaction: the
+    -- breadth lives in the arguments, and the arguments do not leave this file.
+    --
+    -- THIS COLUMN EXISTS TO BE ABLE TO SAY "NO". The analysis that prompted it opened with the
+    -- assumption that an expensive Build step was running unscoped commands, and the fix that
+    -- followed would have been a prompt change telling the agent to narrow them. The data said
+    -- 87 of 121 `go test` runs already carried `-run`, 30 more were package-scoped, and 4 were
+    -- recursive; greps were path-scoped 134 times in 188. The recommendation was withdrawn.
+    -- A column whose main use is retiring a plausible theory is worth more than one that
+    -- confirms them.
+    --
+    -- NULL means the question does not apply — this is not a search or a test, so there is no
+    -- breadth to judge. Do not read NULL as unscoped.
+    --
+    -- Name-scoping is tested first because it binds hardest: `go test ./... -run TestFoo` walks
+    -- the whole tree to find one test and runs one test, so it is scoped by name despite the
+    -- recursive path.
+    --
+    -- PATH SCOPING IS DETECTED ON `./`, NOT ON `/`. Nearly every command in this store is
+    -- `cd <path> && ...`, so a bare test for a slash would find one in the prefix of almost
+    -- every row and report the whole board as path-scoped. A relative package argument
+    -- (`./internal/office`) is the shape that actually narrows the command, and an absolute
+    -- `cd /Users/...` does not match it.
+    --
+    -- THE PRICE OF THAT CHOICE IS AN HONEST FIFTH VALUE. A grep written `rg pattern internal/`
+    -- is path-scoped with no leading `./`, and nothing in the surviving title separates it from
+    -- an unscoped one. Those rows are `not determinable` rather than being called unscoped, and
+    -- the model excludes them from the denominator. Undercounting a share is recoverable;
+    -- reporting disciplined commands as sloppy is what sends someone to fix a prompt that was
+    -- already correct.
+    CASE
+        WHEN m.type <> 'tool_execute'                               THEN NULL
+        WHEN m.title NOT LIKE '%go test%' AND m.title NOT LIKE '%grep%'
+         AND m.title NOT LIKE '%pytest%'  AND m.title NOT LIKE '%playwright%'
+         AND NOT (m.title GLOB 'rg *' OR m.title GLOB '*[ &|;(]rg *') THEN NULL
+        WHEN m.title LIKE '%-run %' OR m.title LIKE '%--grep%'
+          OR m.title LIKE '%-k %'                                   THEN 'scoped by name'
+        WHEN m.title LIKE '%./...%'                                 THEN 'unscoped recursive'
+        WHEN m.title LIKE '%./%'                                    THEN 'scoped by path'
+        ELSE 'not determinable'
+    END                                             AS scope_discipline,
 
     CASE WHEN m.requests_input = 1 THEN 'yes' ELSE 'no' END AS requests_input
 FROM m;

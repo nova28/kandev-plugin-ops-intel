@@ -1,0 +1,42 @@
+# Configured model id -> model family. ONE definition, joined wherever an alias id is stored.
+#
+# WHY THIS EXISTS. Two fact tables record the model as Kandev *configured* it rather than as the
+# API *resolved* it: `fct_turn` and `fct_cost_event`. In those, `default` and `opus[1m]` are the
+# same model under two names. `default` is not a fallback or a missing value — it is the id the
+# "Opus - Low" profile carries so that the workflow YAML's portable (agent_name, model, mode)
+# triple resolves to a SECOND Opus profile without colliding with the first. Left unfolded, a
+# config trick shows up in every cost chart as a separate product, and Opus's spend reads low by
+# however much Opus - Low did.
+#
+# WHAT DOES NOT GET FOLDED. `fct_request` stores the resolved API id (`claude-sonnet-5`,
+# `claude-sonnet-4-6`). Those are genuinely different models at different prices and must stay
+# apart — do not join this there.
+#
+# THE RAW ID STAYS EVERYWHERE IT IS FOLDED. The `[1m]` suffix decides the served context window,
+# not just the label. On 2026-08-14 a bare `sonnet` session was given a 200K window while
+# `opus[1m]` got 1M, and compaction paced against the wrong figure until the step was killed by
+# the thrash guard. Group by `model_family` to ask what something cost; group by the raw `model`
+# to ask which context lane it ran in. Collapsing the second question into the first is what made
+# that incident hard to see.
+type: model
+materialize: true
+
+sql: |
+  WITH ids AS (
+      SELECT DISTINCT model FROM src_fct_turn       WHERE model IS NOT NULL AND model <> ''
+      UNION
+      SELECT DISTINCT model FROM src_fct_cost_event WHERE model IS NOT NULL AND model <> ''
+  )
+  SELECT
+      model,
+      CASE
+          WHEN model IN ('default', 'opus[1m]', 'opus', 'opusplan', 'opusplan[1m]') THEN 'opus'
+          WHEN model IN ('sonnet', 'sonnet[1m]')                                    THEN 'sonnet'
+          WHEN model LIKE 'claude-fable-%' OR model LIKE 'fable%'                    THEN 'fable'
+          WHEN model LIKE 'haiku%'                                                   THEN 'haiku'
+          -- Anything else is a foreign or unpinned runtime — `gpt-5.6-sol`, `passthrough`, or a
+          -- deprecated id picked up by a session spawned outside the profile system. Surfaced
+          -- verbatim, because "what is this and who launched it" is the question worth asking.
+          ELSE model
+      END AS model_family
+  FROM ids

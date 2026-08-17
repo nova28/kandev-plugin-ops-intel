@@ -20,6 +20,20 @@ sql: |
 
       -- Run configuration, as recorded per turn.
       t.model,
+
+      -- The model FAMILY, with alias ids folded together — `default` and `opus[1m]` are one
+      -- model. The mapping lives in models/dim_model_family.yaml and is joined, not repeated,
+      -- so this table and `kandev_cost` cannot drift into two different answers to "how much
+      -- did Opus cost". Read that file for why `default` is a real Opus profile and not a
+      -- missing value; `effort` is the dimension that separates the two Opus profiles.
+      --
+      -- THE RAW `model` IS KEPT, DELIBERATELY. The `[1m]` suffix is not cosmetic: it decides
+      -- the context lane. On 2026-08-14 a bare `sonnet` session was served a 200K window while
+      -- `opus[1m]` got 1M, and compaction paced against the wrong number until the step died.
+      -- Folding the suffix away in the only place it is recorded would have made that
+      -- undiagnosable. Group by `model_family` for spend, by `model` for lane questions.
+      COALESCE(mf.model_family, NULLIF(t.model, ''), '(unrecorded)') AS model_family,
+
       t.mode,
       t.effort,
       t.fast_mode,
@@ -84,7 +98,8 @@ sql: |
       END AS agent_duration_bucket
 
   FROM src_fct_turn t
-  LEFT JOIN src_dim_task    d ON d.task_id    = t.task_id
-  LEFT JOIN src_dim_session s ON s.session_id = t.session_id
+  LEFT JOIN src_dim_task     d  ON d.task_id    = t.task_id
+  LEFT JOIN src_dim_session  s  ON s.session_id = t.session_id
+  LEFT JOIN dim_model_family mf ON mf.model     = t.model
   ASOF LEFT JOIN kandev_step_points p
       ON p.session_id = t.session_id AND t.started_at >= p.effective_from

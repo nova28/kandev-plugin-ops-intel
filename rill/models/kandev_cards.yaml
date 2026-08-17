@@ -20,7 +20,9 @@ sql: |
           task_id,
           COUNT(*)                                     AS turns,
           COUNT(DISTINCT session_id)                   AS sessions,
-          COUNT(DISTINCT model)                        AS models_used,
+          -- Family, not the raw id — a card that ran only Opus reads as one model even when
+          -- its turns are split between the `opus[1m]` and `default` aliases.
+          COUNT(DISTINCT model_family)                 AS models_used,
           SUM(agent_seconds)                           AS agent_seconds,
           -- Excludes the first turn of every session, whose preceding gap is not recorded.
           SUM(idle_seconds_before)                     AS idle_seconds,
