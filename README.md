@@ -13,39 +13,17 @@ behind them are in the Forge repo at `docs/research/kandev/2026-08-12-kandev-ope
 > change once installs exist, so it now names the purpose. If Rill is ever replaced, the id
 > survives.
 
-## The Cost panel on a task
+## Step analysis in the task composer
 
-The dashboards answer questions *across* runs. The **Cost** panel answers them on the card you
-have open, which is where a cost signal can still change a decision. Add it from the "+" menu in
-the task workspace.
+The dashboards answer questions *across* runs. The task composer shows the same **step-attributed
+cost** from day one: a compact Rill snapshot total sits beside the model and send controls. Click
+it to open the detailed ledger in an anchored, scrollable popover—workflow-step rail, attribution
+basis, agent/idle time, model and account economics, peer context, and external/unpriced work.
+It does not need a task-panel "Add" action and does not provide a session-cost view.
 
-It lays the card's spend along the workflow steps it passed through — the same rail already
-drawn at the top of the task page. That axis is the point. A bill tells you a number; money on
-the rail tells you *where your process leaks*, and on real cards it does: one card here spends
-more in Testing than in Build, and another carries 52 codex calls inside Review, which means
-Review's printed figure is the most understated number on the card.
-
-Three things it refuses to do, each for a reason the data forced:
-
-- **It does not order the rail by when spend was observed.** Two interleaved sessions plus
-  partial step stamping produce a first-seen order like Spec → Testing → Review → Build. That is
-  an artifact of stamping, not a card that bounced. The rail follows the workflow's declared
-  step order; first-seen is the fallback only for a step the workflow no longer defines.
-- **It does not print a confident total.** Over half the cards in this store hand work to
-  codex/agy, which bill to a separate account. The headline carries an explicit unpriced line,
-  and amber means that and only that anywhere in the panel.
-- **It does not show a per-turn figure.** Cost events carry no turn id. Any per-turn dollar
-  amount would be invented, so none is drawn.
-
-**Where the numbers come from: Rill, not Kandev's database.** The chain is
-`~/.kandev/data/kandev.db` → `extract.sh` → CSVs → Rill/DuckDB → its query API → the panel, over
-the same endpoint the workspace probe already used. That is why the plugin still requests **no
-capabilities** — and why the snapshot is point-in-time. A card created since the last extract has
-no rows, and gets an explicit empty state rather than a `$0.00` that reads like a free task.
-
-Reading live spend would mean `capabilities.api_read` plus a Kandev endpoint over
-`office_cost_events` — and a second definition of a dollar, which is the thing the iframe exists
-to avoid. Worth doing only for a figure Rill genuinely cannot serve.
+Rill remains both the source of this task detail and the separate Ops Intel analytics surface. The
+task ledger visibly reports its snapshot freshness; refresh the Rill extract when current data is
+required.
 
 ## Still ahead
 
@@ -98,6 +76,48 @@ cd rill && ./extract/extract.sh && rill start . --allowed-origins http://localho
 snapshot before filtering to it. Omit it and the tab still works — the filter is just applied
 without that check, and the chip in the toolbar is the escape hatch.
 
+### Keeping the snapshot fresh
+
+Rill serves a point-in-time extract and does not hot-reload it, so every figure in the tab and in
+the task panel is exactly as old as the last refresh. Install the hourly agent once and stop
+thinking about it:
+
+```bash
+make refresh-agent-install
+```
+
+That loads a LaunchAgent running `rill/auto-refresh.sh` hourly — and at login, and on wake. Each
+run refreshes only if it is **within working hours** (`08:00-23:00` by default; override with
+`make refresh-agent-install REFRESH_WINDOW=07:00-23:30`), **Rill is already answering** on
+`:9009`, and **the last refresh was over 50 minutes ago**. Everything else is a logged skip with
+its reason, in `~/Library/Logs/kandev-opscost-refresh.log`.
+
+The Rill gate is the one worth understanding: this never starts Rill. The plugin's own rule is
+that it does not launch a second long-running server, and a timer doing it from the outside would
+break that rule from another direction. It refreshes what you are already using and stays quiet
+otherwise.
+
+```bash
+make refresh-agent-status      # loaded? last exit? last 15 log lines
+make refresh                   # one refresh now, gates and all (FORCE=1 ignores them)
+make refresh-agent-uninstall
+```
+
+A refresh restarts Rill, because that is the only way it re-reads the CSVs — so an open dashboard
+blinks for about twenty seconds, once an hour. That is the cost of the numbers being current, and
+it is why there is a window at all rather than a job running around the clock.
+
+**What a refresh actually costs.** 35 seconds end to end on a ~700 MB store: a 6-second snapshot,
+then the SQL, the Rill restart and `check.sh`'s five assertions. The agent runs at background
+priority with low-priority I/O, and a run past 10 minutes is killed as stuck
+(`OPSCOST_REFRESH_TIMEOUT_MIN`) rather than allowed to hold the lock into the next hour.
+
+That number is the whole reason the hourly job is viable, and it is recent: `extract.sh`
+snapshotted with `sqlite3 .backup` until the first unattended run exposed it. `.backup` restarts
+its page copy whenever the source is written, so under a running Kandev it reached 437 MB of 692
+MB in 29 minutes and was still slowing. `VACUUM INTO` does it in one pass, in six seconds. See the
+header of `extract/extract.sh`.
+
 `rill/data/` (the extractor's CSV output) and `rill/tmp/` (Rill's DuckDB scratch) are
 gitignored — both are regenerated, and both hold real telemetry. The packaged plugin does not
 contain `rill/` at all; `make package` stages only the manifest, the binary and the bundle.
@@ -110,10 +130,8 @@ so anything else it spawned would be fought over on every restart. The page prob
 `localhost:9009` instead and hands over the command when nothing answers. An honest empty
 state beats an iframe that silently fails.
 
-**The backend is a deliberate no-op.** This is a UI-only plugin, but Kandev's installer
-requires `runtime.type: binary`, so `main.go` embeds `pluginsdk.UnimplementedPlugin` purely to
-give Kandev a process to supervise. It requests **no capabilities** — it reads nothing from
-Kandev and writes nothing back.
+**The backend is a deliberate no-op.** Kandev requires `runtime.type: binary`, but the plugin
+uses no Kandev API capabilities. Rill owns the task-ledger semantics and is started separately.
 
 **An iframe, not native React panels.** Each Rill measure carries the reasoning for its
 expression in a reviewable YAML file. Porting those charts to React would fork that logic into

@@ -33,12 +33,12 @@ var HERE = dirname(fileURLToPath(import.meta.url));
 var ORDER = [
   "config.mjs",
   "format.mjs",
+  "clipboard.mjs",
+  "icon.mjs",
   "rill.mjs",
   "ledger.mjs",
-  "cost-index.mjs",
   "panel.mjs",
-  "chip.mjs",
-  "card.mjs",
+  "step-analysis.mjs",
   "page.mjs",
   "plugin.mjs",
 ];

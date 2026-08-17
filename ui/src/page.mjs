@@ -20,6 +20,7 @@
  */
 
 import { RILL_ORIGIN, VIEWS, START_COMMAND } from "./config.mjs";
+import { copyTextToClipboard } from "./clipboard.mjs";
 import { probeRill, probeWorkspace, viewSrc, activeWorkspaceName } from "./rill.mjs";
 
 export function createOpsCostPage(host) {
@@ -106,12 +107,11 @@ export function createOpsCostPage(host) {
       };
     }, [status]);
 
+    // Off a secure origin `navigator.clipboard` is simply absent, and this used to do nothing
+    // at all in that case — no copy, no message. The shared path falls back and, either way,
+    // says what happened.
     function copyCommand() {
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(START_COMMAND).then(function () {
-          if (host.toast && host.toast.success) host.toast.success("Command copied");
-        });
-      }
+      copyTextToClipboard(host, START_COMMAND, "Start command");
     }
 
     var current = VIEWS.filter(function (v) { return v.id === view; })[0] || VIEWS[0];

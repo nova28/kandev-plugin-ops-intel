@@ -8,12 +8,12 @@
 # installs exist. The scope is "what does our operation cost and where does it leak", by
 # whatever mechanism serves that.
 #
-# UI-only: the managed executable is a deliberate no-op. The Rill project it frames lives in
-# rill/ alongside this manifest and must be started separately — see README.md.
+# Rill lives in rill/ and is started separately. The managed executable exists
+# because Kandev requires a supervised binary even for UI-only plugins.
 id: "kandev-plugin-opscost"
 api_version: 1
-version: "0.21.0"
-display_name: "Ops Cost"
+version: "0.32.0"
+display_name: "Ops Intel"
 description: "Operational cost and efficiency intelligence — spend per model, per build step, and anomaly detection."
 author: "henry"
 categories: ["tools"]
@@ -27,13 +27,6 @@ runtime:
     # machine, so shipping five binaries would be 95 MB of pretence.
     darwin-arm64: "server/plugin-darwin-arm64"
 
-# No capabilities requested, still. The Ops Cost tab renders an iframe, and the
-# task-detail Cost panel reads Rill cross-origin rather than reading Kandev — so
-# neither surface needs anything from the host. Least privilege here is not a
-# posture, it is just what the features need.
-#
-# Adding `api_read` would only be justified by a figure Rill cannot serve: a
-# running card's spend, which the point-in-time snapshot does not have.
 capabilities: {}
 
 ui:

@@ -17,6 +17,7 @@
  */
 
 import { RILL_ORIGIN, START_COMMAND } from "./config.mjs";
+import { copyTextToClipboard } from "./clipboard.mjs";
 // Two lines from one module because the build takes only single-line named imports; it says
 // so loudly rather than emitting a bundle with a stray `import` in it.
 import { fmtUsd, fmtDuration, fmtCount, modelColor, OFF_LEDGER } from "./format.mjs";
@@ -411,11 +412,30 @@ export function createTaskCostPanel(host) {
       }, children);
     }
 
+    // The command plus a copy button, because selecting 120 characters of shell out of a
+    // panel is the one gesture this surface should never require: the panel is anchored to a
+    // toolbar button, and a drag-select inside it starts by moving the pointer away from that
+    // anchor. Popover semantics keep the panel open while you do it either way (see
+    // step-analysis.mjs), but one click still beats a careful drag.
     function commandBlock(key) {
-      return jsx("pre", { key: key, style: {
-        padding: "10px", borderRadius: "5px", background: SUNK, fontSize: "11px",
-        overflowX: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all",
-      } }, START_COMMAND);
+      return jsx("div", { key: key, style: { display: "flex", flexDirection: "column", gap: "6px" } },
+        jsx("pre", { style: {
+          padding: "10px", borderRadius: "5px", background: SUNK, fontSize: "11px",
+          overflowX: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all",
+          userSelect: "text",
+        } }, START_COMMAND),
+        jsx("div", { style: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } },
+          jsx(Button, {
+            size: "sm",
+            variant: "outline",
+            onClick: function () { copyTextToClipboard(host, START_COMMAND, "Refresh command"); },
+          }, "Copy command"),
+          // Named, not hinted at. The refresh this command performs by hand is the same one
+          // `make refresh-agent-install` runs hourly; a reader doing it manually every time
+          // deserves to know that once.
+          jsx("span", { style: { fontFamily: MONO, fontSize: "10px", opacity: 0.5 } },
+            "or install the hourly refresh: make refresh-agent-install"))
+      );
     }
 
     if (data.state === "loading") {
@@ -448,7 +468,7 @@ export function createTaskCostPanel(host) {
         jsx("p", { key: "p", style: { opacity: 0.75, margin: 0 } },
           "This panel queries Rill on " + RILL_ORIGIN + " directly, so Rill has to be running " +
           "and started with an allowed origin for Kandev. Without it the browser blocks the " +
-          "read — the dashboards in the Ops Cost tab still work, because an iframe needs no " +
+          "read — the dashboards in the Ops Intel tab still work, because an iframe needs no " +
           "such permission."),
         commandBlock("c"),
         jsx("div", { key: "b" },
@@ -470,9 +490,14 @@ export function createTaskCostPanel(host) {
 
       var body = absent
         // The extract predates the card. This is the only case re-running it fixes.
-        ? "Rill reads a point-in-time copy of Kandev's database and does not hot-reload it, " +
-          "so a card created since the last extract is not in it. Re-run the extract and " +
-          "restart Rill to pick it up."
+        //
+        // The age belongs in this sentence rather than only in the "no run recorded" one below:
+        // it is the difference between "the snapshot is 20 minutes old, the hourly refresh will
+        // collect this card shortly" and "the snapshot is two days old, nothing is refreshing".
+        ? "Rill reads a point-in-time copy of Kandev's database and does not hot-reload it, so a " +
+          "card created since the last extract is not in it" +
+          (ageText ? " — this snapshot is " + ageText + ". " : ". ") +
+          "Re-run the extract and restart Rill to pick it up."
         : ran
           // Present, and it ran — but nothing billed. Cost events are written when a session
           // flushes, which happens at a step transition, so a card still working through its
@@ -691,54 +716,36 @@ export function createTaskCostPanel(host) {
 
       jsx("div", { key: "sep2", style: { height: "1px", background: BORDER } }),
 
-      // ---- provenance. Every figure above is as of an extract, from a reconstruction.
+      // ---- compact provenance. The full explanations belong in tooltips and docs;
+      // this surface should prioritise the rail rather than repeat a paragraph on
+      // every task.
       jsx("div", { key: "foot", style: {
-        fontFamily: MONO, fontSize: "9.5px", lineHeight: 1.65, opacity: 0.55,
+        fontFamily: MONO, fontSize: "9.5px", lineHeight: 1.45, opacity: 0.55,
       } },
         jsx("div", {
           title: "in " + fmtCount(data.fresh) + " · cache " + fmtCount(data.cached) +
             " · out " + fmtCount(data.out),
           style: { cursor: "help" },
-        }, "Tokens: " + fmtTokenSplit(data.fresh, data.cached, data.out) +
-          ". Cache reads bill at a tenth of fresh input."),
-        // Kandev records no step on a cost event. An event bills the window since the previous
-        // event in its session, and that window is attributed to the step holding most of its
-        // messages — NOT to the nearest preceding stamp. Cost events flush at a step
-        // transition, so "nearest stamp" bills the step that just started and has done no work.
+        }, "Tokens: " + fmtTokenSplit(data.fresh, data.cached, data.out)),
         (function () {
           var a = snapshotAge(data.snapshotAt);
           return a == null ? null : jsx("div", null,
-            "As of a snapshot " + fmtDuration(a) + " old — anything since is not here.");
+            "Snapshot " + fmtDuration(a) + " old");
         })(),
-        // A cost event's `occurred_at` is stamped `time.Now()` by an ASYNCHRONOUS subscriber
-        // when it handles the event, not when the spend happened — so the timestamp is a
-        // handling time, and any step placed by it is inferred from a window, not recorded.
-        jsx("div", null, "Kandev records no step and no turn on a cost event, and timestamps " +
-          "it when an async subscriber handles it rather than when the spend occurred. Steps " +
-          "here are placed by that window; no per-turn figure exists."),
-        // WHICH TIMELINE PRODUCED THIS RAIL. Not decoration: on ledger sessions 83% of spend
-        // lands in a single step exactly and none is unattributable; on stamp sessions that
-        // is 58%, with 38% majority verdicts and 5% unplaceable.
         data.stepBasis === "ledger"
-          ? jsx("div", null, "Steps come from Kandev's transition ledger — exact intervals, " +
-              "including manual moves.")
+          ? jsx("div", null, "Step source: transition ledger")
           : data.stepBasis === "stamps"
-            ? jsx("div", null, "Kandev recorded no transitions for this card's sessions, so " +
-                "steps are reconstructed from workflow message stamps: approximate, and " +
-                "blind to manual card moves.")
+            ? jsx("div", null, "Step source: message stamps (approximate)")
             : data.stepBasis === "mixed"
-              ? jsx("div", null, "This card straddles the transition-ledger cutover — some " +
-                  "sessions have exact intervals, others are reconstructed from message stamps.")
+              ? jsx("div", null, "Step source: ledger + message stamps")
               : null,
         data.verdict > 0
-          ? jsx("div", null, fmtUsd(data.verdict) + " of that billed windows covering more " +
-              "than one step — those labels (dotted) are a majority verdict, not a fact.")
+          ? jsx("div", null, fmtUsd(data.verdict) + " uses multi-step attribution")
           : null,
         // Most cost events carry no agent_profile_id; the account is then read off the
         // session, which runs under one profile for its whole life. Sound, but an inference.
         data.inferredProfile > 0
-          ? jsx("div", null, "Account for " + fmtUsd(data.inferredProfile) + " of that came " +
-              "from the session, not the cost event — the event recorded none.")
+          ? jsx("div", null, "Account inferred for " + fmtUsd(data.inferredProfile))
           : null,
         data.degraded.timing ? jsx("div", { style: { color: OFF_LEDGER } },
           "Timing unavailable — hours omitted.") : null,
@@ -747,8 +754,7 @@ export function createTaskCostPanel(host) {
         // Without the step definitions the rail falls back to first-observed order, which can
         // look like a workflow sequence while not being one. Say so.
         data.degraded.order ? jsx("div", { style: { color: OFF_LEDGER } },
-          "Workflow step order unavailable — listed in the order spend was first seen, which " +
-          "may not be the workflow's sequence.") : null,
+          "Workflow order unavailable.") : null,
         data.undefinedSteps && data.undefinedSteps.length
           ? jsx("div", null, data.undefinedSteps.join(", ") +
               " — not in this workflow's current definition, listed last.")
@@ -757,7 +763,7 @@ export function createTaskCostPanel(host) {
           jsx("a", {
             href: "#", onClick: function (e) { e.preventDefault(); load(); },
             style: { opacity: 0.8 },
-          }, "Refresh"))
+          }, "Refresh snapshot"))
       ),
     ]);
   };

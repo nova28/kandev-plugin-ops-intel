@@ -50,6 +50,15 @@
   var VIEWS = [
     { id: "embedded", label: "Cost, steps & anomalies", path: "/canvas/embedded" },
     { id: "steps", label: "Workspace & step deep dive", path: "/canvas/step_deep_dive" },
+    // An explore, not a canvas, and deliberately. It serves two opposite readings of one grain
+    // — one card down its steps, or one step across every card — and a fixed layout would have
+    // to promote one and demote the other. See the header of metrics/card_steps.yaml.
+    { id: "cardsteps", label: "Card × step (explore)", path: "/explore/card_steps" },
+    // The two request-grain views. Both read Claude Code transcripts rather than Kandev's store
+    // — see models/kandev_requests.yaml for why that second source exists — so both are blank
+    // for steps that ran on codex or agy. Blank meaning "not observable", never "free".
+    { id: "requests", label: "Request ledger (explore)", path: "/explore/request_ledger" },
+    { id: "tooleconomics", label: "Tool economics (explore)", path: "/explore/tool_economics" },
     { id: "overview", label: "Overview", path: "/canvas/overview" },
     { id: "anomalies", label: "Anomalies (explore)", path: "/explore/anomalies" },
   ];
@@ -194,6 +203,129 @@
     var h = 0;
     for (var j = 0; j < n.length; j++) h = (h * 31 + n.charCodeAt(j)) % 360;
     return "hsl(" + h + ", 34%, 55%)";
+  }
+
+
+  // ====================================================================================
+  // ui/src/clipboard.mjs
+  // ====================================================================================
+  /**
+   * One copy path for every surface that hands the reader a command.
+   *
+   * WHY THIS IS SHARED RATHER THAN INLINE. The start command appears in three places — the tab's
+   * down state, the panel's "cannot read Rill", and the panel's "not in this snapshot yet" — and
+   * each of those is a moment where the reader is already mildly stuck. A copy that silently does
+   * nothing there reads as a second failure of the same surface, so the failure has to be visible
+   * and the behaviour identical in all three.
+   *
+   * `navigator.clipboard` is present on localhost (a secure context) but not on a plain-http
+   * origin, which is exactly how this plugin would be loaded from another machine on the LAN. The
+   * execCommand fallback is deprecated and still the only thing that works there.
+   */
+
+  function copyTextToClipboard(host, text, label) {
+    var what = label || "Command";
+    var toast = (host && host.toast) || null;
+
+    function ok() {
+      if (toast && toast.success) toast.success(what + " copied");
+    }
+    // A failed copy must say so. Silence is indistinguishable from a copy that worked, and the
+    // reader finds out only when they paste the wrong thing into a shell.
+    function fail() {
+      if (toast && toast.error) toast.error("Could not copy — select the text and copy manually");
+    }
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(ok, function () {
+        if (!legacyCopy(text)) fail();
+        else ok();
+      });
+      return;
+    }
+    if (legacyCopy(text)) ok();
+    else fail();
+  }
+
+  /** Deprecated, and the only path available off a secure origin. */
+  function legacyCopy(text) {
+    try {
+      var area = document.createElement("textarea");
+      area.value = text;
+      // Off-screen rather than hidden: `display:none` and `visibility:hidden` are not selectable,
+      // so the copy silently yields an empty clipboard.
+      area.style.position = "fixed";
+      area.style.top = "-1000px";
+      area.setAttribute("readonly", "readonly");
+      document.body.appendChild(area);
+      area.select();
+      var copied = document.execCommand("copy");
+      document.body.removeChild(area);
+      return copied;
+    } catch (err) {
+      return false;
+    }
+  }
+
+
+  // ====================================================================================
+  // ui/src/icon.mjs
+  // ====================================================================================
+  /**
+   * The plugin's own nav glyph — a gauge.
+   *
+   * WHY NOT A CURATED NAME. `icon: "chart"` resolved to Tabler's `IconChartBar`, which is the
+   * glyph the host's own **Stats** button already uses — and since this item moved into the
+   * sidebar footer, the two sat side by side as identical bar charts. An icon that duplicates its
+   * neighbour is worse than no icon: it reads as a rendering bug, and neither button says which
+   * one you want. None of the 18 curated names is right either (bell, bolt, book, bug, calendar,
+   * chart, checklist, cloud, database, flask, globe, message, puzzle, robot, rocket, settings,
+   * ticket, users), so this takes the contract's other option: a plugin-owned component.
+   *
+   * WHY A GAUGE. The surface is not only about money. It answers how the operation is running —
+   * spend per model and per step, agent time against idle time, tool mix, how long steps spend
+   * waiting, code output per dollar, anomalies. A coin or a receipt would name the narrowest
+   * reading of that and would date badly as the plugin grows; a dial reads as "rate and health of
+   * a running thing", which is the whole surface.
+   *
+   * DRAWN FOR 14 PIXELS. The footer renders icons at `h-3.5 w-3.5`, so this is three strokes and
+   * nothing else: the dial, the needle, the hub. Tabler's conventions are matched deliberately
+   * (24 viewBox, `currentColor`, no fill, 2px round-capped strokes) so it sits in the row as a
+   * peer rather than as a foreign asset. The host sizes it through `className`, which wins over
+   * the width/height attributes, so those stay as the natural size for any surface that does not
+   * pass one.
+   */
+
+  function createGaugeIcon(host) {
+    var jsx = host.jsx;
+
+    return function OpsGaugeIcon(props) {
+      var p = props || {};
+      return jsx(
+        "svg",
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          width: 24,
+          height: 24,
+          viewBox: "0 0 24 24",
+          fill: "none",
+          stroke: "currentColor",
+          strokeWidth: 2,
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+          className: p.className,
+          // The label lives on the button, so the glyph must not be announced twice.
+          "aria-hidden": p["aria-hidden"] == null ? "true" : p["aria-hidden"],
+        },
+        // The dial: a half turn, open at the bottom where a gauge's scale ends.
+        jsx("path", { d: "M4 15a8 8 0 0 1 16 0" }),
+        // The needle, deliberately off-centre. A needle straight up reads as a decoration; one
+        // swung to a value reads as a measurement.
+        jsx("path", { d: "M12 15l3.6-4.2" }),
+        // The hub, which is what stops the two paths looking like an unrelated arc and slash.
+        jsx("circle", { cx: 12, cy: 15, r: 1.2 })
+      );
+    };
   }
 
 
@@ -791,108 +923,6 @@
 
 
   // ====================================================================================
-  // ui/src/cost-index.mjs
-  // ====================================================================================
-  /**
-   * ONE QUERY FOR THE WHOLE BOARD.
-   *
-   * The kanban card slot renders per card, and a board can hold dozens. The task panel's
-   * six-query load is right for one open card and catastrophic for forty — that is the
-   * "per-card query on every card render" this repo's notes have warned about from the start.
-   *
-   * So card contributions do not query. They read a workspace-wide index built by two queries
-   * total, memoised at module scope and shared by every card instance: one for spend per task,
-   * one for off-ledger calls per task. Both return roughly one row per card — tens of rows, not
-   * tens of queries.
-   *
-   * The index is deliberately coarse. It carries a total and a count, nothing per-step and
-   * nothing per-model, because that is all a card has room to say. Anything richer is what
-   * opening the card is for.
-   */
-
-  // Rill reads a point-in-time snapshot that only changes when someone re-runs the extract and
-  // restarts it, so this could be cached for the session. A minute is the compromise: long
-  // enough that scrolling a board never re-queries, short enough that a fresh extract shows up
-  // without a reload.
-  var TTL_MS = 60000;
-
-  var cached = null;
-  var cachedAt = 0;
-  var inFlight = null;
-
-  /**
-   * Two result sets in, one lookup out. Pure.
-   *
-   * Returns `{ ok, byTask }`. `ok` is false when the spend query could not be read at all —
-   * cards then render nothing rather than a row of $0.00, which would libel every card on the
-   * board as free.
-   */
-  function assembleCostIndex(totals, external) {
-    if (totals === null) return { ok: false, byTask: {} };
-    var byTask = {};
-    totals.forEach(function (r) {
-      if (!r.task_id) return;
-      byTask[r.task_id] = { subcents: Number(r.subcents || 0), external: 0 };
-    });
-    (external || []).forEach(function (r) {
-      if (!r.task_id) return;
-      // A card can have off-ledger calls and no metered spend of its own — every one of its
-      // agents billed somewhere else. That card is the most understated on the board, so it
-      // gets an entry rather than being skipped for having no dollar figure.
-      if (!byTask[r.task_id]) byTask[r.task_id] = { subcents: 0, external: 0 };
-      byTask[r.task_id].external += Number(r.n || 0);
-    });
-    return { ok: true, byTask: byTask };
-  }
-
-  /** The two queries, exported so a test can assert they stay task-scoped and cheap. */
-  function costIndexQueries() {
-    return [
-      "SELECT task_id, sum(cost_subcents) AS subcents FROM " + COST_MODEL +
-        " WHERE cost_attribution = 'attributed to a card' GROUP BY 1",
-      "SELECT task_id, count(*) AS n FROM " + ACTIVITY_MODEL +
-        " WHERE is_external_agent_call AND task_id <> '' GROUP BY 1",
-    ];
-  }
-
-  /**
-   * The shared index. Concurrent callers during a cold load get the SAME promise — forty cards
-   * mounting in one frame must produce two queries, not eighty.
-   */
-  function loadCostIndex(query) {
-    var run = query || rillQuery;
-    var now = Date.now();
-    if (cached && now - cachedAt < TTL_MS) return Promise.resolve(cached);
-    if (inFlight) return inFlight;
-
-    inFlight = Promise.all(costIndexQueries().map(function (sql) { return run(sql); }))
-      .then(function (res) {
-        var index = assembleCostIndex(res[0], res[1]);
-        // A failed read is not cached. The usual cause is Rill being down or started without
-        // --allowed-origins, both of which get fixed while the board is open; caching the
-        // failure for a minute would make the fix look like it did not work.
-        if (index.ok) {
-          cached = index;
-          cachedAt = Date.now();
-        }
-        inFlight = null;
-        return index;
-      }, function () {
-        inFlight = null;
-        return { ok: false, byTask: {} };
-      });
-    return inFlight;
-  }
-
-  /** Drop the memo — used by tests, and after anything that would change the snapshot. */
-  function resetCostIndex() {
-    cached = null;
-    cachedAt = 0;
-    inFlight = null;
-  }
-
-
-  // ====================================================================================
   // ui/src/panel.mjs
   // ====================================================================================
   /**
@@ -1303,11 +1333,30 @@
         }, children);
       }
 
+      // The command plus a copy button, because selecting 120 characters of shell out of a
+      // panel is the one gesture this surface should never require: the panel is anchored to a
+      // toolbar button, and a drag-select inside it starts by moving the pointer away from that
+      // anchor. Popover semantics keep the panel open while you do it either way (see
+      // step-analysis.mjs), but one click still beats a careful drag.
       function commandBlock(key) {
-        return jsx("pre", { key: key, style: {
-          padding: "10px", borderRadius: "5px", background: SUNK, fontSize: "11px",
-          overflowX: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all",
-        } }, START_COMMAND);
+        return jsx("div", { key: key, style: { display: "flex", flexDirection: "column", gap: "6px" } },
+          jsx("pre", { style: {
+            padding: "10px", borderRadius: "5px", background: SUNK, fontSize: "11px",
+            overflowX: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all",
+            userSelect: "text",
+          } }, START_COMMAND),
+          jsx("div", { style: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } },
+            jsx(Button, {
+              size: "sm",
+              variant: "outline",
+              onClick: function () { copyTextToClipboard(host, START_COMMAND, "Refresh command"); },
+            }, "Copy command"),
+            // Named, not hinted at. The refresh this command performs by hand is the same one
+            // `make refresh-agent-install` runs hourly; a reader doing it manually every time
+            // deserves to know that once.
+            jsx("span", { style: { fontFamily: MONO, fontSize: "10px", opacity: 0.5 } },
+              "or install the hourly refresh: make refresh-agent-install"))
+        );
       }
 
       if (data.state === "loading") {
@@ -1340,7 +1389,7 @@
           jsx("p", { key: "p", style: { opacity: 0.75, margin: 0 } },
             "This panel queries Rill on " + RILL_ORIGIN + " directly, so Rill has to be running " +
             "and started with an allowed origin for Kandev. Without it the browser blocks the " +
-            "read — the dashboards in the Ops Cost tab still work, because an iframe needs no " +
+            "read — the dashboards in the Ops Intel tab still work, because an iframe needs no " +
             "such permission."),
           commandBlock("c"),
           jsx("div", { key: "b" },
@@ -1362,9 +1411,14 @@
 
         var body = absent
           // The extract predates the card. This is the only case re-running it fixes.
-          ? "Rill reads a point-in-time copy of Kandev's database and does not hot-reload it, " +
-            "so a card created since the last extract is not in it. Re-run the extract and " +
-            "restart Rill to pick it up."
+          //
+          // The age belongs in this sentence rather than only in the "no run recorded" one below:
+          // it is the difference between "the snapshot is 20 minutes old, the hourly refresh will
+          // collect this card shortly" and "the snapshot is two days old, nothing is refreshing".
+          ? "Rill reads a point-in-time copy of Kandev's database and does not hot-reload it, so a " +
+            "card created since the last extract is not in it" +
+            (ageText ? " — this snapshot is " + ageText + ". " : ". ") +
+            "Re-run the extract and restart Rill to pick it up."
           : ran
             // Present, and it ran — but nothing billed. Cost events are written when a session
             // flushes, which happens at a step transition, so a card still working through its
@@ -1583,54 +1637,36 @@
 
         jsx("div", { key: "sep2", style: { height: "1px", background: BORDER } }),
 
-        // ---- provenance. Every figure above is as of an extract, from a reconstruction.
+        // ---- compact provenance. The full explanations belong in tooltips and docs;
+        // this surface should prioritise the rail rather than repeat a paragraph on
+        // every task.
         jsx("div", { key: "foot", style: {
-          fontFamily: MONO, fontSize: "9.5px", lineHeight: 1.65, opacity: 0.55,
+          fontFamily: MONO, fontSize: "9.5px", lineHeight: 1.45, opacity: 0.55,
         } },
           jsx("div", {
             title: "in " + fmtCount(data.fresh) + " · cache " + fmtCount(data.cached) +
               " · out " + fmtCount(data.out),
             style: { cursor: "help" },
-          }, "Tokens: " + fmtTokenSplit(data.fresh, data.cached, data.out) +
-            ". Cache reads bill at a tenth of fresh input."),
-          // Kandev records no step on a cost event. An event bills the window since the previous
-          // event in its session, and that window is attributed to the step holding most of its
-          // messages — NOT to the nearest preceding stamp. Cost events flush at a step
-          // transition, so "nearest stamp" bills the step that just started and has done no work.
+          }, "Tokens: " + fmtTokenSplit(data.fresh, data.cached, data.out)),
           (function () {
             var a = snapshotAge(data.snapshotAt);
             return a == null ? null : jsx("div", null,
-              "As of a snapshot " + fmtDuration(a) + " old — anything since is not here.");
+              "Snapshot " + fmtDuration(a) + " old");
           })(),
-          // A cost event's `occurred_at` is stamped `time.Now()` by an ASYNCHRONOUS subscriber
-          // when it handles the event, not when the spend happened — so the timestamp is a
-          // handling time, and any step placed by it is inferred from a window, not recorded.
-          jsx("div", null, "Kandev records no step and no turn on a cost event, and timestamps " +
-            "it when an async subscriber handles it rather than when the spend occurred. Steps " +
-            "here are placed by that window; no per-turn figure exists."),
-          // WHICH TIMELINE PRODUCED THIS RAIL. Not decoration: on ledger sessions 83% of spend
-          // lands in a single step exactly and none is unattributable; on stamp sessions that
-          // is 58%, with 38% majority verdicts and 5% unplaceable.
           data.stepBasis === "ledger"
-            ? jsx("div", null, "Steps come from Kandev's transition ledger — exact intervals, " +
-                "including manual moves.")
+            ? jsx("div", null, "Step source: transition ledger")
             : data.stepBasis === "stamps"
-              ? jsx("div", null, "Kandev recorded no transitions for this card's sessions, so " +
-                  "steps are reconstructed from workflow message stamps: approximate, and " +
-                  "blind to manual card moves.")
+              ? jsx("div", null, "Step source: message stamps (approximate)")
               : data.stepBasis === "mixed"
-                ? jsx("div", null, "This card straddles the transition-ledger cutover — some " +
-                    "sessions have exact intervals, others are reconstructed from message stamps.")
+                ? jsx("div", null, "Step source: ledger + message stamps")
                 : null,
           data.verdict > 0
-            ? jsx("div", null, fmtUsd(data.verdict) + " of that billed windows covering more " +
-                "than one step — those labels (dotted) are a majority verdict, not a fact.")
+            ? jsx("div", null, fmtUsd(data.verdict) + " uses multi-step attribution")
             : null,
           // Most cost events carry no agent_profile_id; the account is then read off the
           // session, which runs under one profile for its whole life. Sound, but an inference.
           data.inferredProfile > 0
-            ? jsx("div", null, "Account for " + fmtUsd(data.inferredProfile) + " of that came " +
-                "from the session, not the cost event — the event recorded none.")
+            ? jsx("div", null, "Account inferred for " + fmtUsd(data.inferredProfile))
             : null,
           data.degraded.timing ? jsx("div", { style: { color: OFF_LEDGER } },
             "Timing unavailable — hours omitted.") : null,
@@ -1639,8 +1675,7 @@
           // Without the step definitions the rail falls back to first-observed order, which can
           // look like a workflow sequence while not being one. Say so.
           data.degraded.order ? jsx("div", { style: { color: OFF_LEDGER } },
-            "Workflow step order unavailable — listed in the order spend was first seen, which " +
-            "may not be the workflow's sequence.") : null,
+            "Workflow order unavailable.") : null,
           data.undefinedSteps && data.undefinedSteps.length
             ? jsx("div", null, data.undefinedSteps.join(", ") +
                 " — not in this workflow's current definition, listed last.")
@@ -1649,7 +1684,7 @@
             jsx("a", {
               href: "#", onClick: function (e) { e.preventDefault(); load(); },
               style: { opacity: 0.8 },
-            }, "Refresh"))
+            }, "Refresh snapshot"))
         ),
       ]);
     };
@@ -1657,180 +1692,106 @@
 
 
   // ====================================================================================
-  // ui/src/chip.mjs
+  // ui/src/step-analysis.mjs
   // ====================================================================================
-  /**
-   * THE ALWAYS-THERE COST CHIP — a compact readout in the session top bar.
-   *
-   * WHY THIS EXISTS. `registerTaskPanel` only adds a row to the "+" menu; its contract is
-   * `{ id, title, icon?, Component, mobileEnabled? }` and there is no way for a plugin to
-   * declare itself a default panel. A slot component is the one surface that mounts on every
-   * task without being asked, so this is what "I don't want to add it every time" can actually
-   * be built out of. (The other route is Kandev's own saved layouts, which round-trip plugin
-   * panels — that gives the full panel by default and needs no plugin code at all.)
-   *
-   * WHAT IT DELIBERATELY IS NOT. A top bar is not a dashboard. This shows one number and one
-   * warning marker, and hands off to the full ledger on click. Anything more would be competing
-   * with the task title for the most valuable strip of the page.
-   *
-   * WHEN IT SHOWS NOTHING. If Rill is unreachable or the card has no rows, the chip renders
-   * nothing at all rather than an error. A top bar is the wrong place to explain a local server
-   * being down — the panel does that, at length, with a copyable command. Silence here is not a
-   * swallowed error; it is the error being reported somewhere it can be acted on.
-   */
-
-  function createTaskCostChip(host) {
+  // A compact, always-mounted entry point. The full Rill ledger renders directly
+  // in an anchored popover, matching the chat-toolbar interaction pattern rather
+  // than taking over the screen with a modal.
+  function createStepAnalysisAction(host) {
     var React = host.React;
-    var jsx = host.jsx;
+    var h = host.jsx;
     var Panel = createTaskCostPanel(host);
+    var ui = host.ui || {};
+    var Button = ui.Button || "button";
 
-    var MONO_CHIP = "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace";
+    // POPOVER, NOT TOOLTIP — and the difference is not cosmetic.
+    //
+    // This surface used to be a Radix Tooltip with `pointer-events-auto`, on the reasoning that a
+    // hover-anchored panel is cheaper to open than a click target. A tooltip closes when the
+    // pointer leaves the grace polygon between trigger and content, and that polygon is a narrow
+    // corridor: the trigger sits in the chat toolbar while the content is up to 820px wide above
+    // it, so reaching anything on the far side of the panel — the start command, most obviously —
+    // left the corridor and dismissed the panel mid-gesture. Selecting text inside it was worse
+    // still, because the drag begins by moving away from the trigger.
+    //
+    // A popover is dismissed only by an explicit gesture (Escape, or a click outside), which is
+    // what a surface you read, select from and click buttons inside has to be. Keep it a popover.
+    var hasPopover = !!(ui.Popover && ui.PopoverTrigger && ui.PopoverContent);
+    var Root = hasPopover ? ui.Popover : ui.Tooltip || "div";
+    var Trigger = hasPopover ? ui.PopoverTrigger : ui.TooltipTrigger || "div";
+    var Content = hasPopover ? ui.PopoverContent : ui.TooltipContent || "div";
 
-    return function TaskCostChip(props) {
-      // A SLOT COMPONENT IS NOT A PANEL COMPONENT. `registerComponent` types its component as
-      // `{ slotProps?: unknown }` — the slot's payload arrives as ONE prop, not spread — while
-      // `registerTaskPanel` passes `{ panelId, taskId, ... }` directly. Reading `props.taskId`
-      // here yields undefined, and because a chip with no data renders null, the mistake looks
-      // exactly like "this card has no spend". Accept both shapes so the failure cannot recur
-      // silently if this component is ever mounted the other way.
-      var slot = props.slotProps || props;
-      var taskId = slot.taskId;
-      var dataState = React.useState(null);
-      var data = dataState[0];
-      var setData = dataState[1];
+    return function StepAnalysisAction(props) {
+      var context = (props && props.slotProps) || {};
+      var taskId = context.taskId;
+      var stateHook = React.useState(null);
+      var ledger = stateHook[0];
+      var setLedger = stateHook[1];
+      var openHook = React.useState(false);
+      var open = openHook[0];
+      var setOpen = openHook[1];
 
       React.useEffect(function () {
         if (!taskId) return undefined;
         var cancelled = false;
-        setData(null);
+        setLedger(null);
         loadTaskLedger(taskId).then(
-          function (d) { if (!cancelled) setData(d); },
-          function () { if (!cancelled) setData({ state: "blocked" }); }
+          function (next) { if (!cancelled) setLedger(next); },
+          function () { if (!cancelled) setLedger({ state: "blocked" }); }
         );
         return function () { cancelled = true; };
       }, [taskId]);
 
-      if (!data || data.state !== "ok") return null;
+      if (!taskId) return null;
 
-      function openLedger() {
-        host.openModal({
-          title: "Cost — spend by workflow step",
-          size: "lg",
-          content: function () {
-            return jsx(Panel, { taskId: taskId });
+      var ready = ledger && ledger.state === "ok";
+      var label = ready
+        ? fmtUsd(ledger.total) + " attributed across workflow steps" +
+          (ledger.external ? "; " + ledger.external + " external calls are unpriced" : "")
+        : "Open step analysis";
+
+      return h(
+        Root,
+        { open: open, onOpenChange: setOpen },
+        h(
+          Trigger,
+          { asChild: true },
+          h(
+            Button,
+            {
+              type: "button",
+              variant: "ghost",
+              size: ready ? "sm" : "icon",
+              className: (ready ? "h-7 px-1.5 " : "h-7 w-7 ") +
+                "cursor-pointer text-muted-foreground hover:text-foreground hover:bg-primary/10",
+              title: label,
+              "aria-label": "Open step analysis",
+              "aria-expanded": open,
+              // The popover trigger toggles `open` itself; adding our own handler on top of it
+              // toggles twice in one click and the panel never opens. The tooltip fallback has
+              // no such handler, so there it is the only thing that opens the panel.
+              onClick: hasPopover ? undefined : function () { setOpen(!open); },
+            },
+            h("svg", { xmlns: "http://www.w3.org/2000/svg", width: 16, height: 16, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" }, h("circle", { cx: 8, cy: 8, r: 6 }), h("path", { d: "M18.09 10.37A6 6 0 1 1 10.34 18" })),
+            ready ? h("span", { style: { marginLeft: "3px", fontSize: "11px", fontWeight: 600, fontVariantNumeric: "tabular-nums" } }, fmtUsd(ledger.total)) : null,
+            ready && ledger.external ? h("span", { style: { width: "10px", height: "7px", borderRadius: "2px", border: "1px solid " + OFF_LEDGER + "80", backgroundImage: "repeating-linear-gradient(45deg," + OFF_LEDGER + "6b 0 2px,transparent 2px 5px)" } }) : null
+          )
+        ),
+        h(
+          Content,
+          {
+            side: "top",
+            align: "end",
+            className: "pointer-events-auto p-0",
+            // The ledger is a dense diagnostic, not a hint. Give the step rail
+            // almost the whole viewport so model/account labels and its evidence
+            // footer stay readable; only genuinely overlong cards scroll.
+            // Both primitives carry a host width for ordinary content, so override
+            // it explicitly: this is a full diagnostic surface.
+            style: { width: "min(820px, calc(100vw - 32px))", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 32px)", overflowY: "auto" },
           },
-        });
-      }
-
-      return jsx(
-        "button",
-        {
-          type: "button",
-          onClick: openLedger,
-          title: fmtUsd(data.total) + " metered" +
-            (data.external ? ", plus " + data.external + " off-ledger calls not priced" : "") +
-            "\nOpen the full spend-by-step ledger",
-          style: {
-            display: "inline-flex", alignItems: "center", gap: "5px",
-            fontFamily: MONO_CHIP, fontSize: "11px", fontVariantNumeric: "tabular-nums",
-            padding: "2px 7px", borderRadius: "4px", cursor: "pointer",
-            border: "1px solid var(--border, rgba(128,128,128,0.25))",
-            background: "transparent", color: "inherit", lineHeight: 1.6,
-          },
-        },
-        jsx("span", null, fmtUsd(data.total)),
-        // The floor marker, and the only colour the chip ever uses. Same meaning as everywhere
-        // else in this plugin: spend that is real and not priced here.
-        data.external
-          ? jsx("span", {
-              style: {
-                width: "14px", height: "8px", flex: "none", borderRadius: "2px",
-                border: "1px solid " + OFF_LEDGER + "80",
-                backgroundImage: "repeating-linear-gradient(45deg," + OFF_LEDGER +
-                  "6b 0 2px, transparent 2px 5px)",
-              },
-            })
-          : null
-      );
-    };
-  }
-
-
-  // ====================================================================================
-  // ui/src/card.mjs
-  // ====================================================================================
-  /**
-   * THE KANBAN CARD COST BADGE.
-   *
-   * Renders beside the PR status icon on every board card: one compact figure, plus the
-   * off-ledger hatch when the card handed work to codex/agy.
-   *
-   * IT DOES NOT QUERY. Every instance reads the shared workspace index in cost-index.mjs, which
-   * is two queries for the entire board no matter how many cards are on it. A card slot that
-   * fetched per card is the specific mistake this plugin's notes have warned about since before
-   * the panel existed.
-   *
-   * IT RENDERS NOTHING RATHER THAN A ZERO. No index (Rill down, or a read the browser refused),
-   * or no row for this card (created since the last extract), means no badge. A "$0.00" on a
-   * card that simply is not in the snapshot yet is a claim, and a false one.
-   */
-
-  function createTaskCardCost(host) {
-    var React = host.React;
-    var jsx = host.jsx;
-
-    return function TaskCardCost(props) {
-      // `registerComponent` delivers the slot payload as one `slotProps` prop rather than
-      // spreading it. Both shapes are accepted so this cannot silently render nothing again.
-      var slot = props.slotProps || props;
-      var taskId = slot.taskId;
-
-      var indexState = React.useState(null);
-      var index = indexState[0];
-      var setIndex = indexState[1];
-
-      React.useEffect(function () {
-        var cancelled = false;
-        loadCostIndex().then(function (i) {
-          if (!cancelled) setIndex(i);
-        });
-        return function () { cancelled = true; };
-      }, []);
-
-      if (!index || !index.ok || !taskId) return null;
-      var row = index.byTask[taskId];
-      if (!row) return null;
-
-      var short = fmtUsdShort(row.subcents);
-      if (!short && !row.external) return null;
-
-      return jsx(
-        "span",
-        {
-          title: (short ? fmtUsd(row.subcents) + " metered" : "no metered spend") +
-            (row.external
-              ? ", plus " + row.external + " off-ledger call" +
-                (row.external === 1 ? "" : "s") + " billed to a separate account"
-              : "") +
-            "\nAs of the last Rill extract",
-          style: {
-            display: "inline-flex", alignItems: "center", gap: "3px",
-            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-            fontSize: "10px", fontVariantNumeric: "tabular-nums",
-            opacity: 0.75, whiteSpace: "nowrap", flex: "none",
-          },
-        },
-        short ? jsx("span", null, short) : null,
-        row.external
-          ? jsx("span", {
-              style: {
-                width: "10px", height: "7px", flex: "none", borderRadius: "1px",
-                border: "1px solid " + OFF_LEDGER + "80",
-                backgroundImage: "repeating-linear-gradient(45deg," + OFF_LEDGER +
-                  "6b 0 2px, transparent 2px 5px)",
-              },
-            })
-          : null
+          h("div", { style: { padding: "20px 24px" } }, h(Panel, { taskId: taskId }))
+        )
       );
     };
   }
@@ -1944,12 +1905,11 @@
         };
       }, [status]);
 
+      // Off a secure origin `navigator.clipboard` is simply absent, and this used to do nothing
+      // at all in that case — no copy, no message. The shared path falls back and, either way,
+      // says what happened.
       function copyCommand() {
-        if (navigator.clipboard) {
-          navigator.clipboard.writeText(START_COMMAND).then(function () {
-            if (host.toast && host.toast.success) host.toast.success("Command copied");
-          });
-        }
+        copyTextToClipboard(host, START_COMMAND, "Start command");
       }
 
       var current = VIEWS.filter(function (v) { return v.id === view; })[0] || VIEWS[0];
@@ -2133,48 +2093,33 @@
 
   window.registerKandevPlugin(PLUGIN_ID, {
     initialize: function (registry, host) {
+      // THE FOOTER ICON ROW, not the sidebar list. This is a surface you open when you wonder
+      // what something cost, not one you navigate every few minutes — the same class as Stats
+      // and Settings, which already live down there. A full-width row above the task list spends
+      // permanent vertical space on an occasional question.
+      //
+      // "sidebar-footer" is the plugin-facing name; the host maps it onto its own internal
+      // "insights" group (kandev#2562), which is what the footer strip and the phone menu's
+      // utility group render. A host that predates that mapping degrades this to a plugin-rail
+      // row rather than dropping the item, so there is no version guard to write here.
       registry.registerNavItem({
         id: "opscost",
-        label: "Ops Cost",
+        label: "Ops Intel",
         path: "/plugins/opscost",
-        icon: "chart",
-        section: "main",
+        // A plugin-owned glyph, not the curated "chart" name: that resolved to the same
+        // IconChartBar the host's Stats button uses, and in this row they were indistinguishable.
+        icon: createGaugeIcon(host),
+        section: "sidebar-footer",
       });
 
       // topbar:false — Rill draws its own filter bar and time-range control, so host chrome on
       // top would be a second header competing with it for the same job.
       registry.registerRoute("/plugins/opscost", createOpsCostPage(host), { topbar: false });
 
-      // Added to the task workspace's "+" menu. No capability is needed: like the workspace
-      // probe on the main tab, this reads Rill cross-origin rather than reading Kandev, so the
-      // plugin still requests nothing from the host.
-      registry.registerTaskPanel({
-        id: "task-cost",
-        title: "Cost",
-        icon: "chart",
-        Component: createTaskCostPanel(host),
-        mobileEnabled: true,
-      });
-
-      // A slot component is the only surface that mounts on every task WITHOUT being added —
-      // `registerTaskPanel` has no way to declare itself a default. This puts the card's total
-      // in the session top bar always, and opens the full ledger in a host modal on click.
-      //
-      // For the full panel to open by default instead, save a layout containing it as the
-      // custom Default in Settings > Layouts; Kandev round-trips plugin panels in saved
-      // layouts, and no plugin code can substitute for that.
-      registry.registerComponent("chat-top-bar", createTaskCostChip(host));
-
-      // Spend on every board card, beside the PR status icon.
-      //
-      // NOTE: this is the KANBAN board, not the sidebar task list. The sidebar list mounts no
-      // plugin slot at all (`app-sidebar/sections/tasks-section.tsx` contains no `PluginSlot`),
-      // so there is no way to contribute to it — the board card is the nearest surface Kandev
-      // actually opens up.
-      //
-      // Every instance reads one shared, memoised index rather than querying: two queries for
-      // the whole board regardless of card count. See cost-index.mjs.
-      registry.registerComponent("task-card-indicators", createTaskCardCost(host));
+      // This toolbar slot is always mounted beside the model/send controls. It
+      // is the entry point for the Rill-backed, step-attributed task analysis;
+      // operators never add a panel or first see a session-only cost.
+      registry.registerComponent("chat-input-actions", createStepAnalysisAction(host));
     },
   });
 
