@@ -1,39 +1,63 @@
 #!/usr/bin/env bash
 #
-# The unattended wrapper around refresh.sh — what launchd runs every hour so the snapshot is
-# fresh whenever someone opens the tab, instead of being as old as the last time somebody
-# remembered to re-extract.
+# The unattended wrapper around refresh.sh — what launchd runs, on a short poll interval, so the
+# snapshot reacts to real activity instead of being as old as the last time somebody remembered
+# to re-extract.
 #
 # WHY A WRAPPER AND NOT refresh.sh IN THE PLIST. refresh.sh is the interactive verb: it always
 # extracts, always restarts Rill, and always prints. Run from a timer that is exactly wrong —
-# it would restart Rill at 04:00 on a machine nobody is using, and again ten minutes later if
-# the Mac woke, slept and woke. Everything that makes an hourly run *safe* rather than merely
-# periodic lives here:
+# it would restart Rill at 04:00 on a machine nobody is using, and firing this script every
+# poll would mean Rill restarting every poll too. Everything that makes a run *safe* rather than
+# merely frequent lives here:
 #
 #   * a working-hours window, because a restart outside it serves nobody
 #   * a "Rill is already running" gate, so this refreshes what is in use and never starts a
 #     server the operator did not ask for (see README: the plugin does not start Rill)
-#   * a minimum interval, because launchd fires StartInterval jobs on wake as well as on time,
-#     and two extracts four minutes apart are two 25 MB writes for one answer
-#   * a lock, because an extract that overruns the hour must not meet the next one
+#   * SIGNAL-DRIVEN FAST PATH: main.go subscribes to Kandev's task.moved bus event
+#     (capabilities.events in manifest.yaml — see its comment for why task.moved and not a
+#     direct cost event) and, on every delivery, rewrites $SIGNAL. This script — a separate
+#     process with no Kandev API access of its own — polls that file rather than the bus
+#     directly. A burst of moves (every step advance on a busy workflow publishes one) collapses
+#     into ONE refresh: wait for QUIET_SECONDS since the last move, or MAX_WAIT_SECONDS since the
+#     first pending one, whichever comes first. Triggering per event instead would mean
+#     overlapping extracts and Rill restarting every few seconds instead of on real settle.
+#   * FIXED-TIME MODE: the operator can turn "React to task moves" off in Settings > Plugins >
+#     Ops Intel (config_schema.event_driven), which makes $SIGNAL carry event_driven=0. This
+#     script then ignores first_seen/last_seen entirely and refreshes on a plain interval
+#     (config_schema.fixed_interval_minutes) instead — e.g. to cap this at once an hour
+#     regardless of how often cards move, same cadence as before this whole mechanism existed.
+#   * BACKSTOP: if $SIGNAL doesn't exist at all — the event capability declined at install, an
+#     older Kandev, or the plugin hasn't synced yet — this falls back to the old periodic
+#     cadence (MIN_GAP_MIN), so a refresh still happens even if nothing has ever signaled.
+#   * a lock, because an extract can outlast the poll interval and must not meet the next one
 #
 # Every skip is logged with its reason. A refresher that goes quiet is indistinguishable from
 # one that is working, which is the failure mode this whole project keeps arguing against.
 #
 #   ./auto-refresh.sh              refresh if the gates allow it
-#   ./auto-refresh.sh --force      ignore window, Rill gate and interval (still locks)
+#   ./auto-refresh.sh --force      ignore window, Rill gate, signal and interval (still locks)
 #   ./auto-refresh.sh --self-test  assert the window arithmetic, touch nothing
 #
 # Configuration, all environment variables (set them in the plist, not here):
 #
-#   OPS_INTEL_REFRESH_WINDOW        "08:00-23:00" — local time, inclusive of both ends.
-#                                    A window whose end is before its start spans midnight.
-#   OPS_INTEL_REFRESH_MIN_GAP_MIN   50 — minimum minutes between two refreshes.
-#   OPS_INTEL_REFRESH_TIMEOUT_MIN   10 — a refresh past this is killed, so it cannot hold the lock
-#                                    across the following hours. Anything named rill is spared.
-#   OPS_INTEL_REFRESH_REQUIRE_RILL  1 — refresh only while Rill is listening. 0 refreshes (and
-#                                    therefore starts Rill) regardless.
-#   OPS_INTEL_REFRESH_LOG           ~/Library/Logs/kandev-ops-intel-refresh.log
+#   OPS_INTEL_REFRESH_WINDOW              "08:00-23:00" — local time, inclusive of both ends.
+#                                          A window whose end is before its start spans midnight.
+#   OPS_INTEL_REFRESH_MIN_GAP_MIN         50 — BACKSTOP minutes between refreshes when nothing
+#                                          is signaling a pending change.
+#   OPS_INTEL_REFRESH_QUIET_MINUTES       2 — fallback quiet window, used only until the first
+#                                          event ever writes its own value into $SIGNAL. The
+#                                          operator's real value lives in Settings > Plugins >
+#                                          Ops Intel (config_schema.quiet_minutes) and travels
+#                                          through $SIGNAL, not through this env var.
+#   OPS_INTEL_REFRESH_MAX_WAIT_MINUTES    5 — fallback max-wait, same caveat as above.
+#   OPS_INTEL_REFRESH_FIXED_INTERVAL_MINUTES  60 — fallback fixed-mode interval, same caveat
+#                                          (config_schema.fixed_interval_minutes).
+#   OPS_INTEL_REFRESH_TIMEOUT_MIN         10 — a refresh past this is killed, so it cannot hold
+#                                          the lock into the next several polls. Anything named
+#                                          rill is spared.
+#   OPS_INTEL_REFRESH_REQUIRE_RILL        1 — refresh only while Rill is listening. 0 refreshes
+#                                          (and therefore starts Rill) regardless.
+#   OPS_INTEL_REFRESH_LOG                 ~/Library/Logs/kandev-ops-intel-refresh.log
 #
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +71,11 @@ export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 
 WINDOW="${OPS_INTEL_REFRESH_WINDOW:-08:00-23:00}"
 MIN_GAP_MIN="${OPS_INTEL_REFRESH_MIN_GAP_MIN:-50}"
+# In minutes on the env var, like config_schema — converted to seconds once here since
+# signal_should_refresh compares against $SIGNAL's second-precision timestamps.
+QUIET_SECONDS_DEFAULT=$(( ${OPS_INTEL_REFRESH_QUIET_MINUTES:-2} * 60 ))
+MAX_WAIT_SECONDS_DEFAULT=$(( ${OPS_INTEL_REFRESH_MAX_WAIT_MINUTES:-5} * 60 ))
+FIXED_INTERVAL_SECONDS_DEFAULT=$(( ${OPS_INTEL_REFRESH_FIXED_INTERVAL_MINUTES:-60} * 60 ))
 # 10 minutes, measured rather than guessed: a healthy full refresh on a ~700 MB store is 35
 # seconds end to end (6s snapshot, then the SQL, the Rill restart and check.sh). A deadline is
 # for a genuinely stuck run, and at this ratio ten minutes is already twenty times the real
@@ -60,9 +89,13 @@ REQUIRE_RILL="${OPS_INTEL_REFRESH_REQUIRE_RILL:-1}"
 LOG="${OPS_INTEL_REFRESH_LOG:-$HOME/Library/Logs/kandev-ops-intel-refresh.log}"
 RILL_ORIGIN="${RILL_ORIGIN:-http://localhost:9009}"
 
+# $STATE_DIR must match main.go's stateDir() exactly — it is the one location both the Go
+# plugin process and this shell script can compute identically, from $HOME alone. See that
+# function's comment for why it is not KANDEV_PLUGIN_DATA_DIR.
 STATE_DIR="$HOME/Library/Caches/kandev-ops-intel"
 STAMP="$STATE_DIR/last-refresh"
 LOCK="$STATE_DIR/refresh.lock"
+SIGNAL="$STATE_DIR/refresh-signal"
 
 # ---------------------------------------------------------------- window arithmetic
 
@@ -91,6 +124,17 @@ within_window() {
     fi
 }
 
+# ---------------------------------------------------------------- signal debounce arithmetic
+
+# signal_should_refresh <now> <first_seen> <last_seen> <quiet_s> <max_wait_s>. True (0) once a
+# pending change has either gone quiet or waited long enough; false (1) otherwise. Pure
+# arithmetic — no file I/O — so --self-test can exercise it directly.
+signal_should_refresh() {
+    local now="$1" first_seen="$2" last_seen="$3" quiet_s="$4" max_wait_s="$5"
+    local since_last_move=$((now - last_seen)) since_first_pending=$((now - first_seen))
+    ((since_last_move >= quiet_s || since_first_pending >= max_wait_s))
+}
+
 if [[ "${1:-}" == "--self-test" ]]; then
     fails=0
     t() { # t <expect 0|1> <now> <window>
@@ -112,6 +156,28 @@ if [[ "${1:-}" == "--self-test" ]]; then
     t 1 $((12 * 60)) "22:00-02:00"      # overnight, outside
     t 2 $((12 * 60)) "8am-10pm"         # unparseable is a refusal, not a default
     t 2 $((12 * 60)) "08:00-25:00"      # out-of-range hour likewise
+
+    d() { # d <expect 0|1> <now> <first_seen> <last_seen> <quiet_s> <max_wait_s>
+        local want="$1" now="$2" first="$3" last="$4" quiet="$5" maxw="$6" got=0
+        signal_should_refresh "$now" "$first" "$last" "$quiet" "$maxw" || got=1
+        if [[ "$got" != "$want" ]]; then
+            echo "  FAIL  signal_should_refresh now=$now first=$first last=$last quiet=$quiet max=$maxw -> $got, want $want"
+            fails=1
+        else
+            echo "  PASS  signal_should_refresh now=$now first=$first last=$last quiet=$quiet max=$maxw -> $got"
+        fi
+    }
+    # A single fresh event: not yet quiet, nowhere near max wait.
+    d 1 100 100 100 60 300
+    # Quiet window exactly satisfied (>=, not >): last move 60s ago, quiet=60.
+    d 0 160 100 100 60 300
+    d 1 159 100 100 60 300
+    # Still within quiet after a burst refreshed last_seen, but first_seen is old: max wait
+    # forces a refresh even though moves keep arriving and quiet never settles.
+    d 0 500 100 490 60 300  # since_first=400>=300 even though since_last=10<60
+    d 1 350 100 340 60 300  # since_first=250<300, since_last=10<60 — still waiting
+    # first_seen == last_seen (the very first event of a burst): neither threshold met yet.
+    d 1 100 100 100 60 300
     [[ $fails -eq 0 ]] && echo "self-test ok" || { echo "SELF-TEST FAILED"; exit 1; }
     exit 0
 fi
@@ -165,10 +231,50 @@ if [[ $FORCE -eq 0 ]]; then
             || skip "Rill is not running on $RILL_ORIGIN (nothing is reading the snapshot)"
     fi
 
-    if [[ -f "$STAMP" ]]; then
+    if [[ -f "$SIGNAL" ]]; then
+        # first_seen last_seen quiet_seconds max_wait_seconds event_driven fixed_interval_seconds
+        # — written by main.go's syncSignal, on every task.moved delivery AND on every plugin
+        # restart (which Kandev triggers on any Settings > Plugins > Ops Intel config change).
+        # A malformed or short line (partial write outrun by an atomic rename, or the 4-field
+        # format from before the event_driven toggle existed) falls back to the env-var
+        # defaults and today's timestamp — wait one more quiet window rather than crash or
+        # refresh blindly.
+        read -r first_seen last_seen quiet_s max_wait_s event_driven_s fixed_interval_s \
+            < "$SIGNAL" 2>/dev/null || true
+        now_epoch=$(date +%s)
+        [[ "${first_seen:-}" =~ ^[0-9]+$ ]] || first_seen=$now_epoch
+        [[ "${last_seen:-}" =~ ^[0-9]+$ ]] || last_seen=$now_epoch
+        [[ "${quiet_s:-}" =~ ^[0-9]+$ ]] || quiet_s=$QUIET_SECONDS_DEFAULT
+        [[ "${max_wait_s:-}" =~ ^[0-9]+$ ]] || max_wait_s=$MAX_WAIT_SECONDS_DEFAULT
+        [[ "${event_driven_s:-}" =~ ^[01]$ ]] || event_driven_s=1
+        [[ "${fixed_interval_s:-}" =~ ^[0-9]+$ ]] || fixed_interval_s=$FIXED_INTERVAL_SECONDS_DEFAULT
+
+        if [[ "$event_driven_s" == "1" ]]; then
+            signal_should_refresh "$now_epoch" "$first_seen" "$last_seen" "$quiet_s" "$max_wait_s" || \
+                skip "pending change $((now_epoch - last_seen))s since last move (quiet ${quiet_s}s) / $((now_epoch - first_seen))s since first pending (max wait ${max_wait_s}s)"
+            # Falls through to the lock/refresh below — a pending change has settled or waited
+            # long enough. MIN_GAP_MIN does NOT gate this path: quiet_s already spaces
+            # successive event-driven refreshes, since $SIGNAL is only cleared on success.
+        else
+            # FIXED-TIME MODE: the operator turned "React to task moves" off in Settings.
+            # Ignore first_seen/last_seen entirely and use $STAMP against the operator's own
+            # fixed_interval_minutes, same shape as the BACKSTOP below but their configured
+            # value instead of the env-var default — this is what makes "keep it at an hour
+            # regardless of task.moved" an actual, reachable setting rather than just a hope.
+            if [[ -f "$STAMP" ]]; then
+                age_s=$((now_epoch - $(stat -f %m "$STAMP")))
+                ((age_s < fixed_interval_s)) \
+                    && skip "fixed-interval mode; last refresh $((age_s / 60))m ago (interval $((fixed_interval_s / 60))m)"
+            fi
+        fi
+    elif [[ -f "$STAMP" ]]; then
+        # TRUE BACKSTOP: no signal has EVER been written — the event capability is missing,
+        # declined, or the plugin hasn't synced yet (e.g. right after install, before its first
+        # task.moved or its SetHost callback). Falls back to the env-var default, since there is
+        # no operator config to read here at all.
         age_min=$((($(date +%s) - $(stat -f %m "$STAMP")) / 60))
         ((age_min < MIN_GAP_MIN)) \
-            && skip "last refresh was ${age_min}m ago (minimum gap ${MIN_GAP_MIN}m)"
+            && skip "no pending change; last refresh was ${age_min}m ago (backstop gap ${MIN_GAP_MIN}m)"
     fi
 fi
 
@@ -222,14 +328,28 @@ run_with_deadline() {
 
 if run_with_deadline; then
     touch "$STAMP"
+    # Clear $SIGNAL on success, but ONLY in event-driven mode. There it holds transient
+    # per-burst state (first_seen/last_seen) that must reset so the next task.moved starts a
+    # fresh debounce window — main.go's OnEvent recreates it from scratch on delivery, so a
+    # move that arrives mid-refresh (or in the few seconds right after this rm) just starts a
+    # fresh window rather than being lost. In FIXED-TIME mode $SIGNAL instead holds persistent
+    # operator config (event_driven=0, fixed_interval_seconds); removing it here would silently
+    # fall back to the env-var backstop default (OPS_INTEL_REFRESH_MIN_GAP_MIN, not the
+    # operator's chosen interval) until the next task.moved happened to resync it — which could
+    # be a long wait in fixed-time mode by definition. Re-read rather than reuse the gate
+    # section's variables: this branch also runs under --force, which skips that section
+    # entirely, and re-reading a possibly-absent file is cheap and always correct either way.
+    signal_mode=1
+    [[ -f "$SIGNAL" ]] && { read -r _ _ _ _ signal_mode _ < "$SIGNAL" 2>/dev/null || signal_mode=1; }
+    [[ "$signal_mode" == "1" ]] && rm -f "$SIGNAL"
     elapsed=$(($(date +%s) - started))
     log "refresh ok in $((elapsed / 60))m$((elapsed % 60))s"
 else
     rc=$?
     # refresh.sh ends in check.sh, whose integrity assertions can fail on a snapshot that
     # extracted perfectly well — so the exit status alone does not say whether the data is
-    # usable. Do not stamp: another attempt next hour is cheap, and a stamped failure would
-    # suppress it.
-    log "refresh FAILED (exit $rc) — see the output above; not stamping, will retry next hour"
+    # usable. Do not stamp and do not clear $SIGNAL: the next poll (event-driven or backstop)
+    # retries, and a stamped/cleared failure would suppress that.
+    log "refresh FAILED (exit $rc) — see the output above; not stamping, will retry"
     exit "$rc"
 fi

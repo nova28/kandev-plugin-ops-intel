@@ -9,13 +9,15 @@
 # whatever mechanism serves that.
 #
 # Rill lives in rill/ and is started separately. The managed executable exists
-# because Kandev requires a supervised binary even for UI-only plugins.
+# because Kandev requires a supervised binary even for UI-only plugins — but it is no longer a
+# pure no-op: it subscribes to task.moved so the hourly snapshot can react to real activity
+# instead of only polling. See main.go and rill/auto-refresh.sh's SIGNAL-DRIVEN FAST PATH.
 id: "kandev-plugin-ops-intel"
 api_version: 1
-version: "0.32.0"
+version: "0.33.0"
 display_name: "Ops Intel"
 description: "Operational cost and efficiency intelligence — spend per model, per build step, and anomaly detection."
-author: "henry"
+author: "nova28"
 categories: ["tools"]
 repo_url: "https://github.com/kdlbs/kandev-plugin-template"
 
@@ -28,7 +30,60 @@ runtime:
     # checked into git is a template, not something Kandev ever installs directly.
     "@@PLATFORM@@": "server/plugin-@@PLATFORM@@"
 
-capabilities: {}
+capabilities:
+  # A card's step moves — manually or by the workflow engine advancing it — is the one signal
+  # closest to "cost data just changed": Kandev flushes cost events at a step transition (see
+  # CLAUDE.md's domain facts). This is a proxy for a real office.cost.recorded event, which is
+  # declared in Kandev's event vocabulary but never actually published anywhere in its source
+  # (checked directly; the write path that inserts an office_cost_events row has no publish
+  # call) — subscribing to it today would mean an OnEvent handler that is invoked never.
+  events: ["task.moved"]
+
+# Operator-editable via Settings > Plugins > Ops Intel. Durations are in minutes, not seconds:
+# a single refresh already costs ~35s extraction plus a ~20s Rill restart, so anything
+# sub-minute is false precision for a knob whose sensible range starts around "a couple of
+# minutes" anyway. Read with Host.GetConfig in main.go (durations clamped to a 1-minute floor
+# there — config_schema validates required/type/enum/format/secret, per Kandev's docs, but not
+# a numeric minimum, so a 0 or negative value typed into the form would otherwise defeat
+# debouncing entirely) and written into rill/auto-refresh.sh's signal file, so the shell-driven
+# refresh honors whatever the operator chose without either side hardcoding the other's
+# defaults twice. Synced both on every task.moved delivery AND on host injection (SetHost) —
+# the latter matters because Kandev restarts the plugin on any config change, and OnEvent alone
+# would leave the shell script reading a stale value until the next real task move, which could
+# be a long wait right after someone flips event_driven off. See the matching
+# OPS_INTEL_REFRESH_QUIET_MINUTES / _MAX_WAIT_MINUTES / _FIXED_INTERVAL_MINUTES fallback
+# defaults in rill/auto-refresh.sh, used only until the plugin has written its own value once.
+config_schema:
+  type: object
+  properties:
+    event_driven:
+      {
+        type: boolean,
+        default: true,
+        title: "React to task moves",
+        description: "Refresh shortly after real activity (Quiet window / Max wait below). Turn off to ignore task moves entirely and refresh on a fixed schedule instead (Fixed interval) — e.g. to cap this at once an hour regardless of how often cards move.",
+      }
+    quiet_minutes:
+      {
+        type: integer,
+        default: 2,
+        title: "Quiet window, minutes (if reacting to task moves)",
+        description: "Ignored when \"React to task moves\" is off. Wait this long after the last task move before refreshing — collapses a burst of moves into one refresh instead of one per event.",
+      }
+    max_wait_minutes:
+      {
+        type: integer,
+        default: 5,
+        title: "Max wait, minutes (if reacting to task moves)",
+        description: "Ignored when \"React to task moves\" is off. Refresh at least this often after the first pending change, even if moves keep arriving and the quiet window never settles.",
+      }
+    fixed_interval_minutes:
+      {
+        type: integer,
+        default: 60,
+        title: "Fixed interval, minutes (if NOT reacting to task moves)",
+        description: "Used when \"React to task moves\" is off, as the plain refresh schedule — e.g. once an hour regardless of how often cards move. Also used as a one-time backstop before the first task move ever arrives, even while reacting is on.",
+      }
 
 ui:
   bundle: "/ui/bundle.js"
