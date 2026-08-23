@@ -67,13 +67,24 @@ Every fact table carries two, and picking the wrong one silently answers a diffe
   writes onto messages. The two fact tables resolve it differently, on purpose:
   - `kandev_turns` ASOF-joins on `started_at`, because a turn's work happens *after* its
     start — a turn beginning at the same instant as a stamp belongs to the step being entered.
-  - `kandev_cost` does **not** ASOF-join. A cost event looks *backwards*: it bills the work
-    done since the previous event, and Kandev flushes those events at a step transition, so
-    "nearest stamp at or before" credited the money to the step that had just started. It
-    reported `Testing` at $797 and first in the New Feature Dev table against an actual $331
-    and third. Each event is now attributed to the step holding the most messages in the
-    window it bills. `step_attribution_basis` says whether that window sat in one step or the
-    label is a majority verdict over a window that crossed a boundary (142 of 668 events).
+  - `kandev_cost` resolves its step from the event's **turn stamp** wherever it has one.
+    Kandev stamps `workflow_step_id_at_start` on every turn and `turn_id` on every cost event
+    from 2026-08-16, so from that date the step is a join, not a reconstruction.
+    `step_attribution_basis = 'turn stamp'` marks those rows.
+  - Before the cutover there is no stamp, and `kandev_cost` falls back to a window rule. It
+    does **not** ASOF-join: a cost event looks *backwards*, billing the work done since the
+    previous event, and Kandev flushes those events at a step transition — so "nearest stamp
+    at or before" credited the money to the step that had just started. It reported `Testing`
+    at $797 and first in the New Feature Dev table against an actual $331 and third. The
+    fallback instead attributes each event to the step holding the most messages in the
+    window it bills, and `step_attribution_basis` says whether that window sat in one step or
+    the label is a majority verdict over a window that crossed a boundary.
+  - **The fallback is wrong on multi-profile workflows, and that is why the stamp exists.**
+    A session's timeline records the step it *signals a move into*, not the step it works. On
+    a workflow that runs different steps under different agent profiles, a session parks on a
+    label another session is executing, and its next wake is billed there. Measured against
+    the stamp: 25.4% of post-cutover dollars landed on the wrong step, moving whole models
+    between steps. Pre-cutover rows still carry that error and cannot be repaired.
 - **`current_step`** — where the card sits *now*. Its final resting place. Only useful for
   "what is stuck where".
 
@@ -81,6 +92,43 @@ Filter `step_attributed = 'yes'` before comparing steps. About a fifth of spend 
 before its session's first stamp, and the unattributed pile is larger than most real steps —
 left in, it sits at the top of every leaderboard looking like the most expensive stage of the
 board.
+
+## Cutting to a config epoch
+
+**Read this before quoting any total.** The store spans several config environments, and most of it
+is not evidence about the machine running today. On the 2026-08-20 extract, **$5,798 of the Kandev
+workspace's $8,778 was spent before the epoch series began** — 1M window, no compaction ceiling,
+workflow revisions that no longer exist. Summed undifferentiated, every headline is wrong by
+roughly 3x.
+
+`models/kandev_config_epoch.yaml` is the cut, one row per session. Join it and filter:
+
+```sql
+SELECT c.workflow, c.step_at_event, SUM(c.cost_subcents)/10000.0 AS usd
+FROM kandev_cost c
+JOIN kandev_config_epoch e USING (session_id)
+WHERE e.is_current_series      -- ENV-005 onward: the first OBSERVED ceiling
+  AND e.is_measurable          -- excludes ENV-003, void on a collapsed 200K proxy
+  AND c.origin = 'manual'      -- automation runs are a different population
+GROUP BY 1, 2
+```
+
+Two columns gate what you may claim from a row:
+
+| Column | Read it as |
+|---|---|
+| `epoch_basis` | `transcript` is exact (the environment binds at process spawn). `session start` is a proxy — Kandev stamps the session row, not the process. |
+| `is_measurable` | Validity, not age. Only ENV-003 is false. ENV-001 is old and perfectly good *as ENV-001 evidence*. |
+
+**`epoch_basis` matters more than it looks.** The transcript key reaches 69 of 404 sessions and
+**zero in ENV-007, the current environment** — so any statement about today's config rests on the
+`session start` fallback. Where both keys exist they agree on 59 of 69, and `check.sh` asserts the
+10 disagreements never invert (transcript always earlier). If that assertion ever fails, every
+ENV-007 figure here is suspect.
+
+Boundaries are duplicated between this model and `kandev_requests.yaml` because Rill has no shared
+scalar macro. Edit one, edit both, re-run `./check.sh` — the agreement assertion is what makes the
+duplication safe.
 
 ## Three things this cannot tell you
 

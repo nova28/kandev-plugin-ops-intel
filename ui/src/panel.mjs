@@ -218,6 +218,34 @@ export function createTaskCostPanel(host) {
     );
   }
 
+  /**
+   * "codex (gpt-5.2-codex × 4, (unspecified) × 12)" per agent, one array entry each — the
+   * shared shape behind both the per-step tooltip and the card-level floor chip, so the two
+   * never drift apart. `models` is best-effort (see extract.sql); an agent with no breakdown
+   * at all falls back to the plain count rather than an empty parenthesis.
+   */
+  function agentModelBreakdown(agents, models) {
+    return Object.keys(agents).map(function (a) {
+      var byModel = models && models[a] ? models[a] : null;
+      var modelKeys = byModel ? Object.keys(byModel) : [];
+      if (!modelKeys.length) return a + " × " + agents[a];
+      var parts = modelKeys
+        .sort(function (x, y) { return byModel[y] - byModel[x]; })
+        .map(function (m) { return m + " × " + byModel[m]; })
+        .join(", ");
+      return a + " (" + parts + ")";
+    });
+  }
+
+  /**
+   * Tooltip for the off-ledger badge: which agent, which model, how many calls — and an
+   * explicit statement that there is no price, rather than a number quietly implying $0.
+   */
+  function offLedgerTitle(s) {
+    var byAgent = agentModelBreakdown(s.externalAgents, s.externalAgentModels).join(", ");
+    return byAgent + " — billed to a separate account, no price recorded here";
+  }
+
   /** One step of the rail: what it cost, which models paid for it, how long it held the card. */
   function StepRow(props) {
     var s = props.step;
@@ -273,9 +301,7 @@ export function createTaskCostPanel(host) {
           }, s.step),
           s.external
             ? jsx("span", {
-                title: Object.keys(s.externalAgents).map(function (a) {
-                  return a + " × " + s.externalAgents[a];
-                }).join(", ") + " — billed to a separate account",
+                title: offLedgerTitle(s),
                 style: {
                   fontFamily: MONO, fontSize: "9px", letterSpacing: "0.05em",
                   color: OFF_LEDGER, border: "1px solid " + OFF_LEDGER + "59",
@@ -573,9 +599,8 @@ export function createTaskCostPanel(host) {
           .reduce(function (n, s) { return n + stepTotal(s, selected, selectedProfile); }, 0)
       : data.total;
 
-    var agentNames = Object.keys(data.externalAgents).map(function (a) {
-      return a + " × " + data.externalAgents[a];
-    }).join(" · ");
+    var agentNames = agentModelBreakdown(data.externalAgents, data.externalAgentModels)
+      .join(" · ");
 
     return shell([
       // ---- headline
@@ -732,12 +757,12 @@ export function createTaskCostPanel(host) {
           return a == null ? null : jsx("div", null,
             "Snapshot " + fmtDuration(a) + " old");
         })(),
-        data.stepBasis === "ledger"
-          ? jsx("div", null, "Step source: transition ledger")
-          : data.stepBasis === "stamps"
-            ? jsx("div", null, "Step source: message stamps (approximate)")
+        data.stepBasis === "stamp"
+          ? jsx("div", null, "Step source: turn stamps (exact)")
+          : data.stepBasis === "inferred"
+            ? jsx("div", null, "Step source: billing windows (approximate)")
             : data.stepBasis === "mixed"
-              ? jsx("div", null, "Step source: ledger + message stamps")
+              ? jsx("div", null, "Step source: turn stamps + billing windows")
               : null,
         data.verdict > 0
           ? jsx("div", null, fmtUsd(data.verdict) + " uses multi-step attribution")

@@ -77,7 +77,7 @@ sql: |
           -- read 725:1 input:output — "the worst churn on the board" — when the figure
           -- restricted to clean windows is 524:1, against Build's 523. The ratio was an
           -- artifact of soft attribution and one card, and nothing on the step table said so.
-          SUM(cost_subcents) FILTER (WHERE step_attribution_basis = 'window sat in one step')
+          SUM(cost_subcents) FILTER (WHERE step_attribution_basis IN ('turn stamp', 'window sat in one step'))
                                                 AS clean_cost_subcents
       FROM kandev_cost
       WHERE step_attributed = 'yes'

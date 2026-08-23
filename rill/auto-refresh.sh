@@ -153,6 +153,14 @@ if [[ $FORCE -eq 0 ]]; then
         # Ask whether Rill answers rather than whether a process matches: a `rill start` that is
         # wedged mid-reconcile is a process, and restarting it is precisely what we want. curl
         # against the port is the same question the plugin's own probe asks.
+        #
+        # THIS GATE CANNOT RESTART RILL, ONLY DECLINE TO WORK WITHOUT IT — so anything that
+        # leaves Rill dead makes the schedule permanently inert. That happened: refresh.sh
+        # pkill'd Rill and could not exec the replacement, and from the next hour on this gate
+        # skipped every run with exit 0, which reads as healthy in `launchctl print` and hides
+        # the outage better than the failure did. refresh.sh now resolves `rill` BEFORE killing
+        # anything, so the loop cannot be entered; recovery from an existing one is a single
+        # `make refresh FORCE=1`, which bypasses this gate and starts Rill.
         curl -s -o /dev/null --max-time 4 "$RILL_ORIGIN/" \
             || skip "Rill is not running on $RILL_ORIGIN (nothing is reading the snapshot)"
     fi

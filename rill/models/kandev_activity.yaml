@@ -1,7 +1,8 @@
 # One row per message — what the agent actually did, with no message content.
 #
-# This is where the step-transition ledger gets reconstructed. `session_step_history` and
-# `workflow_step_decisions` are both zero rows, so transitions exist only as tool calls:
+# This is where the step-transition ledger gets reconstructed. `workflow_step_decisions` is
+# zero rows and `session_step_history` (586 rows) covers only 148 of 312 sessions (47.4%),
+# so transitions are read from tool calls instead:
 # `step_complete_kandev` is an advance and `move_task_kandev` is an explicit move. Two
 # limits follow and neither is fixable downstream:
 #
@@ -19,8 +20,8 @@ sql: |
           *,
           -- Forward-fill the stamped step across the session. A stamp marks step ENTRY, so
           -- every message after it belongs to that step until the next stamp. This is the
-          -- step-transition ledger reconstructed — the real one (`session_step_history`) is
-          -- zero rows.
+          -- step-transition ledger reconstructed — `session_step_history` exists (586 rows)
+          -- but covers only 148 of 312 sessions, so it cannot be the sole source.
           --
           -- Two honest limits, both visible in the data rather than papered over:
           --  * The first stamp lands on average at message ~61 of a session, so everything
@@ -60,6 +61,24 @@ sql: |
       -- understated by whatever they spent on someone else's bill.
       COALESCE(m.external_agent, '(none)') AS external_agent,
       m.external_agent IS NOT NULL         AS is_external_agent_call,
+
+      -- Which model an off-ledger call named, when the invocation said so explicitly (see
+      -- extract.sql for the two flag forms this reads). Still no price — see the measure
+      -- comment in the metrics view for why that figure does not exist anywhere in this store.
+      COALESCE(m.external_agent_model, '(unspecified)') AS external_agent_model,
+
+      -- Real tokens an off-ledger call reported, read from its own captured stdout (see
+      -- extract.sql). external_agent_tokens_total is the plain sum (input+output), present
+      -- for both codex review's native output and Challenge/Consult's --json output; the
+      -- five *_in/*_cached_input/*_cache_write/*_out/*_reasoning_output columns are the
+      -- richer breakdown, present only where the skill's CODEX_USAGE line was captured.
+      -- Still never a price — token counts alone don't tell you a rate.
+      m.external_agent_tokens_total             AS external_agent_tokens_total,
+      m.external_agent_tokens_in                 AS external_agent_tokens_in,
+      m.external_agent_tokens_cached_input       AS external_agent_tokens_cached_input,
+      m.external_agent_tokens_cache_write        AS external_agent_tokens_cache_write,
+      m.external_agent_tokens_out                AS external_agent_tokens_out,
+      m.external_agent_tokens_reasoning_output   AS external_agent_tokens_reasoning_output,
 
       -- Coarse grouping, so "where does a turn's activity go" is one chart rather than a
       -- 200-row tool leaderboard.

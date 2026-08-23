@@ -10,7 +10,37 @@
 # back-derived from token prices and that answer was wrong by 10x — an undocumented unit is
 # not something to infer from a plausible-looking arithmetic check.
 #
-# STEP ATTRIBUTION: WHY THIS IS NOT AN ASOF JOIN ANY MORE.
+# STEP ATTRIBUTION: THE STAMP FIRST, THE WINDOW ONLY WHERE THERE IS NO STAMP.
+#
+# Every event from 2026-08-16 onward carries `turn_id`, and its turn carries
+# `step_at_start` — the step Kandev read off the card when it created the turn, in the same
+# transaction. That is a READING of the step, and it replaces the window reconstruction
+# below wherever it exists. `step_attribution_basis = 'turn stamp'` marks those rows.
+#
+# WHY THE WINDOW RULE HAD TO BE DEMOTED — IT IS WRONG ON MULTI-PROFILE WORKFLOWS.
+#
+# The window rule labels an event by the step that owned the window, read off the SESSION's
+# own step timeline. That timeline comes from `session_step_history`, which records the step
+# a session SIGNALS A MOVE INTO — not the step it goes on to work. On a workflow that gives
+# different steps different agent profiles, those are different things: the session that
+# finishes Triage records "entered Build", but Build belongs to the other profile's session,
+# so the first session parks on the label `Build` and does no Build work at all. The next
+# time it wakes — for Review — its window is still labelled Build, and Review's spend is
+# billed to Build.
+#
+# Measured on the live store, comparing the window verdict against the stamp on the 413
+# stamped events the ledger covers: 106 events and $736 of $2,898 — 25.4% of the money —
+# land on the wrong step, across 27 cards. On one card (`eff7b1f0`, Fix / Chore, Opus on
+# Triage+Review and Sonnet on Build+Verify+PR) it read `Build $21.93, sonnet + opus[1m]`
+# for a step that ran Sonnet only and cost $15.02, while Review — which spent every one of
+# those Opus dollars — read $12.08 of sonnet, and Create PR vanished from the panel
+# entirely. The error is not noise around a correct total: it moves whole models between
+# steps, which is the exact comparison the per-step table exists to support.
+#
+# The window rule is kept, unchanged, for pre-cutover events. It cannot be improved for
+# them — the stamp cannot be backfilled — and its own reason for existing is still sound:
+#
+# WHY THE WINDOW RULE IS NOT AN ASOF JOIN.
 #
 # It used to be `ASOF JOIN ... ON occurred_at >= effective_from` — attribute the spend to the
 # most recent step stamp at or before the event. That is wrong, and measurably so. Cost events
@@ -43,8 +73,9 @@
 #     not enough to justify breaking the one-row-per-cost-event grain that `cost_events`,
 #     `kandev_cards` and `kandev_step_diagnostics` all count on.
 #
-#   * Message count is a proxy for model round-trips, not a meter. It is the only per-step
-#     volume signal in the store — `office_cost_events` has no turn_id and never will.
+#   * Message count is a proxy for model round-trips, not a meter. It was the only per-step
+#     volume signal in the store for events that have no `turn_id`; from the 2026-08-16
+#     cutover the stamp supersedes it and this weighting no longer runs.
 #
 # 17 events lose attribution entirely under this rule (503 attributed, down from 520): their
 # only stamp is at or after the event, so nothing is known to have preceded them. That is the
@@ -58,21 +89,44 @@ materialize: true
 
 sql: |
   WITH
+  -- THE STAMP. One row per event that can be resolved exactly, via its turn.
+  --
+  -- `NULLIF(turn_id, '')` because the extract emits empty string, not NULL, for the
+  -- pre-cutover events; and `step_at_start IS NOT NULL` because a turn whose stamp write
+  -- degraded joins fine and still knows nothing. Both cases fall through to the window rule
+  -- rather than being attributed on a blank.
+  stamp AS (
+      SELECT
+          e.cost_event_id,
+          t.step_at_start AS step
+      FROM src_fct_cost_event e
+      JOIN src_fct_turn t ON t.turn_id = NULLIF(e.turn_id, '')
+      WHERE t.step_at_start IS NOT NULL
+  ),
+
   -- The window an event bills: from the previous event in the same session to this one. A
   -- session's first event falls back to the session start; if that is missing too the window
   -- collapses to the instant, which no slice can dominate, and the row goes unattributed.
+  --
+  -- LAG runs over EVERY event in the session, stamped or not, before the stamped ones are
+  -- dropped. The window an unstamped event bills is the work since the previous event that
+  -- actually happened — filtering first would silently stretch it back over a stamped
+  -- neighbour and bill that neighbour's work twice.
   win AS (
-      SELECT
-          e.cost_event_id,
-          e.session_id,
-          e.occurred_at,
-          COALESCE(
-              LAG(e.occurred_at) OVER (PARTITION BY e.session_id ORDER BY e.occurred_at),
-              s.session_started_at,
-              e.occurred_at
-          ) AS window_from
-      FROM src_fct_cost_event e
-      LEFT JOIN src_dim_session s ON s.session_id = e.session_id
+      SELECT * FROM (
+          SELECT
+              e.cost_event_id,
+              e.session_id,
+              e.occurred_at,
+              COALESCE(
+                  LAG(e.occurred_at) OVER (PARTITION BY e.session_id ORDER BY e.occurred_at),
+                  s.session_started_at,
+                  e.occurred_at
+              ) AS window_from
+          FROM src_fct_cost_event e
+          LEFT JOIN src_dim_session s ON s.session_id = e.session_id
+      )
+      WHERE cost_event_id NOT IN (SELECT cost_event_id FROM stamp)
   ),
   -- The step timeline as half-open intervals. The last slice of a session stays open.
   slice AS (
@@ -205,16 +259,28 @@ sql: |
           ELSE                                          'attributed to a card'
       END AS cost_attribution,
 
-      -- Which step owned the window this event bills. See the attribution note in the header —
-      -- this is what makes "what does Review cost" answerable at all, because the cost table
-      -- has no step column and the card's `current_step` is where the card ended up, not where
-      -- the money went.
-      COALESCE(a.step, '(step not attributable)') AS step_at_event,
-      CASE WHEN a.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
+      -- The step this event's spend belongs to: the turn's own stamp where there is one,
+      -- otherwise the step that owned the window it bills. See the attribution note in the
+      -- header — this is what makes "what does Review cost" answerable at all, because the
+      -- cost table has no step column and the card's `current_step` is where the card ended
+      -- up, not where the money went.
+      COALESCE(st.step, a.step, '(step not attributable)') AS step_at_event,
+      CASE WHEN st.step IS NULL AND a.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
 
-      -- Whether that label is a fact about the window or a majority verdict over a window that
-      -- crossed a step boundary. Read it before quoting a single step's total as exact.
+      -- HOW MUCH TO TRUST THAT LABEL. Three tiers, and the gap between the first and the
+      -- other two is the difference between a reading and a reconstruction:
+      --
+      --   'turn stamp'                  exact. Kandev read the step off the card when it
+      --                                 created the turn.
+      --   'window sat in one step'      inferred, but from a window that never left a step.
+      --   'dominant of N steps ...'     inferred, and a majority verdict over a window that
+      --                                 crossed a boundary.
+      --
+      -- Anything other than 'turn stamp' is pre-2026-08-16 data and carries the
+      -- multi-profile error described in the header. Filter on it before quoting a single
+      -- step's total as exact — `kandev_card_steps.clean_cost_subcents` exists for that.
       CASE
+          WHEN st.step IS NOT NULL     THEN 'turn stamp'
           WHEN a.step IS NULL          THEN 'not attributable'
           WHEN a.steps_in_window = 1   THEN 'window sat in one step'
           ELSE                              'dominant of ' || a.steps_in_window || ' steps in window'
@@ -224,4 +290,5 @@ sql: |
   LEFT JOIN src_dim_task      d  ON d.task_id       = c.task_id
   LEFT JOIN src_dim_session   s  ON s.session_id    = c.session_id
   LEFT JOIN attributed        a  ON a.cost_event_id = c.cost_event_id
+  LEFT JOIN stamp             st ON st.cost_event_id = c.cost_event_id
   LEFT JOIN dim_model_family  mf ON mf.model        = c.model

@@ -37,8 +37,16 @@ bundle:
 
 # The Rill ledger's pure formatting and attribution assembly are dependency-free
 # Node tests; no running Kandev or Rill server is required.
+#
+# Glob the files rather than passing the directory: under Node 22 `--test test/` resolves the
+# argument as a MODULE and dies with "Cannot find module .../test", which reads like a broken
+# import inside a test and is actually the runner never starting. Every test silently stopped
+# running the day the pinned Node moved.
+#
+# NOTE: this covers the pure JS only. Step attribution lives in SQL and is asserted by
+# rill/check.sh against a running Rill — see the step-attribution block there.
 test:
-	$(NODE) --test test/
+	$(NODE) --test test/*.test.mjs
 
 # plugin-pack walks EVERY file under -dir with no ignore mechanism, so packing the repo root
 # would ship whatever happens to be lying in it: the Rill project (25 MB of extracted CSV and

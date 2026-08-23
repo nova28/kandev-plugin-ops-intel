@@ -104,6 +104,42 @@ test("off-ledger calls roll up per step and across the card", () => {
   assert.equal(r.rail[0].external, 10);
 });
 
+test("off-ledger calls carry a best-effort model breakdown, never a price", () => {
+  var cost = [costRow("Review", "sonnet", 300, "2026-08-08T15:25:00Z")];
+  var external = [
+    { step: "Review", agent: "codex", model: "gpt-5.2-codex", n: 4 },
+    // Most codex/agy calls name no model at all — extract.sql reports that as NULL, which the
+    // query layer never sees because the row is absent from `model`, not present as null.
+    { step: "Review", agent: "codex", n: 12 },
+    { step: "Review", agent: "agy", model: "gpt-5.1", n: 3 },
+  ];
+  var r = assembleLedger(cost, external, [], [], ORDER);
+
+  assert.deepEqual(r.rail[0].externalAgentModels, {
+    codex: { "gpt-5.2-codex": 4, "(unspecified)": 12 },
+    agy: { "gpt-5.1": 3 },
+  });
+  assert.deepEqual(r.externalAgentModels, {
+    codex: { "gpt-5.2-codex": 4, "(unspecified)": 12 },
+    agy: { "gpt-5.1": 3 },
+  });
+  // The agent-level count is unaffected — it was already right and nothing here should change it.
+  assert.deepEqual(r.externalAgents, { codex: 16, agy: 3 });
+});
+
+test("off-ledger model breakdown rolls up across steps at the card level", () => {
+  // A non-empty on-ledger cost keeps this out of the "empty" early return (see the test above
+  // this one for that case) — the point here is the cross-step model rollup, not zero-spend.
+  var cost = [costRow("Spec", "opus", 100, "2026-08-08T05:00:00Z")];
+  var external = [
+    { step: "Review", agent: "codex", model: "gpt-5.2-codex", n: 2 },
+    { step: "Build", agent: "codex", model: "gpt-5.2-codex", n: 5 },
+    { step: "Build", agent: "codex", model: "gpt-5", n: 1 },
+  ];
+  var r = assembleLedger(cost, external, [], [], ORDER);
+  assert.deepEqual(r.externalAgentModels, { codex: { "gpt-5.2-codex": 7, "gpt-5": 1 } });
+});
+
 test("a step with only off-ledger calls survives, at zero on-ledger cost", () => {
   var cost = [costRow("Spec", "opus", 100, "2026-08-08T05:00:00Z")];
   var external = [{ step: "Build", agent: "codex", n: 4 }];
@@ -435,9 +471,16 @@ test("spend whose account came from the session is counted separately", () => {
 });
 
 // ---------------------------------------------------------------------------------------
-// Step-timeline source. Two sources with different trustworthiness — on ledger sessions 83%
-// of spend lands in one step exactly and none is unplaceable; on stamp sessions that is 58%,
-// with 38% majority verdicts. A reader acting on a per-step figure must know which they got.
+// HOW THE PER-STEP SPLIT WAS RESOLVED. Two mechanisms with very different trustworthiness.
+//
+// 'turn stamp' is a reading: Kandev recorded the step on the turn, at turn creation, in the
+// same transaction. Anything else is the billing-window reconstruction, which is wrong on
+// any workflow that runs different steps under different agent profiles — a session parks on
+// the label of a step another session is executing, and its next wake bills there. Measured
+// at 25.4% of post-cutover dollars landing on the wrong step before this was fixed.
+//
+// So the panel must never call an inferred split exact. These tests pin that, and pin the
+// weighting: the basis is decided by DOLLARS, not row counts.
 // ---------------------------------------------------------------------------------------
 
 function withSource(rows) {
@@ -445,21 +488,47 @@ function withSource(rows) {
   return assembleLedger(cost, [], [], [], ORDER, [], [{ in_snapshot: 1 }], [], rows);
 }
 
-test("a card whose steps come from the ledger says so", () => {
-  assert.equal(withSource([{ from_ledger: 1, from_stamps: 0 }]).stepBasis, "ledger");
+test("a card attributed entirely from turn stamps is reported as exact", () => {
+  assert.equal(withSource([{ stamped: 5000, inferred: 0 }]).stepBasis, "stamp");
 });
 
-test("a card still on reconstructed message stamps says so", () => {
-  assert.equal(withSource([{ from_ledger: 0, from_stamps: 1 }]).stepBasis, "stamps");
+test("a card attributed entirely from billing windows says it is inferred", () => {
+  assert.equal(withSource([{ stamped: 0, inferred: 5000 }]).stepBasis, "inferred");
 });
 
-test("a card straddling the cutover is reported as mixed, not as either one", () => {
+test("a card straddling the turn_id cutover is reported as mixed, not as either one", () => {
   // Claiming "exact" for a card that is half reconstructed would be the worst of the three.
-  assert.equal(withSource([{ from_ledger: 1, from_stamps: 1 }]).stepBasis, "mixed");
+  assert.equal(withSource([{ stamped: 3000, inferred: 2000 }]).stepBasis, "mixed");
 });
 
-test("no step points at all yields null, not a false claim of exactness", () => {
-  assert.equal(withSource([{ from_ledger: 0, from_stamps: 0 }]).stepBasis, null);
+test("one inferred dollar on an otherwise-stamped card still downgrades it to mixed", () => {
+  // The regression this guards: a threshold or a row count would round this to "exact" and
+  // the reader would quote a per-step figure that has a reconstructed component in it. The
+  // rail is only as exact as its least exact row.
+  assert.equal(withSource([{ stamped: 999999, inferred: 1 }]).stepBasis, "mixed");
+});
+
+test("basis is weighted by spend, so one big inferred event cannot hide behind many stamps", () => {
+  // Counting rows would call this card exact on a 1:1 split of the money. The event that
+  // moves the most money is exactly the one whose attribution matters.
+  assert.equal(withSource([{ stamped: 100, inferred: 90000 }]).stepBasis, "mixed");
+});
+
+test("a card with no attributed spend yields null, not a false claim of exactness", () => {
+  // An empty sum is not evidence of an exact reading. Defaulting to "stamp" here would put
+  // "exact" under every card whose spend is entirely unattributable.
+  assert.equal(withSource([{ stamped: 0, inferred: 0 }]).stepBasis, null);
   assert.equal(withSource([]).stepBasis, null);
   assert.equal(withSource(null).stepBasis, null);
+});
+
+test("a majority-verdict window is still counted as spend needing the caveat", () => {
+  // `verdict` is independent of stepBasis and keys off 'dominant of%'. A turn-stamped row
+  // must never land in it — the stamp does not straddle anything.
+  var cost = [
+    costRow("Build", "sonnet", 400, "2026-08-08T15:00:00Z", { is_verdict: true }),
+    costRow("Review", "opus", 600, "2026-08-08T16:00:00Z", { is_verdict: false }),
+  ];
+  var r = assembleLedger(cost, [], [], [], ORDER, []);
+  assert.equal(r.verdict, 400, "only the row whose window crossed a boundary");
 });

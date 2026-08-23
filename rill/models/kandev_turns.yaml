@@ -45,16 +45,27 @@ sql: |
       t.config_completeness,
 
       -- Card and workflow context. `current_step` is the card's step NOW, not the step this
-      -- turn ran under; no per-event step exists in the store.
+      -- turn ran under — see `step_at_event` below for that.
       d.workspace,
       d.workflow,
       d.current_step,
       d.stage_type,
 
-      -- The step this TURN ran under, resolved by ASOF join to the step timeline. Use this
-      -- for per-step timing; `current_step` is where the card ended up.
-      COALESCE(p.step, '(step not attributable)') AS step_at_event,
-      CASE WHEN p.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
+      -- The step this TURN ran under: its own stamp where it has one, ASOF against the step
+      -- timeline otherwise. Use this for per-step timing; `current_step` is where the card
+      -- ended up.
+      --
+      -- The stamp comes first for the same reason it does in `kandev_cost`, and keeping the
+      -- two in step matters beyond this model: `kandev_card_steps` puts cost and turns on one
+      -- row, and its header is explicit that a ratio whose halves used different attribution
+      -- rules is not a ratio. Cost moved to the stamp; turns move with it.
+      --
+      -- The ASOF fallback is still right for unstamped turns, and for the reason originally
+      -- given: a turn's work happens AFTER `started_at`, so a turn beginning at the same
+      -- instant as a transition belongs to the step being ENTERED. That tie breaks the other
+      -- way for cost, which looks backwards.
+      COALESCE(t.step_at_start, p.step, '(step not attributable)') AS step_at_event,
+      CASE WHEN t.step_at_start IS NULL AND p.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
       d.task_title,
       d.task_state,
       d.priority,

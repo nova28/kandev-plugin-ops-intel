@@ -507,11 +507,13 @@
 
     // Work handed to codex/agy. Real calls with NO cost row anywhere in this store — they bill
     // to a separate account. Counting them is the only way the panel can state how incomplete
-    // its own total is.
+    // its own total is. `model` is a best-effort label (see extract.sql), never a price — that
+    // figure does not exist anywhere in this store for an off-ledger call.
     var external =
-      "SELECT step_at_event AS step, external_agent AS agent, count(*) AS n" +
+      "SELECT step_at_event AS step, external_agent AS agent, external_agent_model AS model," +
+      " count(*) AS n" +
       " FROM " + ACTIVITY_MODEL + " WHERE task_id = '" + id + "'" +
-      " AND is_external_agent_call GROUP BY 1, 2";
+      " AND is_external_agent_call GROUP BY 1, 2, 3";
 
     // Timing. Negative gaps are real in this store (overlapping turns) and are clamped to zero
     // rather than allowed to deflate a step's idle total.
@@ -576,16 +578,25 @@
     // was running as it said so. Nothing in Rill knows the wall clock; only the caller does.
     var freshness = "SELECT max(created_at) AS last_activity FROM src_fct_message";
 
-    // WHICH STEP TIMELINE THIS CARD GOT. Two sources with very different trustworthiness:
-    // Kandev's real transition ledger (exact intervals, sees manual moves) or the old
-    // reconstruction from message stamps (approximate, blind to manual moves, and blind to
-    // everything before a session's first stamp). A reader deciding whether to act on a
-    // per-step figure should know which one produced it.
+    // HOW THIS CARD'S PER-STEP SPLIT WAS RESOLVED, weighted by the money it moves.
+    //
+    // This used to report the card's step TIMELINE source (transition ledger vs message
+    // stamps). That was the wrong question: the timeline is an input to the fallback, and a
+    // card can have a perfect ledger and still have every figure on this rail inferred. What a
+    // reader needs to know is whether the SPEND was attributed by reading each turn's own
+    // stamp or by reconstructing which step owned a billing window — the second is what puts
+    // Review's Opus dollars on a Sonnet-only Build row when a workflow runs steps under
+    // different agent profiles. See models/kandev_cost.yaml.
+    //
+    // Weighted by subcents rather than counted by rows, because one inferred event carrying
+    // most of a card is the case worth warning about and a row count would bury it.
     var stepSource =
-      "SELECT max(CASE WHEN p.basis LIKE 'ledger%' THEN 1 ELSE 0 END) AS from_ledger," +
-      " max(CASE WHEN p.basis = 'message stamp' THEN 1 ELSE 0 END) AS from_stamps" +
-      " FROM kandev_step_points p JOIN src_dim_session s ON s.session_id = p.session_id" +
-      " WHERE s.task_id = '" + id + "'";
+      "SELECT" +
+      " COALESCE(SUM(CASE WHEN step_attribution_basis = 'turn stamp'" +
+      "   THEN cost_subcents ELSE 0 END), 0) AS stamped," +
+      " COALESCE(SUM(CASE WHEN step_attribution_basis <> 'turn stamp'" +
+      "   THEN cost_subcents ELSE 0 END), 0) AS inferred" +
+      " FROM kandev_cost WHERE task_id = '" + id + "' AND step_attributed = 'yes'";
 
     return [cost, external, timing, peers, order, modelTiming, presence, freshness, stepSource];
   }
@@ -603,8 +614,9 @@
    * elapsed agent work, which is a much lower number than its generation rate and the more
    * useful one for comparing what a model actually costs in time.
    *
-   * It also cannot be exact: `office_cost_events` carries no turn_id, so tokens are matched to
-   * time only through the model label both sides happen to carry. Aggregate, not per-turn.
+   * It also cannot be exact: cost events carry a turn_id only from 2026-08-16, and this join
+   * has to cover the whole store, so tokens are matched to time through the model label both
+   * sides happen to carry. Aggregate, not per-turn.
    */
   function modelRates(models, timingRows) {
     var secs = {};
@@ -628,13 +640,17 @@
                                  freshness, stepSource) {
     var snapshotAt = freshness && freshness.length ? freshness[0].last_activity || null : null;
     var src = stepSource && stepSource.length ? stepSource[0] : null;
-    // "ledger" | "stamps" | "mixed" | null. Mixed means a card whose sessions straddle the
-    // 2026-08-12 cutover; its rail is part exact and part reconstructed.
-    var stepBasis = !src ? null
-      : Number(src.from_ledger || 0) && Number(src.from_stamps || 0) ? "mixed"
-      : Number(src.from_ledger || 0) ? "ledger"
-      : Number(src.from_stamps || 0) ? "stamps"
-      : null;
+    // "stamp" | "inferred" | "mixed" | null. Mixed means a card whose spend straddles the
+    // 2026-08-16 turn_id cutover; part of its rail is read and part reconstructed.
+    //
+    // A card with neither (no attributed spend at all) is null, not "stamp" — an empty sum is
+    // not evidence of an exact reading.
+    var stamped = src ? Number(src.stamped || 0) : 0;
+    var inferred = src ? Number(src.inferred || 0) : 0;
+    var stepBasis = !src || (!stamped && !inferred) ? null
+      : stamped && inferred ? "mixed"
+      : stamped ? "stamp"
+      : "inferred";
     // The cost query decides whether the panel can say anything at all. A null answer means
     // the read was refused, not that the task was free.
     if (cost === null) return { state: "blocked" };
@@ -681,7 +697,10 @@
           // or by both, without re-querying.
           subcents: 0, events: 0, entries: [], models: [], firstAt: null,
           cached: 0, fresh: 0, out: 0, synthesized: 0, verdict: 0, inferredProfile: 0,
-          external: 0, externalAgents: {},
+          // externalAgents is agent -> count, unchanged. externalAgentModels adds a second cut,
+          // agent -> { model -> count }, so the off-ledger badge can say WHAT ran, not just how
+          // many calls — still never a price, which this store has nowhere for an off-ledger call.
+          external: 0, externalAgents: {}, externalAgentModels: {},
           turns: 0, agentS: 0, idleS: 0,
         };
       }
@@ -722,8 +741,11 @@
     (external || []).forEach(function (r) {
       var s = slot(r.step);
       var n = Number(r.n || 0);
+      var model = r.model || "(unspecified)";
       s.external += n;
       s.externalAgents[r.agent] = (s.externalAgents[r.agent] || 0) + n;
+      if (!s.externalAgentModels[r.agent]) s.externalAgentModels[r.agent] = {};
+      s.externalAgentModels[r.agent][model] = (s.externalAgentModels[r.agent][model] || 0) + n;
     });
 
     (timing || []).forEach(function (r) {
@@ -805,9 +827,16 @@
       .sort(function (a, b) { return b.subcents - a.subcents; });
 
     var agents = {};
+    var agentModels = {};
     all.forEach(function (s) {
       Object.keys(s.externalAgents).forEach(function (a) {
         agents[a] = (agents[a] || 0) + s.externalAgents[a];
+      });
+      Object.keys(s.externalAgentModels).forEach(function (a) {
+        if (!agentModels[a]) agentModels[a] = {};
+        Object.keys(s.externalAgentModels[a]).forEach(function (m) {
+          agentModels[a][m] = (agentModels[a][m] || 0) + s.externalAgentModels[a][m];
+        });
       });
     });
 
@@ -818,6 +847,7 @@
       total: sum("subcents"),
       external: sum("external"),
       externalAgents: agents,
+      externalAgentModels: agentModels,
       // Events whose TOKEN COUNTS were synthesized rather than reported. Deliberately not
       // called "estimated cost": cost provenance is not recorded anywhere in this store, so
       // whether a figure is a bill or a list-price reconstruction is unanswerable and must
@@ -1139,6 +1169,34 @@
       );
     }
 
+    /**
+     * "codex (gpt-5.2-codex × 4, (unspecified) × 12)" per agent, one array entry each — the
+     * shared shape behind both the per-step tooltip and the card-level floor chip, so the two
+     * never drift apart. `models` is best-effort (see extract.sql); an agent with no breakdown
+     * at all falls back to the plain count rather than an empty parenthesis.
+     */
+    function agentModelBreakdown(agents, models) {
+      return Object.keys(agents).map(function (a) {
+        var byModel = models && models[a] ? models[a] : null;
+        var modelKeys = byModel ? Object.keys(byModel) : [];
+        if (!modelKeys.length) return a + " × " + agents[a];
+        var parts = modelKeys
+          .sort(function (x, y) { return byModel[y] - byModel[x]; })
+          .map(function (m) { return m + " × " + byModel[m]; })
+          .join(", ");
+        return a + " (" + parts + ")";
+      });
+    }
+
+    /**
+     * Tooltip for the off-ledger badge: which agent, which model, how many calls — and an
+     * explicit statement that there is no price, rather than a number quietly implying $0.
+     */
+    function offLedgerTitle(s) {
+      var byAgent = agentModelBreakdown(s.externalAgents, s.externalAgentModels).join(", ");
+      return byAgent + " — billed to a separate account, no price recorded here";
+    }
+
     /** One step of the rail: what it cost, which models paid for it, how long it held the card. */
     function StepRow(props) {
       var s = props.step;
@@ -1194,9 +1252,7 @@
             }, s.step),
             s.external
               ? jsx("span", {
-                  title: Object.keys(s.externalAgents).map(function (a) {
-                    return a + " × " + s.externalAgents[a];
-                  }).join(", ") + " — billed to a separate account",
+                  title: offLedgerTitle(s),
                   style: {
                     fontFamily: MONO, fontSize: "9px", letterSpacing: "0.05em",
                     color: OFF_LEDGER, border: "1px solid " + OFF_LEDGER + "59",
@@ -1494,9 +1550,8 @@
             .reduce(function (n, s) { return n + stepTotal(s, selected, selectedProfile); }, 0)
         : data.total;
 
-      var agentNames = Object.keys(data.externalAgents).map(function (a) {
-        return a + " × " + data.externalAgents[a];
-      }).join(" · ");
+      var agentNames = agentModelBreakdown(data.externalAgents, data.externalAgentModels)
+        .join(" · ");
 
       return shell([
         // ---- headline
@@ -1653,12 +1708,12 @@
             return a == null ? null : jsx("div", null,
               "Snapshot " + fmtDuration(a) + " old");
           })(),
-          data.stepBasis === "ledger"
-            ? jsx("div", null, "Step source: transition ledger")
-            : data.stepBasis === "stamps"
-              ? jsx("div", null, "Step source: message stamps (approximate)")
+          data.stepBasis === "stamp"
+            ? jsx("div", null, "Step source: turn stamps (exact)")
+            : data.stepBasis === "inferred"
+              ? jsx("div", null, "Step source: billing windows (approximate)")
               : data.stepBasis === "mixed"
-                ? jsx("div", null, "Step source: ledger + message stamps")
+                ? jsx("div", null, "Step source: turn stamps + billing windows")
                 : null,
           data.verdict > 0
             ? jsx("div", null, fmtUsd(data.verdict) + " uses multi-step attribution")

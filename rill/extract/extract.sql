@@ -31,9 +31,17 @@
 -- Shared dimensional spine.
 --
 -- NOTE ON `step`: `tasks.workflow_step_id` is the card's CURRENT step, not the step it was
--- in when a given turn ran. `session_step_history` and `workflow_step_decisions` are both
--- zero rows (inventory § 3.1), so no per-event step is available. Everything downstream
--- names this `current_step` so nobody reads it as history.
+-- in when a given turn ran, so everything downstream names it `current_step` and nobody may
+-- read it as history.
+--
+-- CORRECTED 2026-08-19. The original note said `session_step_history` and
+-- `workflow_step_decisions` were BOTH zero rows (inventory § 3.1) and that no per-event step
+-- was therefore available. That is now half wrong and the half that changed matters:
+-- `session_step_history` carries 580+ rows and IS extracted below as `fct_step_transition`,
+-- the real per-event ledger. `workflow_step_decisions` remains genuinely empty.
+-- Leaving the old note in place had a cost — it was read three separate times on 2026-08-19
+-- as evidence that step history is unavailable, once far enough to nearly block an
+-- experiment on a defect that had already resolved.
 -- ---------------------------------------------------------------------------
 CREATE TEMP VIEW v_task AS
 SELECT
@@ -204,6 +212,10 @@ LEFT JOIN repositories   r  ON r.id  = s.repository_id;
 -- ---------------------------------------------------------------------------
 -- fct_turn — one row per turn. The timing grain.
 --
+-- `step_at_start` is the exact step this turn ran in — see the column comment. It is what
+-- `kandev_cost` now joins through, and it is the reason per-step cost stopped being a
+-- reconstruction for post-2026-08-16 data.
+--
 -- `idle_seconds_before` is the gap from the previous turn's completion in the same
 -- session. Inventory § 2.3 is emphatic that this measures a gap and does NOT identify its
 -- cause — orchestration delay, queued dispatch and operator latency are indistinguishable
@@ -225,9 +237,24 @@ SELECT
                                                     AS idle_seconds_before,
     CASE WHEN t.completed_at IS NULL THEN 'no' ELSE 'yes' END AS is_complete,
     c.model, c.mode, c.effort, c.fast_mode, c.agent, c.config_completeness,
-    COALESCE(NULLIF(json_extract(t.metadata, '$.agent_type'), ''), '(none)') AS agent_type
+    COALESCE(NULLIF(json_extract(t.metadata, '$.agent_type'), ''), '(none)') AS agent_type,
+    -- THE STEP THIS TURN STARTED IN, READ RATHER THAN RECONSTRUCTED.
+    --
+    -- Kandev stamps `workflow_step_id_at_start` into the turn's metadata inside the same
+    -- transaction that inserts the turn, reading the card's step directly
+    -- (`CreateTurnWithStepStamp`, task/repository/sqlite/session.go). It is the only
+    -- per-event step signal in this store that is a READING — every other one, including
+    -- `kandev_step_points`, is inferred from a timeline.
+    --
+    -- Null before 2026-08-16 and on the small number of turns whose stamp write degraded
+    -- (the backend deliberately falls back to an unstamped insert rather than failing turn
+    -- creation for telemetry). Left NULL rather than defaulted: an unstamped turn has an
+    -- UNKNOWN step, and the window reconstruction downstream is what handles that case.
+    ws.name                                         AS step_at_start
 FROM task_session_turns t
-LEFT JOIN v_turn_config c ON c.turn_id = t.id;
+LEFT JOIN v_turn_config c ON c.turn_id = t.id
+LEFT JOIN workflow_steps ws
+       ON ws.id = json_extract(t.metadata, '$.workflow_step_id_at_start');
 
 
 -- ---------------------------------------------------------------------------
@@ -237,14 +264,22 @@ LEFT JOIN v_turn_config c ON c.turn_id = t.id;
 -- prices (inventory § 3.4 — the back-derivation was wrong by 10x). The USD conversion is
 -- deliberately left to the Rill measure so the raw integer survives here unrounded.
 --
--- These events carry no turn_id, so cost CANNOT be attributed to a turn — only to a
--- session and a timestamp. Any per-turn cost figure would be an invention.
+-- `turn_id` WAS NULL ON EVERY EVENT AND IS NOT ANY MORE. Kandev began stamping it on
+-- 2026-08-16; before that date no event carries one and none can be backfilled. It is the
+-- single most valuable column here, because `fct_turn.step_at_start` carries the step the
+-- card was in when that turn BEGAN — read from the task, at turn creation, by the backend
+-- that knew the answer. That makes step attribution a join rather than a reconstruction for
+-- every event from the cutover onward. See the attribution note in models/kandev_cost.yaml.
+--
+-- Emitted raw and empty-as-empty: the cutover is a fact about the data and the model layer
+-- decides what to do on each side of it.
 -- ---------------------------------------------------------------------------
 .output data/fct_cost_event.csv
 SELECT
     e.id                                              AS cost_event_id,
     strftime('%Y-%m-%dT%H:%M:%SZ', e.occurred_at)     AS occurred_at,
     e.session_id                                      AS session_id,
+    COALESCE(e.turn_id, '')                           AS turn_id,
     COALESCE(NULLIF(e.task_id, ''), s.task_id, '')    AS task_id,
     COALESCE(NULLIF(e.model, ''), '(unrecorded)')     AS model,
     COALESCE(NULLIF(e.provider, ''), '(unrecorded)')  AS provider,
@@ -301,6 +336,13 @@ WITH m AS (
         id, task_session_id, task_id, turn_id, author_type, type, created_at, requests_input,
         REPLACE(REPLACE(COALESCE(json_extract(metadata, '$.title'), ''), CHAR(10), ' '), CHAR(13), ' ') AS title,
         json_extract(metadata, '$.normalized.generic.input.raw_input.skill') AS skill,
+        -- The captured stdout of a shell call, kept newline-intact (unlike `title` above,
+        -- which flattens them). A codex/agy tool_execute's stdout is where its own usage
+        -- report lands — the plain `tokens used\nN` line every mode prints, and Challenge/
+        -- Consult's richer `CODEX_USAGE: input=... cached_input=... cache_write=... output=...
+        -- reasoning_output=...` line — and the newlines are what bound one line from the next
+        -- when parsing either below. NULL for every non-tool_execute message type.
+        json_extract(metadata, '$.normalized.shell_exec.output.stdout') AS shell_stdout,
         -- The step the card was in WHEN THIS MESSAGE HAPPENED. This is the only per-event
         -- step signal in the store — `tasks.workflow_step_id` is the card's step now, which
         -- is useless for asking what a step cost. Stamped on ~400 messages across 42 of 67
@@ -349,6 +391,135 @@ SELECT
     m.skill                                         AS skill,
     m.stamped_step                                  AS stamped_step,
     m.external_agent                                AS external_agent,
+
+    -- THE MODEL an off-ledger codex/agy call actually used, when the invocation named one
+    -- explicitly. Parsed from exactly two flag forms documented in the codex skill's own
+    -- SKILL.md: `-m <model>` (exec-based modes — Challenge, Consult, the custom-instructions
+    -- Review path) and the review-mode translation `-c model="<model>"` (native `codex review`
+    -- rejects -m outright, so the skill rewrites it). Nothing else is read from the command
+    -- line — the whole point of dropping arguments above is that an assignment is where a
+    -- credential appears, and this stays narrowly scoped to those two literal markers on
+    -- m.title, which already has its newlines flattened to spaces.
+    --
+    -- NULL is common and honest, not a bug: most sampled invocations in this store omit -m
+    -- entirely and let codex fall back to whatever ~/.codex/config.toml configures on the
+    -- machine that ran it — this extract cannot see that file and does not guess its value.
+    CASE
+        WHEN m.external_agent IS NULL THEN NULL
+        WHEN INSTR(m.title, ' -m ') > 0 THEN
+            NULLIF(TRIM(SUBSTR(SUBSTR(m.title, INSTR(m.title, ' -m ') + 4), 1,
+                    CASE WHEN INSTR(SUBSTR(m.title, INSTR(m.title, ' -m ') + 4), ' ') > 0
+                         THEN INSTR(SUBSTR(m.title, INSTR(m.title, ' -m ') + 4), ' ') - 1
+                         ELSE 40
+                    END), ' "' || CHAR(39)), '')
+        WHEN INSTR(m.title, 'model="') > 0 THEN
+            NULLIF(SUBSTR(SUBSTR(m.title, INSTR(m.title, 'model="') + 7), 1,
+                    CASE WHEN INSTR(SUBSTR(m.title, INSTR(m.title, 'model="') + 7), '"') > 0
+                         THEN INSTR(SUBSTR(m.title, INSTR(m.title, 'model="') + 7), '"') - 1
+                         ELSE 40
+                    END), '')
+        ELSE NULL
+    END                                             AS external_agent_model,
+
+    -- TOKENS AN OFF-LEDGER CALL ACTUALLY USED, read from its own captured stdout rather than
+    -- its command line. Two independent sources, in order of preference:
+    --
+    --   1. `CODEX_USAGE: input=N cached_input=N cache_write=N output=N reasoning_output=N` —
+    --      printed by the codex skill's Challenge/Consult JSONL parser directly off codex's
+    --      own `turn.completed.usage` object (verified live against codex-cli 0.146.0: the
+    --      object really does carry all five fields, split by cache read/write and reasoning
+    --      vs response — see the skill's `## Cost Estimation` section). Gives all five numbers.
+    --   2. `tokens used\nN` — codex's own plain total, printed natively by `codex review`
+    --      (the only mode with no `--json`, hence no breakdown) and also by Challenge/Consult
+    --      as the human-readable half of the same line CODEX_USAGE rides beside. Comma-
+    --      formatted in the wild (`62,791`), so the comma is stripped before casting.
+    --
+    -- Neither source exists for every call — most sampled invocations in this store have
+    -- neither, because the run never reached a `turn.completed` (still in progress, timed
+    -- out, or an earlier tool-boundary truncated the capture). NULL there is the honest
+    -- answer, not a parsing failure to paper over.
+    -- Every CAST below is guarded with NULLIF(..., '') on the extracted substring first. An
+    -- INSTR hit whose value is truncated away (capture cut off mid-line — observed for real:
+    -- a stored stdout ending in a bare "tokens used\n" with no number after it, presumably a
+    -- killed/timed-out run) would otherwise SUBSTR to an empty string, and SQLite's
+    -- CAST('' AS INTEGER) is 0, not NULL — silently reporting "zero tokens" for a call that
+    -- was actually truncated, not free. NULLIF makes the empty case fall through to NULL.
+    CASE WHEN m.external_agent IS NULL OR m.shell_stdout IS NULL THEN NULL
+         WHEN INSTR(m.shell_stdout, 'CODEX_USAGE: input=') > 0 THEN
+             CAST(NULLIF(SUBSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'CODEX_USAGE: input=') + 20), 1,
+                     CASE WHEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'CODEX_USAGE: input=') + 20), ' ') > 0
+                          THEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'CODEX_USAGE: input=') + 20), ' ') - 1
+                          ELSE 12 END), '') AS INTEGER)
+         ELSE NULL
+    END                                             AS external_agent_tokens_in,
+
+    CASE WHEN m.external_agent IS NULL OR m.shell_stdout IS NULL THEN NULL
+         WHEN INSTR(m.shell_stdout, ' cached_input=') > 0 THEN
+             CAST(NULLIF(SUBSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' cached_input=') + 14), 1,
+                     CASE WHEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' cached_input=') + 14), ' ') > 0
+                          THEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' cached_input=') + 14), ' ') - 1
+                          ELSE 12 END), '') AS INTEGER)
+         ELSE NULL
+    END                                             AS external_agent_tokens_cached_input,
+
+    CASE WHEN m.external_agent IS NULL OR m.shell_stdout IS NULL THEN NULL
+         WHEN INSTR(m.shell_stdout, ' cache_write=') > 0 THEN
+             CAST(NULLIF(SUBSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' cache_write=') + 13), 1,
+                     CASE WHEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' cache_write=') + 13), ' ') > 0
+                          THEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' cache_write=') + 13), ' ') - 1
+                          ELSE 12 END), '') AS INTEGER)
+         ELSE NULL
+    END                                             AS external_agent_tokens_cache_write,
+
+    CASE WHEN m.external_agent IS NULL OR m.shell_stdout IS NULL THEN NULL
+         WHEN INSTR(m.shell_stdout, ' output=') > 0 THEN
+             CAST(NULLIF(SUBSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' output=') + 8), 1,
+                     CASE WHEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' output=') + 8), ' ') > 0
+                          THEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' output=') + 8), ' ') - 1
+                          ELSE 12 END), '') AS INTEGER)
+         ELSE NULL
+    END                                             AS external_agent_tokens_out,
+
+    -- Last field on the line: bounded by the newline print() always ends a line with, not by
+    -- a following space — there is no field after it.
+    CASE WHEN m.external_agent IS NULL OR m.shell_stdout IS NULL THEN NULL
+         WHEN INSTR(m.shell_stdout, ' reasoning_output=') > 0 THEN
+             CAST(NULLIF(SUBSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' reasoning_output=') + 18), 1,
+                     CASE WHEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' reasoning_output=') + 18), CHAR(10)) > 0
+                          THEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, ' reasoning_output=') + 18), CHAR(10)) - 1
+                          ELSE 12 END), '') AS INTEGER)
+         ELSE NULL
+    END                                             AS external_agent_tokens_reasoning_output,
+
+    -- The plain total, independent of whether CODEX_USAGE was present. Covers `codex review`
+    -- (no --json, no breakdown, ever) and stands in for Challenge/Consult calls that predate
+    -- this skill printing CODEX_USAGE at all — same number either way (input + output), just
+    -- without the split.
+    --
+    -- TWO SEPARATORS, BOTH OBSERVED IN THIS STORE. `tokens used\nN` (newline, no colon) is
+    -- what the skill's own SKILL.md documents and what most rows use (221 of 261 sampled
+    -- `tokens used` rows). But 29 real rows read `tokens used: N` (colon, same line) instead —
+    -- an older codex-native format the skill's doc doesn't mention. Try the documented form
+    -- first, fall back to the colon form so those 29 aren't silently dropped.
+    CASE WHEN m.external_agent IS NULL OR m.shell_stdout IS NULL THEN NULL
+         WHEN INSTR(m.shell_stdout, 'tokens used' || CHAR(10)) > 0 THEN
+             CAST(NULLIF(REPLACE(SUBSTR(
+                     SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'tokens used' || CHAR(10)) + 12),
+                     1,
+                     CASE WHEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'tokens used' || CHAR(10)) + 12), CHAR(10)) > 0
+                          THEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'tokens used' || CHAR(10)) + 12), CHAR(10)) - 1
+                          ELSE 12 END
+                 ), ',', ''), '') AS INTEGER)
+         WHEN INSTR(m.shell_stdout, 'tokens used:') > 0 THEN
+             CAST(NULLIF(TRIM(REPLACE(SUBSTR(
+                     SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'tokens used:') + 12),
+                     1,
+                     CASE WHEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'tokens used:') + 12), CHAR(10)) > 0
+                          THEN INSTR(SUBSTR(m.shell_stdout, INSTR(m.shell_stdout, 'tokens used:') + 12), CHAR(10)) - 1
+                          ELSE 12 END
+                 ), ',', '')), '') AS INTEGER)
+         ELSE NULL
+    END                                             AS external_agent_tokens_total,
 
     -- WAITING, CLASSIFIED WHERE THE COMMAND LINE STILL EXISTS. Like `external_agent` above,
     -- this must be computed here: the full command line is dropped two columns up, and it is
