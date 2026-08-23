@@ -17,15 +17,21 @@ GOOS     := $(shell $(GO) env GOOS)
 GOARCH   := $(shell $(GO) env GOARCH)
 PLATFORM := $(GOOS)-$(GOARCH)
 
-# The hourly snapshot refresh (see rill/auto-refresh.sh). REFRESH_WINDOW is local time, both
-# ends inclusive; override it at install time, e.g. `make refresh-agent-install
-# REFRESH_WINDOW=07:00-23:00`.
+# The snapshot refresh (see rill/auto-refresh.sh). REFRESH_WINDOW is local time, both ends
+# inclusive; override either at install time, e.g. `make refresh-agent-install
+# REFRESH_WINDOW=07:00-23:00 REFRESH_POLL_SECONDS=30`.
 REFRESH_LABEL  := com.kandev-plugin-ops-intel.refresh
 REFRESH_PLIST  := $(HOME)/Library/LaunchAgents/$(REFRESH_LABEL).plist
 REFRESH_LOG    := $(HOME)/Library/Logs/kandev-ops-intel-refresh.log
 # 08:00-23:00 rather than a 9-to-5: the work this measures routinely runs into the evening, and
 # a window that closes at 22:00 leaves the snapshot stalest exactly when it is being read.
 REFRESH_WINDOW ?= 08:00-23:00
+# How often launchd wakes auto-refresh.sh to CHECK, not how often it actually refreshes — most
+# wake-ups just read the signal file and go back to sleep (see auto-refresh.sh's SIGNAL-DRIVEN
+# FAST PATH). 60s keeps event-driven latency low without noticeable overhead; it does not need
+# to be anywhere near QUIET_SECONDS/MAX_WAIT_SECONDS, which live in Settings > Plugins > Ops
+# Intel (config_schema), not here.
+REFRESH_POLL_SECONDS ?= 60
 
 .PHONY: build bundle test package install reinstall uninstall clean \
 	refresh refresh-agent-install refresh-agent-uninstall refresh-agent-status
@@ -121,11 +127,12 @@ refresh-agent-install:
 	     -e 's|@@LOG@@|$(REFRESH_LOG)|g' \
 	     -e 's|@@HOME@@|$(HOME)|g' \
 	     -e 's|@@WINDOW@@|$(REFRESH_WINDOW)|g' \
+	     -e 's|@@POLL_SECONDS@@|$(REFRESH_POLL_SECONDS)|g' \
 	     rill/launchd/$(REFRESH_LABEL).plist.template > $(REFRESH_PLIST)
 	@plutil -lint $(REFRESH_PLIST)
 	@launchctl bootout gui/$$(id -u)/$(REFRESH_LABEL) 2>/dev/null || true
 	launchctl bootstrap gui/$$(id -u) $(REFRESH_PLIST)
-	@echo "installed $(REFRESH_LABEL): hourly within $(REFRESH_WINDOW), log $(REFRESH_LOG)"
+	@echo "installed $(REFRESH_LABEL): checks every $(REFRESH_POLL_SECONDS)s within $(REFRESH_WINDOW) (refreshes only on a signal or the backstop gap), log $(REFRESH_LOG)"
 
 refresh-agent-uninstall:
 	@launchctl bootout gui/$$(id -u)/$(REFRESH_LABEL) 2>/dev/null || true

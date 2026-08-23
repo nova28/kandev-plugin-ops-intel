@@ -26,12 +26,14 @@ and a per-task **Cost panel**, both backed by a local [Rill](https://docs.rillda
    CSVs into an embedded DuckDB and reconciles the model/metrics-view/dashboard definitions
    also in `rill/`, serving the result on `localhost:9009`. This plugin doesn't define any of
    that logic itself — every chart's definition lives in reviewable YAML there.
-4. **The plugin** never talks to Kandev's API and requests no capabilities. It reads Rill only:
-   the **Ops Intel** tab iframes Rill's own dashboards; the **Cost panel** queries Rill's query
-   API directly to lay one card's spend along its workflow steps.
+4. **The plugin reads Rill only, never Kandev's data API.** The **Ops Intel** tab iframes
+   Rill's own dashboards; the **Cost panel** queries Rill's query API directly to lay one card's
+   spend along its workflow steps. Its one Kandev capability is a `task.moved` event
+   subscription — not a data read — used only to trigger step 2 sooner than a blind timer would;
+   see [Keeping the snapshot fresh](#keeping-the-snapshot-fresh).
 
 Because step 2 is a snapshot, every number is exactly as old as the last extract — see
-[Keeping the snapshot fresh](#keeping-the-snapshot-fresh) for the hourly automation.
+[Keeping the snapshot fresh](#keeping-the-snapshot-fresh) for how that stays automatic.
 
 ## Dependencies
 
@@ -65,17 +67,42 @@ before filtering to it; omit it and the tab still works, just without that check
 ### Keeping the snapshot fresh
 
 Rill doesn't hot-reload the snapshot, so every figure is only as current as the last extract.
-Install the hourly agent once and stop thinking about it:
+Install the agent once and stop thinking about it:
 
 ```bash
 make refresh-agent-install
 ```
 
-A LaunchAgent runs `rill/auto-refresh.sh` hourly, at login, and on wake. Each run refreshes only
-if it's **within working hours** (`08:00-23:00` by default, override with `REFRESH_WINDOW=...`),
-**Rill is already answering** on `:9009` (this never starts Rill), and **the last refresh was
-over 50 minutes ago**. Every skip is logged, with its reason, to
+A LaunchAgent runs `rill/auto-refresh.sh` on a short poll (60s by default), at login, and on
+wake — but most wake-ups do nothing. The plugin subscribes to Kandev's `task.moved` bus event
+(a card's step moving, manually or by the workflow engine) and, on every delivery, drops a
+signal the script reads: it waits for a **quiet window** since the last move, or a **max wait**
+since the first pending one, whichever comes first, so a burst of moves collapses into one
+refresh instead of one per event. All of this is operator-configurable in **Settings > Plugins
+> Ops Intel**, no rebuild or reinstall needed:
+
+| Setting | Default | |
+|---|---|---|
+| React to task moves | on | Turn off for a plain fixed schedule instead — see below. |
+| Quiet window | 2 min | |
+| Max wait | 5 min | |
+| Fixed interval | 60 min | Used when "React to task moves" is off, or as a backstop before the first task move ever arrives even while it's on. |
+
+Turning "React to task moves" off is how to keep this at a fixed cadence — e.g. once an hour,
+same as before this mechanism existed — regardless of how often cards actually move; the fixed
+interval is still operator-configurable, it just stops reacting to real activity. See `main.go`'s
+`OnEvent`/`SetHost` and `rill/auto-refresh.sh`'s SIGNAL-DRIVEN FAST PATH for the mechanics.
+
+If nothing has ever synced at all (an older Kandev, the event capability declined at install, or
+the plugin hasn't started yet), it falls back to a periodic **backstop**: refresh if **within
+working hours** (`08:00-23:00` by default, override with `REFRESH_WINDOW=...`), **Rill is
+already answering** on `:9009` (this never starts Rill), and **the last refresh was over 50
+minutes ago**. Every skip is logged, with its reason, to
 `~/Library/Logs/kandev-ops-intel-refresh.log`.
+
+A single refresh always costs the same regardless of what triggered it — extraction here isn't
+incremental (see `extract.sql`'s header), so this design buys lower latency and no wasted work
+while idle, not a cheaper individual refresh.
 
 ```bash
 make refresh-agent-status      # loaded? last exit? last 15 log lines
@@ -84,9 +111,9 @@ make refresh-agent-uninstall
 ```
 
 A refresh restarts Rill — the only way it re-reads the CSVs — so an open dashboard blinks for
-about 20 seconds, once an hour. End to end it's ~35 seconds on a ~700 MB store, which is why the
-hourly cadence is viable at all; see `extract.sh`'s header for the `VACUUM INTO` vs `.backup`
-story.
+about 20 seconds each time. End to end it's ~35 seconds on a ~700 MB store, which is why a
+signal-driven cadence — potentially several refreshes an hour on a busy workflow, not one — is
+viable at all; see `extract.sh`'s header for the `VACUUM INTO` vs `.backup` story.
 
 `rill/data/` and `rill/tmp/` are gitignored, regenerated outputs that hold real telemetry — the
 packaged plugin never contains `rill/` at all; `make package` stages only the manifest, the
@@ -123,8 +150,12 @@ surfaces, so the ledger visibly reports its snapshot freshness rather than imply
 - **The plugin never starts Rill.** Kandev supervises the plugin binary's lifecycle; anything
   else the plugin spawned would be fought over on every restart. The tab probes `localhost:9009`
   and hands over a copyable command when nothing answers.
-- **The backend is a deliberate no-op** (`main.go`). The plugin uses no Kandev API capabilities —
-  Rill owns all of the actual semantics, and is started separately.
+- **The backend does exactly one thing beyond being a supervised process** (`main.go`): bridge
+  Kandev's `task.moved` event to a signal file, so `rill/auto-refresh.sh` — which has no Kandev
+  API access of its own — knows when to check sooner than its poll interval. It still declares
+  no `api_read`/`api_write` capability and never calls a Host data method; Rill owns all of the
+  actual semantics, and is still started separately, deliberately never by the Go process
+  itself (see the previous bullet — that rule is *why* the signal is a file, not a direct call).
 - **An iframe, not native React panels.** Every Rill measure carries its own reasoning in
   reviewable YAML in `rill/`; porting those charts into React would fork that logic into a second
   place and guarantee drift.

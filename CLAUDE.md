@@ -37,14 +37,16 @@ Other targets: `make build` (host binary only), `make bundle` (regenerate `ui/bu
 `make clean`. `package` depends on `build bundle test`, so a failing test or an unbuildable
 bundle stops an install rather than shipping a stale one.
 
-The snapshot-refresh targets are separate from the build and touch no plugin code:
-`make refresh-agent-install` / `refresh-agent-uninstall` / `refresh-agent-status` manage the
-hourly LaunchAgent, and `make refresh` (`FORCE=1` to ignore its gates) runs one refresh now. See
-**The hourly refresh** under External dependencies.
+The snapshot-refresh targets are separate from the *build*, but are no longer independent of
+plugin code — `main.go`'s `OnEvent` feeds `rill/auto-refresh.sh` a signal now, see **The
+signal-driven refresh** below. `make refresh-agent-install` / `refresh-agent-uninstall` /
+`refresh-agent-status` manage the LaunchAgent, and `make refresh` (`FORCE=1` to ignore its
+gates) runs one refresh now.
 
 Overridable variables: `KANDEV` (default `../o/kandev`, the local Kandev checkout), `KANDEV_URL`
 (default `http://localhost:8817`), `GO` (defaults to `GOTOOLCHAIN=go1.26.0 go`),
-`REFRESH_WINDOW` (default `08:00-23:00`, the hourly refresh's working hours).
+`REFRESH_WINDOW` (default `08:00-23:00`, the backstop's working hours), `REFRESH_POLL_SECONDS`
+(default `60`, how often the LaunchAgent wakes to *check* — not how often it refreshes).
 
 `make install` requires a running Kandev; `make package` requires the Kandev checkout, because
 packing runs `cmd/plugin-pack` from `$(KANDEV)/apps/backend`.
@@ -53,12 +55,15 @@ packing runs `cmd/plugin-pack` from `$(KANDEV)/apps/backend`.
 
 - **`manifest.yaml`** — the contract with Kandev. Declares `runtime.type: binary` (mandatory, even
   for a UI-only plugin), a single executable keyed by `@@PLATFORM@@` (substituted by `make
-  package` with the builder's own GOOS-GOARCH — see the Makefile), `capabilities: {}`, and the
-  UI bundle path. `VERSION` in the Makefile is parsed out of this file.
-- **`main.go`** — a deliberate no-op. Embeds `pluginsdk.UnimplementedPlugin` and calls
-  `pluginsdk.Serve` purely so Kandev has a process to supervise. It must stay this way unless the
-  plugin genuinely grows a backend need; adding one also means declaring capabilities in the
-  manifest.
+  package` with the builder's own GOOS-GOARCH — see the Makefile), `capabilities.events:
+  ["task.moved"]`, a `config_schema` for the refresh debounce, and the UI bundle path. `VERSION`
+  in the Makefile is parsed out of this file.
+- **`main.go`** — no longer a no-op, but still declares no `api_read`/`api_write` capability and
+  never calls a Host *data* method. Embeds `pluginsdk.UnimplementedPlugin` (so `HandleWebhook`
+  etc. stay no-ops) and overrides `OnEvent` for exactly one purpose: bridging `task.moved` to
+  `rill/auto-refresh.sh`'s signal file, since that script has no Kandev API access of its own.
+  See **The signal-driven refresh** under External dependencies for why that split exists —
+  the Go process is deliberately never the thing that touches Rill.
 - **`ui/bundle.js`** — the actual product, and **generated**. Edit `ui/src/*.mjs` and run
   `make bundle`; editing the bundle directly is silently undone by the next build.
 
@@ -192,18 +197,62 @@ it passed through — the same rail the operator already reads at the top of the
   Its `extract/extract.sh` snapshots `~/.kandev/data/kandev.db`; Rill does not hot-reload the
   snapshot, so re-extracting needs a Rill restart. `rill/data/` and `rill/tmp/` are gitignored
   build outputs.
-  - **The hourly refresh.** `rill/auto-refresh.sh` is the unattended wrapper around
+  - **The signal-driven refresh.** `rill/auto-refresh.sh` is the unattended wrapper around
     `rill/refresh.sh`, run by the `com.kandev-plugin-ops-intel.refresh` LaunchAgent (installed by
-    `make refresh-agent-install`, template in `rill/launchd/`). It exists because a snapshot is
-    only as good as its age, and the manual loop is three commands people forget. Four gates,
-    each for a reason: a working-hours window; Rill must already answer on `:9009` (**this never
-    starts Rill** — same rule as the plugin, applied from the outside); a 50-minute minimum gap,
-    because launchd fires `StartInterval` jobs on wake as well as on schedule; and a `mkdir`
-    lock, because an extract can outlast the hour. Every skip logs its reason to
-    `~/Library/Logs/kandev-ops-intel-refresh.log` — a silent refresher is indistinguishable from a
-    working one. A failed run does **not** stamp, so the next hour retries.
-    `./auto-refresh.sh --self-test` asserts the window arithmetic, including the leading-zero
-    trap that made `08:00` unparseable octal.
+    `make refresh-agent-install`, template in `rill/launchd/`) on a short poll (`REFRESH_POLL_SECONDS`,
+    default 60s) — but most wake-ups do nothing. It exists because a snapshot is only as good as
+    its age, and the manual loop is three commands people forget.
+  - **`capabilities.events: ["task.moved"]` in manifest.yaml is what makes this signal-driven
+    rather than purely periodic.** `main.go`'s `OnEvent` fires on every `task.moved` delivery
+    (a card's step moving, manually or by the workflow engine) and rewrites
+    `$STATE_DIR/refresh-signal` — the one thing auto-refresh.sh (a separate process with no
+    Kandev API access) can poll instead of the bus itself. `task.moved` is a proxy for a real
+    cost-write event: `office.cost.recorded` is declared in Kandev's event vocabulary but never
+    actually published anywhere in Kandev's source (checked directly — the write path that
+    inserts an `office_cost_events` row has no `Publish` call), and per this file's own domain
+    facts, Kandev flushes cost events *at* a step transition, so `task.moved` is the closest
+    thing that exists today.
+  - **Debounce, not per-event triggering.** A burst of moves (every step advance on a busy
+    workflow publishes one) would otherwise mean overlapping extracts and Rill restarting every
+    few seconds. `signal_should_refresh` (pure arithmetic, exercised by `--self-test`) waits for
+    a **quiet window** since the last move or a **max wait** since the first pending one,
+    whichever comes first — both operator-configurable in Settings > Plugins > Ops Intel
+    (`config_schema.quiet_minutes` / `max_wait_minutes`, default 2/5 **minutes**, not seconds: a
+    single refresh already costs ~35s + a ~20s Rill restart, so sub-minute values are false
+    precision). `main.go` clamps both to a 1-minute floor before writing them into the signal
+    file — `config_schema` validates `required`/`type`/`enum`/`format`/`secret` but not a
+    numeric minimum, so an unclamped 0 would defeat debouncing entirely.
+  - **Extraction is not incremental — a refresh costs the same regardless of trigger.** See
+    `extract.sql`'s header: several derivations (git-snapshot LAG deltas, the config-epoch cut)
+    need each session's full history, not a delta, so this design buys lower latency and no
+    wasted work while idle, never a cheaper individual run.
+  - **`config_schema.event_driven` (default true) is a real off switch, not just a slower
+    setting.** Off means `rill/auto-refresh.sh` ignores `first_seen`/`last_seen` entirely and
+    refreshes on a plain `config_schema.fixed_interval_minutes` interval (default 60) instead —
+    e.g. to cap this at once an hour regardless of how often cards move. Both are carried as the
+    5th/6th fields of `$STATE_DIR/refresh-signal` (`event_driven_s`, `fixed_interval_s`), and
+    `main.go`'s `syncSignal` writes them on **every** `task.moved` delivery AND on `SetHost`
+    (host injection) — the latter exists because Kandev restarts the plugin on any config
+    change, and `OnEvent` alone would leave the shell script reading a stale value until the
+    next real task move, which could be a long wait right after flipping this off. The success
+    path only clears `$SIGNAL` when it read `event_driven_s == 1`: in fixed-time mode the file
+    holds persistent config, not a per-burst debounce state, and blindly deleting it there would
+    silently fall back to the env-var backstop default instead of the operator's chosen
+    interval until the next lucky event resynced it.
+  - **The BACKSTOP.** If `$STATE_DIR/refresh-signal` doesn't exist at all — an older Kandev, the
+    event capability declined at install, or the plugin hasn't synced yet — auto-refresh.sh
+    falls back to the old periodic gates: a working-hours window; Rill must already answer on
+    `:9009` (**this never starts Rill** — same rule as the plugin, applied from the outside); a
+    50-minute minimum gap (`REFRESH_WINDOW`/`OPS_INTEL_REFRESH_MIN_GAP_MIN`); and a `mkdir`
+    lock, because an extract can outlast the poll interval. Every skip logs its reason to
+    `~/Library/Logs/kandev-ops-intel-refresh.log` — a silent refresher is indistinguishable from
+    a working one. A failed run does **not** stamp or clear the signal, so the next poll retries.
+    `./auto-refresh.sh --self-test` asserts both the window arithmetic (including the
+    leading-zero trap that made `08:00` unparseable octal) and the debounce arithmetic.
+  - **`$STATE_DIR` (`~/Library/Caches/kandev-ops-intel`) is deliberately not
+    `KANDEV_PLUGIN_DATA_DIR`.** That directory is injected only into the Go plugin process's own
+    environment; auto-refresh.sh has no way to discover its resolved path. `$HOME` is the one
+    thing both sides can compute identically — see `main.go`'s `stateDir()`.
   - **launchd hands a job `PATH=/usr/bin:/bin:/usr/sbin:/sbin`.** Without `/opt/homebrew/bin`
     the extract half succeeds and only the `rill` restart fails, leaving a fresh snapshot the
     running Rill never reads. Both the plist and the script set PATH; keep both.
@@ -211,7 +260,8 @@ it passed through — the same rail the operator already reads at the top of the
     online-backup API restarts its page copy whenever the source is written, so under a running
     Kandev it does not converge: a measured run reached 437 MB of 692 MB in 29 minutes and was
     still slowing. `VACUUM INTO` writes a compacted copy from one read transaction — 669 MB in
-    6 seconds, whole refresh 35 seconds. The hourly agent is only possible because of it.
+    6 seconds, whole refresh 35 seconds. The signal-driven refresh — which can fire several
+    times an hour on a busy workflow, not once — is only viable at that speed because of it.
   - **`extract.sh` has an `EXPECTED` whitelist** and promotes only the files named in it. Adding a
     `.output` to `extract.sql` without adding the filename there writes the CSV to the staging
     directory and silently drops it — the guard exists so a partial extract is never promoted, and

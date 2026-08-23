@@ -19,8 +19,18 @@
 -- number, or a low-cardinality enum. If it is none of those, it is prose, and prose does
 -- not leave the database.
 --
--- Consumed by extract.sh, which runs it against a `.backup` snapshot rather than the live
--- file. Every derivation beyond flattening belongs in the Rill models, not here.
+-- Consumed by extract.sh, which runs it against a `VACUUM INTO` snapshot rather than the live
+-- file (see that script's header for why `.backup` doesn't work). Every derivation beyond
+-- flattening belongs in the Rill models, not here.
+--
+-- EVERY QUERY BELOW IS A FULL RE-DERIVE, NOT A DELTA. There is no `WHERE updated_at > :last`
+-- anywhere in this file, and that is deliberate, not an oversight: several downstream
+-- derivations (the git-snapshot LAG deltas in kandev_code_output.yaml, the config-epoch cut,
+-- the rebase/base-commit-change detection) need each session's *entire* history to compute
+-- correctly, not just what changed since the last extract — an incremental version of this
+-- file would have to re-derive those from scratch anyway. A refresh's cost is therefore fixed
+-- regardless of how little actually changed; see rill/auto-refresh.sh's SIGNAL-DRIVEN FAST
+-- PATH for how the plugin avoids running this needlessly rather than making each run cheaper.
 
 .bail on
 .mode csv

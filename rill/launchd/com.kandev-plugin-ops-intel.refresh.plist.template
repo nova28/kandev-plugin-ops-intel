@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Hourly Rill snapshot refresh. Installed by `make refresh-agent-install`, which substitutes
-  @@…@@ with this checkout's paths — the plist has to carry absolute paths, and this repo is
-  cloned wherever the operator put it.
+  Rill snapshot refresh, polled frequently but only DONE rarely. Installed by
+  `make refresh-agent-install`, which substitutes @@…@@ with this checkout's paths — the plist
+  has to carry absolute paths, and this repo is cloned wherever the operator put it.
 
   A LaunchAgent (per-user, at login), never a LaunchDaemon. The extract reads
   ~/.kandev/data/kandev.db and writes into this checkout, and Rill is the operator's own
@@ -11,9 +11,11 @@
 
   StartInterval rather than fifteen StartCalendarInterval entries: launchd fires an interval
   job on wake as well as on schedule, which is exactly the behaviour wanted here (open the
-  laptop, the snapshot catches up), and auto-refresh.sh already owns the working-hours window
-  and the minimum gap. Encoding the window here as well would put the same policy in two
-  places and let them disagree.
+  laptop, a pending signal catches up promptly), and auto-refresh.sh already owns the
+  working-hours window, the signal-driven debounce, and the backstop gap. Encoding any of that
+  here as well would put the same policy in two places and let them disagree. Most wake-ups
+  under @@POLL_SECONDS@@s do nothing but read a signal file and go back to sleep — see
+  auto-refresh.sh's SIGNAL-DRIVEN FAST PATH.
 -->
 <plist version="1.0">
 <dict>
@@ -28,9 +30,11 @@
     <key>WorkingDirectory</key>
     <string>@@RILL_DIR@@</string>
 
-    <!-- Hourly, plus once at login. Both are gated by the window and the minimum gap. -->
+    <!-- Every @@POLL_SECONDS@@s, plus once at login. Both are gated by the window and the
+         signal-driven debounce (or the backstop gap, if nothing has signaled) in
+         auto-refresh.sh — this is how often it CHECKS, not how often it actually refreshes. -->
     <key>StartInterval</key>
-    <integer>3600</integer>
+    <integer>@@POLL_SECONDS@@</integer>
     <key>RunAtLoad</key>
     <true/>
 

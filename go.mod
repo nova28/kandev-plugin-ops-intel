@@ -1,4 +1,4 @@
-module github.com/henry/kandev-plugin-ops-intel
+module github.com/nova28/kandev-plugin-ops-intel
 
 go 1.26.0
 
