@@ -186,10 +186,12 @@ it passed through — the same rail the operator already reads at the top of the
 - **Kandev checkout at `../o/kandev`** — supplies the SDK via a `replace` directive in `go.mod`,
   the `plugin-pack` tool, and the docs. Repoint both `go.mod` and the Makefile's `KANDEV` if it
   moves. Requires Go 1.26.
-- **The Rill project** lives in `rill/` in this repo and is started separately (`cd rill &&
-  ./extract/extract.sh && rill start .`). Its `extract/extract.sh` snapshots
-  `~/.kandev/data/kandev.db`; Rill does not hot-reload the snapshot, so re-extracting needs a
-  Rill restart. `rill/data/` and `rill/tmp/` are gitignored build outputs.
+- **[Rill Developer](https://docs.rilldata.com)** (`brew install rilldata/tap/rill`) — a
+  third-party BI engine, not something this repo vendors. The project it serves lives in `rill/`
+  in this repo and is started separately (`cd rill && ./extract/extract.sh && rill start .`).
+  Its `extract/extract.sh` snapshots `~/.kandev/data/kandev.db`; Rill does not hot-reload the
+  snapshot, so re-extracting needs a Rill restart. `rill/data/` and `rill/tmp/` are gitignored
+  build outputs.
   - **The hourly refresh.** `rill/auto-refresh.sh` is the unattended wrapper around
     `rill/refresh.sh`, run by the `com.kandev-plugin-ops-intel.refresh` LaunchAgent (installed by
     `make refresh-agent-install`, template in `rill/launchd/`). It exists because a snapshot is
