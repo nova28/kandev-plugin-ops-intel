@@ -55,11 +55,11 @@
         <string>/opt/homebrew/bin:/usr/local/bin:@@HOME@@/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 
         <!-- Working hours. Local time, both ends inclusive; an end before the start spans midnight. -->
-        <key>OPSCOST_REFRESH_WINDOW</key>
+        <key>OPS_INTEL_REFRESH_WINDOW</key>
         <string>@@WINDOW@@</string>
 
         <!-- Minutes that must pass between refreshes, so a wake-triggered run does not re-extract. -->
-        <key>OPSCOST_REFRESH_MIN_GAP_MIN</key>
+        <key>OPS_INTEL_REFRESH_MIN_GAP_MIN</key>
         <string>50</string>
 
         <!--
@@ -67,7 +67,7 @@
           never starts Rill; a timer that did so on the operator's behalf would break the same
           rule from the outside. Set 0 to have the hourly run bring Rill up as well.
         -->
-        <key>OPSCOST_REFRESH_REQUIRE_RILL</key>
+        <key>OPS_INTEL_REFRESH_REQUIRE_RILL</key>
         <string>1</string>
     </dict>
 
@@ -94,7 +94,7 @@
          moment auto-refresh.sh itself exits, success or failure alike — so every hourly run
          restarted Rill and then killed it again seconds later when the script returned. Observed
          directly as "Rill shutdown gracefully" landing right after "refresh ok"/"refresh FAILED"
-         in kandev-opscost-refresh.log, and as a `last-refresh` stamp that was never written
+         in kandev-ops-intel-refresh.log, and as a `last-refresh` stamp that was never written
          despite dozens of "runs". This key tells launchd to leave processes the job leaves
          behind alone instead of reaping the group on exit — the launchd-native equivalent of
          `setsid`. -->

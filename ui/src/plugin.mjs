@@ -20,9 +20,9 @@ window.registerKandevPlugin(PLUGIN_ID, {
     // utility group render. A host that predates that mapping degrades this to a plugin-rail
     // row rather than dropping the item, so there is no version guard to write here.
     registry.registerNavItem({
-      id: "opscost",
+      id: "ops-intel",
       label: "Ops Intel",
-      path: "/plugins/opscost",
+      path: "/plugins/ops-intel",
       // A plugin-owned glyph, not the curated "chart" name: that resolved to the same
       // IconChartBar the host's Stats button uses, and in this row they were indistinguishable.
       icon: createGaugeIcon(host),
@@ -31,7 +31,7 @@ window.registerKandevPlugin(PLUGIN_ID, {
 
     // topbar:false — Rill draws its own filter bar and time-range control, so host chrome on
     // top would be a second header competing with it for the same job.
-    registry.registerRoute("/plugins/opscost", createOpsCostPage(host), { topbar: false });
+    registry.registerRoute("/plugins/ops-intel", createOpsCostPage(host), { topbar: false });
 
     // This toolbar slot is always mounted beside the model/send controls. It
     // is the entry point for the Rill-backed, step-attributed task analysis;

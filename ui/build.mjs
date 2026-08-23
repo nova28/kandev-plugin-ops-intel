@@ -44,7 +44,7 @@ var ORDER = [
 ];
 
 var HEADER = `/**
- * UI bundle for kandev-plugin-opscost.
+ * UI bundle for kandev-plugin-ops-intel.
  *
  * GENERATED — DO NOT EDIT. Sources live in ui/src/, built by ui/build.mjs (\`make bundle\`).
  * Editing this file directly means the next build silently discards your change.

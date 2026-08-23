@@ -1,8 +1,8 @@
-# kandev-plugin-opscost
+# kandev-plugin-ops-intel
 
 Operational cost and efficiency intelligence for Kandev — what a run costs, which model spent
 it, which build step it went to, and what looks abnormal. Today that surface is an **Ops
-Cost** tab framing a local Rill instance; the scope is the question, not the mechanism.
+Intel** tab framing a local Rill instance; the scope is the question, not the mechanism.
 
 The analysis it frames lives in `rill/`, alongside the plugin. The findings and the reasoning
 behind them are in the Forge repo at `docs/research/kandev/2026-08-12-kandev-operational-bi.md`.
@@ -90,7 +90,7 @@ That loads a LaunchAgent running `rill/auto-refresh.sh` hourly — and at login,
 run refreshes only if it is **within working hours** (`08:00-23:00` by default; override with
 `make refresh-agent-install REFRESH_WINDOW=07:00-23:30`), **Rill is already answering** on
 `:9009`, and **the last refresh was over 50 minutes ago**. Everything else is a logged skip with
-its reason, in `~/Library/Logs/kandev-opscost-refresh.log`.
+its reason, in `~/Library/Logs/kandev-ops-intel-refresh.log`.
 
 The Rill gate is the one worth understanding: this never starts Rill. The plugin's own rule is
 that it does not launch a second long-running server, and a timer doing it from the outside would
@@ -110,7 +110,7 @@ it is why there is a window at all rather than a job running around the clock.
 **What a refresh actually costs.** 35 seconds end to end on a ~700 MB store: a 6-second snapshot,
 then the SQL, the Rill restart and `check.sh`'s five assertions. The agent runs at background
 priority with low-priority I/O, and a run past 10 minutes is killed as stuck
-(`OPSCOST_REFRESH_TIMEOUT_MIN`) rather than allowed to hold the lock into the next hour.
+(`OPS_INTEL_REFRESH_TIMEOUT_MIN`) rather than allowed to hold the lock into the next hour.
 
 That number is the whole reason the hourly job is viable, and it is recent: `extract.sh`
 snapshotted with `sqlite3 .backup` until the first unattended run exposed it. `.backup` restarts
@@ -159,8 +159,9 @@ tests, so a failing test stops an install rather than shipping past it.
 ## Build requirements
 
 Go **1.26** (Kandev's module requires it; `GOTOOLCHAIN=go1.26.0` will fetch it if your system
-Go is older). Only `darwin-arm64` is built — a published plugin would cross-compile the full
-matrix, but this one runs on one machine and five binaries would be 95 MB of pretence.
+Go is older). `make build` targets whatever platform you run it on (`go env GOOS`/`GOARCH`) and
+`make package` bakes that into the staged `manifest.yaml` — no cross-compile matrix, each
+developer's own build runs on their own machine.
 
 The SDK is resolved from a local checkout via a `replace` directive in `go.mod`, because the
 Kandev module is not published to a proxy. Repoint it if your checkout moves.

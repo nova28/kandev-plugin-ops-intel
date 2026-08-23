@@ -19,7 +19,7 @@
  * silently fails is worse than an honest empty state.
  */
 
-import { RILL_ORIGIN, VIEWS, START_COMMAND } from "./config.mjs";
+import { RILL_ORIGIN, VIEWS, START_COMMAND, START_COMMAND_HINT } from "./config.mjs";
 import { copyTextToClipboard } from "./clipboard.mjs";
 import { probeRill, probeWorkspace, viewSrc, activeWorkspaceName } from "./rill.mjs";
 
@@ -224,6 +224,11 @@ export function createOpsCostPage(host) {
             ", and nothing is listening there. The plugin deliberately does not start it — " +
             "Kandev supervises plugin processes, and a plugin that spawned its own server " +
             "would fight that supervision on every restart."
+        ),
+        jsx(
+          "p",
+          { style: { opacity: 0.6, fontSize: "12px", marginBottom: "6px" } },
+          START_COMMAND_HINT
         ),
         jsx(
           "pre",

@@ -1,4 +1,4 @@
-module github.com/henry/kandev-plugin-opscost
+module github.com/henry/kandev-plugin-ops-intel
 
 go 1.26.0
 

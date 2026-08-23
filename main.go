@@ -4,8 +4,8 @@ package main
 
 import "github.com/kandev/kandev/pkg/pluginsdk"
 
-type opsCostPlugin struct{ pluginsdk.UnimplementedPlugin }
+type opsIntelPlugin struct{ pluginsdk.UnimplementedPlugin }
 
 func main() {
-	pluginsdk.Serve(&opsCostPlugin{})
+	pluginsdk.Serve(&opsIntelPlugin{})
 }

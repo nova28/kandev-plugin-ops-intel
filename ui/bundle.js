@@ -1,5 +1,5 @@
 /**
- * UI bundle for kandev-plugin-opscost.
+ * UI bundle for kandev-plugin-ops-intel.
  *
  * GENERATED — DO NOT EDIT. Sources live in ui/src/, built by ui/build.mjs (`make bundle`).
  * Editing this file directly means the next build silently discards your change.
@@ -26,7 +26,7 @@
    * honest about failure.
    */
 
-  var PLUGIN_ID = "kandev-plugin-opscost";
+  var PLUGIN_ID = "kandev-plugin-ops-intel";
 
   // The local Rill dev server. Edit here if you run it on another port.
   var RILL_ORIGIN = "http://localhost:9009";
@@ -66,9 +66,15 @@
   // --allowed-origins is what lets every read in rill.mjs return a response instead of an
   // opaque one. Without it the tab still works — the filter just applies unverified — but the
   // task panel cannot read anything at all, and says so.
+  //
+  // Deliberately relative, with no leading `cd`: every developer clones this plugin somewhere
+  // different, and a plugin id or bundle build has no way to know where. The UI that renders
+  // this string is responsible for saying "run this from the rill/ directory of your checkout"
+  // as prose alongside it — see START_COMMAND_HINT.
   var START_COMMAND =
-    "cd ~/Projects/SoftwareFactory/kandev-plugin-opscost/rill && ./extract/extract.sh && " +
-    "rill start . --allowed-origins http://localhost:8817";
+    "./extract/extract.sh && rill start . --allowed-origins http://localhost:8817";
+
+  var START_COMMAND_HINT = "From the rill/ directory of your plugin checkout, run:";
 
   // Both sentinels mean the same thing — the event happened before its session's first step
   // stamp, so it belongs to no step. The models spell it differently and the ledger must treat
@@ -1396,6 +1402,7 @@
       // step-analysis.mjs), but one click still beats a careful drag.
       function commandBlock(key) {
         return jsx("div", { key: key, style: { display: "flex", flexDirection: "column", gap: "6px" } },
+          jsx("span", { style: { opacity: 0.6, fontSize: "11px" } }, START_COMMAND_HINT),
           jsx("pre", { style: {
             padding: "10px", borderRadius: "5px", background: SUNK, fontSize: "11px",
             overflowX: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all",
@@ -2079,6 +2086,11 @@
               "would fight that supervision on every restart."
           ),
           jsx(
+            "p",
+            { style: { opacity: 0.6, fontSize: "12px", marginBottom: "6px" } },
+            START_COMMAND_HINT
+          ),
+          jsx(
             "pre",
             {
               style: {
@@ -2158,9 +2170,9 @@
       // utility group render. A host that predates that mapping degrades this to a plugin-rail
       // row rather than dropping the item, so there is no version guard to write here.
       registry.registerNavItem({
-        id: "opscost",
+        id: "ops-intel",
         label: "Ops Intel",
-        path: "/plugins/opscost",
+        path: "/plugins/ops-intel",
         // A plugin-owned glyph, not the curated "chart" name: that resolved to the same
         // IconChartBar the host's Stats button uses, and in this row they were indistinguishable.
         icon: createGaugeIcon(host),
@@ -2169,7 +2181,7 @@
 
       // topbar:false — Rill draws its own filter bar and time-range control, so host chrome on
       // top would be a second header competing with it for the same job.
-      registry.registerRoute("/plugins/opscost", createOpsCostPage(host), { topbar: false });
+      registry.registerRoute("/plugins/ops-intel", createOpsCostPage(host), { topbar: false });
 
       // This toolbar slot is always mounted beside the model/send controls. It
       // is the entry point for the Rill-backed, step-attributed task analysis;

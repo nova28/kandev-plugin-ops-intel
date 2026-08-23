@@ -7,7 +7,7 @@
  * honest about failure.
  */
 
-export var PLUGIN_ID = "kandev-plugin-opscost";
+export var PLUGIN_ID = "kandev-plugin-ops-intel";
 
 // The local Rill dev server. Edit here if you run it on another port.
 export var RILL_ORIGIN = "http://localhost:9009";
@@ -47,9 +47,15 @@ export var VIEWS = [
 // --allowed-origins is what lets every read in rill.mjs return a response instead of an
 // opaque one. Without it the tab still works — the filter just applies unverified — but the
 // task panel cannot read anything at all, and says so.
+//
+// Deliberately relative, with no leading `cd`: every developer clones this plugin somewhere
+// different, and a plugin id or bundle build has no way to know where. The UI that renders
+// this string is responsible for saying "run this from the rill/ directory of your checkout"
+// as prose alongside it — see START_COMMAND_HINT.
 export var START_COMMAND =
-  "cd ~/Projects/SoftwareFactory/kandev-plugin-opscost/rill && ./extract/extract.sh && " +
-  "rill start . --allowed-origins http://localhost:8817";
+  "./extract/extract.sh && rill start . --allowed-origins http://localhost:8817";
+
+export var START_COMMAND_HINT = "From the rill/ directory of your plugin checkout, run:";
 
 // Both sentinels mean the same thing — the event happened before its session's first step
 // stamp, so it belongs to no step. The models spell it differently and the ledger must treat

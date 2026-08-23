@@ -26,14 +26,14 @@
 #
 # Configuration, all environment variables (set them in the plist, not here):
 #
-#   OPSCOST_REFRESH_WINDOW        "08:00-23:00" — local time, inclusive of both ends.
-#                                 A window whose end is before its start spans midnight.
-#   OPSCOST_REFRESH_MIN_GAP_MIN   50 — minimum minutes between two refreshes.
-#   OPSCOST_REFRESH_TIMEOUT_MIN   10 — a refresh past this is killed, so it cannot hold the lock
-#                                 across the following hours. Anything named rill is spared.
-#   OPSCOST_REFRESH_REQUIRE_RILL  1 — refresh only while Rill is listening. 0 refreshes (and
-#                                 therefore starts Rill) regardless.
-#   OPSCOST_REFRESH_LOG           ~/Library/Logs/kandev-opscost-refresh.log
+#   OPS_INTEL_REFRESH_WINDOW        "08:00-23:00" — local time, inclusive of both ends.
+#                                    A window whose end is before its start spans midnight.
+#   OPS_INTEL_REFRESH_MIN_GAP_MIN   50 — minimum minutes between two refreshes.
+#   OPS_INTEL_REFRESH_TIMEOUT_MIN   10 — a refresh past this is killed, so it cannot hold the lock
+#                                    across the following hours. Anything named rill is spared.
+#   OPS_INTEL_REFRESH_REQUIRE_RILL  1 — refresh only while Rill is listening. 0 refreshes (and
+#                                    therefore starts Rill) regardless.
+#   OPS_INTEL_REFRESH_LOG           ~/Library/Logs/kandev-ops-intel-refresh.log
 #
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,8 +45,8 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # GitHub integration down on 2026-08-15 (see ../../o/CLAUDE.md).
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 
-WINDOW="${OPSCOST_REFRESH_WINDOW:-08:00-23:00}"
-MIN_GAP_MIN="${OPSCOST_REFRESH_MIN_GAP_MIN:-50}"
+WINDOW="${OPS_INTEL_REFRESH_WINDOW:-08:00-23:00}"
+MIN_GAP_MIN="${OPS_INTEL_REFRESH_MIN_GAP_MIN:-50}"
 # 10 minutes, measured rather than guessed: a healthy full refresh on a ~700 MB store is 35
 # seconds end to end (6s snapshot, then the SQL, the Rill restart and check.sh). A deadline is
 # for a genuinely stuck run, and at this ratio ten minutes is already twenty times the real
@@ -55,12 +55,12 @@ MIN_GAP_MIN="${OPSCOST_REFRESH_MIN_GAP_MIN:-50}"
 # This was 40 minutes while extract.sh still snapshotted with `.backup`, which restarts its page
 # copy on every write to the source and did not converge at all under a running Kandev. That is
 # fixed at the source (see extract.sh); the deadline no longer has to accommodate it.
-TIMEOUT_MIN="${OPSCOST_REFRESH_TIMEOUT_MIN:-10}"
-REQUIRE_RILL="${OPSCOST_REFRESH_REQUIRE_RILL:-1}"
-LOG="${OPSCOST_REFRESH_LOG:-$HOME/Library/Logs/kandev-opscost-refresh.log}"
+TIMEOUT_MIN="${OPS_INTEL_REFRESH_TIMEOUT_MIN:-10}"
+REQUIRE_RILL="${OPS_INTEL_REFRESH_REQUIRE_RILL:-1}"
+LOG="${OPS_INTEL_REFRESH_LOG:-$HOME/Library/Logs/kandev-ops-intel-refresh.log}"
 RILL_ORIGIN="${RILL_ORIGIN:-http://localhost:9009}"
 
-STATE_DIR="$HOME/Library/Caches/kandev-opscost"
+STATE_DIR="$HOME/Library/Caches/kandev-ops-intel"
 STAMP="$STATE_DIR/last-refresh"
 LOCK="$STATE_DIR/refresh.lock"
 
@@ -144,7 +144,7 @@ if [[ $FORCE -eq 0 ]]; then
     # An unparseable window is a configuration error, not a quiet no-op. Say so every hour until
     # it is fixed — a refresher that never runs and never complains is the worst outcome here.
     ((window_rc == 2)) && {
-        log "error: OPSCOST_REFRESH_WINDOW='$WINDOW' is not HH:MM-HH:MM — not refreshing"
+        log "error: OPS_INTEL_REFRESH_WINDOW='$WINDOW' is not HH:MM-HH:MM — not refreshing"
         exit 1
     }
     ((window_rc == 0)) || skip "outside working hours ($WINDOW)"

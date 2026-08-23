@@ -5,17 +5,24 @@ GO ?= GOTOOLCHAIN=go1.26.0 go
 KANDEV   ?= ../o/kandev
 KANDEV_URL ?= http://localhost:8817
 VERSION  := $(shell awk '/^version:/ {gsub(/"/,"",$$2); print $$2}' manifest.yaml)
-PKG      := .build/kandev-plugin-opscost-$(VERSION).tar.gz
+PKG      := .build/kandev-plugin-ops-intel-$(VERSION).tar.gz
 STAGE    := .build/pkg
 
 NODE ?= node
+
+# The platform this checkout is being built ON. `make package` bakes it into the staged
+# manifest.yaml (see below) rather than the matrix of everyone's platforms, so every developer
+# who clones this repo installs a binary that actually matches their own machine.
+GOOS     := $(shell $(GO) env GOOS)
+GOARCH   := $(shell $(GO) env GOARCH)
+PLATFORM := $(GOOS)-$(GOARCH)
 
 # The hourly snapshot refresh (see rill/auto-refresh.sh). REFRESH_WINDOW is local time, both
 # ends inclusive; override it at install time, e.g. `make refresh-agent-install
 # REFRESH_WINDOW=07:00-23:00`.
 REFRESH_LABEL  := com.kandev-plugin-ops-intel.refresh
 REFRESH_PLIST  := $(HOME)/Library/LaunchAgents/$(REFRESH_LABEL).plist
-REFRESH_LOG    := $(HOME)/Library/Logs/kandev-opscost-refresh.log
+REFRESH_LOG    := $(HOME)/Library/Logs/kandev-ops-intel-refresh.log
 # 08:00-23:00 rather than a 9-to-5: the work this measures routinely runs into the evening, and
 # a window that closes at 22:00 leaves the snapshot stalest exactly when it is being read.
 REFRESH_WINDOW ?= 08:00-23:00
@@ -23,11 +30,11 @@ REFRESH_WINDOW ?= 08:00-23:00
 .PHONY: build bundle test package install reinstall uninstall clean \
 	refresh refresh-agent-install refresh-agent-uninstall refresh-agent-status
 
-# Host platform only — see README. Rebuilding for the full matrix would ship ~95 MB of
-# binaries that will never run on this machine.
+# The builder's own platform only — see README. Cross-compiling the full matrix would ship
+# binaries nobody on this checkout can verify, for platforms nobody here is running.
 build:
 	@mkdir -p server
-	$(GO) build -o server/plugin-darwin-arm64 .
+	$(GO) build -o server/plugin-$(PLATFORM) .
 
 # ui/bundle.js is GENERATED from ui/src/*.mjs. It stays committed because it is what ships,
 # but editing it directly is a mistake the next build silently undoes — so every path that
@@ -55,8 +62,9 @@ test:
 package: build bundle test
 	@rm -rf $(STAGE)
 	@mkdir -p $(STAGE)/server $(STAGE)/ui
-	@cp manifest.yaml README.md $(STAGE)/
-	@cp server/plugin-darwin-arm64 $(STAGE)/server/
+	@sed 's/@@PLATFORM@@/$(PLATFORM)/g' manifest.yaml > $(STAGE)/manifest.yaml
+	@cp README.md $(STAGE)/
+	@cp server/plugin-$(PLATFORM) $(STAGE)/server/
 	@cp ui/bundle.js $(STAGE)/ui/
 	cd $(KANDEV)/apps/backend && $(GO) run ./cmd/plugin-pack \
 		-dir $(CURDIR)/$(STAGE) -out $(CURDIR)/$(PKG) -platform-only
@@ -83,7 +91,7 @@ reinstall:
 	$(MAKE) install
 
 uninstall:
-	curl -sf -X DELETE $(KANDEV_URL)/api/plugins/kandev-plugin-opscost; echo
+	curl -sf -X DELETE $(KANDEV_URL)/api/plugins/kandev-plugin-ops-intel; echo
 
 clean:
 	rm -rf .build

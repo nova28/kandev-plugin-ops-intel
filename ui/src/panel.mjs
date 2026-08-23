@@ -16,7 +16,7 @@
  * and portals).
  */
 
-import { RILL_ORIGIN, START_COMMAND } from "./config.mjs";
+import { RILL_ORIGIN, START_COMMAND, START_COMMAND_HINT } from "./config.mjs";
 import { copyTextToClipboard } from "./clipboard.mjs";
 // Two lines from one module because the build takes only single-line named imports; it says
 // so loudly rather than emitting a bundle with a stray `import` in it.
@@ -445,6 +445,7 @@ export function createTaskCostPanel(host) {
     // step-analysis.mjs), but one click still beats a careful drag.
     function commandBlock(key) {
       return jsx("div", { key: key, style: { display: "flex", flexDirection: "column", gap: "6px" } },
+        jsx("span", { style: { opacity: 0.6, fontSize: "11px" } }, START_COMMAND_HINT),
         jsx("pre", { style: {
           padding: "10px", borderRadius: "5px", background: SUNK, fontSize: "11px",
           overflowX: "auto", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all",
