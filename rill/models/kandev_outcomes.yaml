@@ -1,0 +1,123 @@
+# One row per card, with what the card PRODUCED alongside what it consumed.
+#
+# `kandev_cards` says, in its own header, that the missing column is the point: nothing in
+# the store recorded whether a card succeeded, so every measure there is cost-side and
+# "cheapest card" is not "best card". `github_task_prs` is the first thing in this store
+# that partially answers it — a merged PR is work that shipped, a closed one is work that
+# did not, and additions/deletions count code that survived review rather than tokens a
+# model emitted. This model is that join and nothing more; the ratios live in the metrics
+# view.
+#
+# WHAT A MERGED PR IS AND IS NOT. It is evidence the work landed. It is NOT evidence the
+# work was correct, and it says nothing about a card that never opened a PR. Ranking on
+# cost-per-merged-PR alone rewards small PRs exactly as ranking on cost alone rewarded
+# giving up early — the same trap the cards model warns about, one level up.
+#
+# COVERAGE IS THE FIRST THING THIS MODEL PUBLISHES. Most cards have no PR: they were
+# research, chores, or stopped before a branch existed. Those cards keep their spend and
+# get `outcome = 'no PR observed'` rather than being dropped, because a cost-per-merged-PR
+# computed over a filtered denominator, presented next to a total that includes everything,
+# is how a dashboard quietly loses half the money. Read `outcome` before reading any ratio.
+#
+# ONE ROW PER CARD, NOT PER PR. The store has 18 PRs across 18 cards today, but nothing in
+# the schema enforces that — `UNIQUE(task_id, repository_id, pr_number)` permits several.
+# PRs are aggregated to the card before the join, so the day a card opens its second PR the
+# card's cost is not counted twice. A card with any merged PR counts as merged.
+type: model
+materialize: true
+
+sql: |
+  WITH pr_agg AS (
+      SELECT
+          task_id,
+          COUNT(*)                                              AS pull_requests,
+          MAX(CASE WHEN pr_state = 'merged' THEN 1 ELSE 0 END)  AS any_merged,
+          MAX(CASE WHEN pr_state = 'open'   THEN 1 ELSE 0 END)  AS any_open,
+
+          SUM(additions)                                        AS additions,
+          SUM(deletions)                                        AS deletions,
+          SUM(review_count)                                     AS review_count,
+          SUM(comment_count)                                    AS comment_count,
+          SUM(unresolved_review_threads)                        AS unresolved_review_threads,
+          SUM(checks_total)                                     AS checks_total,
+          SUM(checks_passing)                                   AS checks_passing,
+
+          MIN(created_at)                                       AS pr_opened_at,
+          MAX(merged_at)                                        AS pr_merged_at,
+          MAX(closed_at)                                        AS pr_closed_at,
+
+          -- PR IDENTITY, BECAUSE A CARD IS NOT A PULL REQUEST. Two cards in this store share
+          -- PR kandev#2418, so counting merged CARDS reports 12 where there are 11 merged
+          -- pull requests. Carrying the key lets the metrics view count the PR itself and
+          -- keeps "$ per merged PR" honest about its own denominator. MIN picks one key per
+          -- card: a card with two merged PRs would still count once, which is the safer
+          -- direction to be wrong in and does not occur here.
+          --
+          -- Keyed on `repository_id`, not the repository NAME. The name is the bare repo
+          -- with the owner deliberately dropped at the extract (an org path is a locator
+          -- this analysis does not need), so two `kandev` repositories under different
+          -- owners would collapse into one key and undercount merged PRs. One repository
+          -- exists in this store today, which is exactly why the weakness would go unseen.
+          MIN(repository_id || '#' || CAST(pr_number AS VARCHAR))
+              FILTER (WHERE pr_state = 'merged')                AS merged_pr_key
+      FROM src_fct_pull_request
+      GROUP BY task_id
+  )
+  SELECT
+      c.*,
+
+      COALESCE(p.pull_requests, 0)          AS pull_requests,
+
+      -- The outcome label, and the whole reason this model exists. GitHub reports a merged
+      -- PR as closed as well, so 'merged' is tested FIRST — reading `state <> 'open'` as
+      -- abandonment would score every successful merge as a failure.
+      --
+      -- TWO LABELS NAME WHAT WAS OBSERVED, NOT WHAT IT MEANT. Both used to claim more than
+      -- the store can support:
+      --
+      --   * 'abandoned' was an interpretation of `closed and not merged`. GitHub records no
+      --     closure reason for a pull request — there is no `state_reason` on a PR, and
+      --     Kandev never closes one itself, so nothing anywhere knows whether a PR was
+      --     abandoned, split, superseded or deliberately exploratory. Naming it abandoned
+      --     put a verdict on two pull requests on the strength of a missing field.
+      --   * 'no PR opened' asserted that none exists. What is known is that none was seen:
+      --     a PR opened outside a watched branch, or before the watch existed, looks
+      --     identical. 55 of 73 cards are in this bucket, so the overclaim is the common case.
+      CASE
+          WHEN p.task_id IS NULL      THEN 'no PR observed'
+          WHEN p.any_merged = 1       THEN 'merged'
+          WHEN p.any_open   = 1       THEN 'in flight'
+          ELSE                             'closed unmerged — reason unrecorded'
+      END                                   AS outcome,
+
+      p.additions                           AS additions,
+      p.deletions                           AS deletions,
+      COALESCE(p.additions, 0) + COALESCE(p.deletions, 0) AS lines_changed,
+      p.review_count                        AS review_count,
+      p.comment_count                       AS comment_count,
+      p.unresolved_review_threads           AS unresolved_review_threads,
+      p.checks_total                        AS checks_total,
+      p.checks_passing                      AS checks_passing,
+
+      p.merged_pr_key                       AS merged_pr_key,
+      p.pr_opened_at                        AS pr_opened_at,
+      p.pr_merged_at                        AS pr_merged_at,
+      p.pr_closed_at                        AS pr_closed_at,
+
+      -- Review latency: PR open -> merge. Distinct from the card's wall time, which starts
+      -- at the first turn and includes everything before a branch existed.
+      CASE
+          WHEN p.pr_merged_at IS NOT NULL
+          THEN date_diff('second', p.pr_opened_at, p.pr_merged_at)
+      END                                   AS pr_open_seconds,
+
+      -- Kept as a dimension rather than folded into `outcome`: a merged PR whose checks
+      -- never passed and one that went green are both "shipped", and the difference is
+      -- worth seeing next to the money.
+      CASE
+          WHEN p.checks_total IS NULL OR p.checks_total = 0 THEN '(no checks recorded)'
+          WHEN p.checks_passing = p.checks_total           THEN 'all checks passed'
+          ELSE                                                  'shipped with failing checks'
+      END                                   AS checks_outcome
+  FROM kandev_cards c
+  LEFT JOIN pr_agg p ON p.task_id = c.task_id

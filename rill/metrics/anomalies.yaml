@@ -1,0 +1,95 @@
+# Triage surface for detected anomalies. Grain: one detection.
+#
+# Read `evidence` first and the score second. Every row states what tripped it in one
+# sentence, because a severity band with no explanation is an invitation to either ignore
+# the list or act on it without looking — and both are worse than not having it.
+#
+# NOTHING HERE MEANS "BROKEN". Each row says only "this is unlike its peers". The store has
+# no outcome label, so an expensive card and a valuable card are indistinguishable to every
+# detector. This is a list of things worth a human minute, ranked.
+type: metrics_view
+
+display_name: Anomalies
+description: >-
+  Outlier cards, sessions and turns detected with median/MAD robust statistics — cost
+  outliers, turn runaways, long stalls, edit thrash, poll storms, overlapping turns and
+  spend stranded on deleted cards.
+
+model: kandev_anomalies
+timeseries: detected_at
+smallest_time_grain: hour
+
+dimensions:
+  - name: anomaly_kind
+    display_name: Anomaly
+    column: anomaly_kind
+  - name: severity
+    display_name: Severity
+    column: severity
+  - name: entity_label
+    display_name: Card / entity
+    column: entity_label
+  - name: entity_type
+    display_name: Entity type
+    column: entity_type
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: step
+    display_name: Step
+    column: step
+  - name: evidence
+    display_name: What tripped it
+    column: evidence
+    description: One sentence naming the observed value and the baseline it was judged against.
+
+measures:
+  - name: total_anomalies
+    display_name: Anomalies
+    expression: COUNT(*)
+    format_preset: humanize
+    lower_is_better: true
+
+  - name: entities_affected
+    display_name: Entities affected
+    expression: COUNT(DISTINCT entity_id)
+    format_preset: humanize
+    lower_is_better: true
+
+  - name: extreme_count
+    display_name: Extreme
+    expression: COUNT(*) FILTER (WHERE severity = '1 · extreme')
+    format_preset: humanize
+    lower_is_better: true
+
+  - name: max_severity_score
+    display_name: Worst score
+    description: Highest robust z in the selection. 3.5 is the detection threshold.
+    expression: MAX(robust_z)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: worst_observed
+    display_name: Worst observed value
+    description: >-
+      Units vary by detector — dollars for cost, hours for stalls, turns for runaways. Only
+      meaningful when a single anomaly type is selected.
+    expression: MAX(observed)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+explore:
+  display_name: Anomalies
+  defaults:
+    measures:
+      - total_anomalies
+      - extreme_count
+      - max_severity_score
+    dimensions:
+      - anomaly_kind
+      - severity
+      - entity_label
+      - workspace

@@ -1,0 +1,189 @@
+# What the agent actually did. Grain: one message.
+#
+# Two warnings that outrank every number on this dashboard:
+#
+#  1. COUNTS ARE DIAGNOSTIC, NEVER A SCORE. Turn counts, message counts and tool-call counts
+#     are motion, not coherence, and the product canon refuses them as measures — including
+#     for our own artifacts. "Ran the drift check 7 times" says nothing about drift caught.
+#     Use these to find where effort concentrates, then go read the work.
+#
+#  2. THE HUMAN-GATE MEASURE COUNTS QUESTIONS ASKED, NOT DECISIONS MADE. It is the closest
+#     available proxy for human-gate integrity and it is genuinely the most interesting
+#     field here, but the table that would record decisions is empty. An agent can ask and
+#     proceed regardless, and this cannot tell the difference.
+type: metrics_view
+
+display_name: Agent activity
+description: >-
+  Tool and message mix per card, workflow and step, reconstructed from message metadata.
+  Message content is never extracted, so nothing here can show what was said — only what
+  kind of action was taken, against which file, and when.
+
+model: kandev_activity
+timeseries: created_at
+smallest_time_grain: hour
+
+dimensions:
+  - name: tool_family
+    display_name: Tool family
+    column: tool_family
+  - name: message_type
+    display_name: Message type
+    column: message_type
+  - name: tool_name
+    display_name: Tool
+    column: tool_name
+  - name: shell_binary
+    display_name: Shell binary
+    column: shell_binary
+    description: >-
+      The command a shell call invoked. Arguments were dropped at extract time — a command
+      line is the likeliest place in this store for a credential to appear.
+  - name: tool_target
+    display_name: File / pattern
+    column: tool_target
+    description: Populated for read, edit and search only.
+  - name: skill
+    display_name: Skill
+    column: skill
+  - name: skill_named
+    display_name: Named a skill
+    column: skill_named
+    description: Filter to 'yes' before ranking skills, or the no-skill majority swamps it.
+  - name: author_type
+    display_name: Author
+    column: author_type
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: step_at_event
+    display_name: Step (when done)
+    column: step_at_event
+    description: The step this action happened under. Group by this for per-step activity.
+  - name: step_attributed
+    display_name: Step resolved
+    column: step_attributed
+  - name: external_agent
+    display_name: External agent
+    column: external_agent
+    description: >-
+      Work handed to codex or agy. These run as subprocesses on a separate account, so they
+      produce NO cost row — a card leaning on them is understated by whatever they spent.
+  - name: current_step
+    display_name: Card's current step
+    column: current_step
+  - name: stage_type
+    display_name: Stage type
+    column: stage_type
+  - name: task_title
+    display_name: Card
+    column: task_title
+  - name: task_state
+    display_name: Card state
+    column: task_state
+  - name: agent_profile
+    display_name: Agent profile
+    column: agent_profile
+  - name: repository
+    display_name: Repository
+    column: repository
+  - name: autopilot_enabled
+    display_name: Autopilot
+    column: autopilot_enabled
+
+measures:
+  - name: total_messages
+    display_name: Messages
+    expression: COUNT(*)
+    format_preset: humanize
+
+  - name: human_gates
+    display_name: Human gates
+    description: >-
+      Agent stopped and asked — ask_user_question, a clarification request, or a message
+      flagged as requiring input. Questions asked, not decisions made.
+    expression: COUNT(*) FILTER (WHERE is_human_gate)
+    format_preset: humanize
+
+  - name: step_advances
+    display_name: Step advances
+    description: Agent-driven step_complete calls. Operator drags on the board leave no trace.
+    expression: COUNT(*) FILTER (WHERE is_step_advance)
+    format_preset: humanize
+
+  - name: step_moves
+    display_name: Explicit card moves
+    description: >-
+      move_task calls. A move backwards is the closest thing to a rework signal this store
+      has — but only when the agent, not a human, did the moving.
+    expression: COUNT(*) FILTER (WHERE is_step_move)
+    format_preset: humanize
+
+  - name: wait_polls
+    display_name: Wait / poll shell calls
+    description: >-
+      echo, sleep, true or wait invoked as a shell command — a round trip spent waiting
+      rather than working. Some waits are correct; a large number is a prompt to look.
+    expression: COUNT(*) FILTER (WHERE is_wait_poll)
+    format_preset: humanize
+    lower_is_better: true
+
+  - name: edits
+    display_name: Edits
+    expression: COUNT(*) FILTER (WHERE message_type = 'tool_edit')
+    format_preset: humanize
+
+  - name: reads
+    display_name: Reads
+    expression: COUNT(*) FILTER (WHERE message_type = 'tool_read')
+    format_preset: humanize
+
+  - name: read_to_edit_ratio
+    display_name: Reads per edit
+    description: How much the agent looked at before changing anything.
+    expression: >-
+      COUNT(*) FILTER (WHERE message_type = 'tool_read')::DOUBLE
+      / NULLIF(COUNT(*) FILTER (WHERE message_type = 'tool_edit'), 0)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: external_agent_calls
+    display_name: External agent calls
+    description: >-
+      Invocations of codex / agy. THE COST OF THESE IS NOT IN ANY DASHBOARD HERE — they bill
+      to a different account entirely. Read a high count as "this card cost more than the
+      cost view says", not as activity.
+    expression: COUNT(*) FILTER (WHERE is_external_agent_call)
+    format_preset: humanize
+
+  - name: distinct_files_touched
+    display_name: Distinct files / patterns
+    expression: COUNT(DISTINCT tool_target)
+    format_preset: humanize
+
+  - name: distinct_cards
+    display_name: Cards
+    expression: COUNT(DISTINCT task_id)
+    format_preset: humanize
+
+  - name: distinct_sessions
+    display_name: Sessions
+    expression: COUNT(DISTINCT session_id)
+    format_preset: humanize
+
+explore:
+  display_name: Agent activity
+  defaults:
+    measures:
+      - total_messages
+      - human_gates
+      - wait_polls
+      - read_to_edit_ratio
+    dimensions:
+      - tool_family
+      - shell_binary
+      - skill
+      - task_title

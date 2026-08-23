@@ -1,0 +1,116 @@
+# One row per agent turn — the timing grain.
+#
+# WHAT THIS CANNOT TELL YOU: `office_cost_events` carries no turn_id, so there is no cost
+# column here and there cannot be one. Cost attributes to a session and a timestamp only.
+# Anything claiming a per-turn dollar figure has invented it.
+type: model
+materialize: true
+
+sql: |
+  SELECT
+      t.turn_id,
+      t.session_id,
+      t.task_id,
+      t.turn_index,
+      t.started_at,
+      t.completed_at,
+      t.agent_seconds,
+      t.idle_seconds_before,
+      t.is_complete,
+
+      -- Run configuration, as recorded per turn.
+      t.model,
+
+      -- The model FAMILY, with alias ids folded together — `default` and `opus[1m]` are one
+      -- model. The mapping lives in models/dim_model_family.yaml and is joined, not repeated,
+      -- so this table and `kandev_cost` cannot drift into two different answers to "how much
+      -- did Opus cost". Read that file for why `default` is a real Opus profile and not a
+      -- missing value; `effort` is the dimension that separates the two Opus profiles.
+      --
+      -- THE RAW `model` IS KEPT, DELIBERATELY. The `[1m]` suffix is not cosmetic: it decides
+      -- the context lane. On 2026-08-14 a bare `sonnet` session was served a 200K window while
+      -- `opus[1m]` got 1M, and compaction paced against the wrong number until the step died.
+      -- Folding the suffix away in the only place it is recorded would have made that
+      -- undiagnosable. Group by `model_family` for spend, by `model` for lane questions.
+      COALESCE(mf.model_family, NULLIF(t.model, ''), '(unrecorded)') AS model_family,
+
+      t.mode,
+      t.effort,
+      t.fast_mode,
+      t.agent,
+      t.agent_type,
+      -- 'full' | 'baseline_only' | 'truncated'. Kept as a dimension so a reader can tell
+      -- "ran at default effort" apart from "we failed to record the effort" — the snapshot
+      -- write does not always happen, and the difference matters for any comparison.
+      t.config_completeness,
+
+      -- Card and workflow context. `current_step` is the card's step NOW, not the step this
+      -- turn ran under — see `step_at_event` below for that.
+      d.workspace,
+      d.workflow,
+      d.current_step,
+      d.stage_type,
+
+      -- The step this TURN ran under: its own stamp where it has one, ASOF against the step
+      -- timeline otherwise. Use this for per-step timing; `current_step` is where the card
+      -- ended up.
+      --
+      -- The stamp comes first for the same reason it does in `kandev_cost`, and keeping the
+      -- two in step matters beyond this model: `kandev_card_steps` puts cost and turns on one
+      -- row, and its header is explicit that a ratio whose halves used different attribution
+      -- rules is not a ratio. Cost moved to the stamp; turns move with it.
+      --
+      -- The ASOF fallback is still right for unstamped turns, and for the reason originally
+      -- given: a turn's work happens AFTER `started_at`, so a turn beginning at the same
+      -- instant as a transition belongs to the step being ENTERED. That tie breaks the other
+      -- way for cost, which looks backwards.
+      COALESCE(t.step_at_start, p.step, '(step not attributable)') AS step_at_event,
+      CASE WHEN t.step_at_start IS NULL AND p.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
+      d.task_title,
+      d.task_state,
+      d.priority,
+      d.origin,
+      d.autopilot_enabled,
+      d.is_child_task,
+      d.is_archived,
+
+      s.agent_profile,
+      s.repository,
+      s.base_branch,
+      s.session_state,
+      s.review_status,
+
+      -- The gap before this turn started. NULL on a session's first turn — deliberately, not
+      -- as 0: the gap between a card being created and its first turn is invisible in this
+      -- table, and on at least one measured card that excluded gap was longer than the card's
+      -- entire recorded wall time. Bucketing a NULL into '< 1 min' would hide exactly that.
+      CASE
+          WHEN t.idle_seconds_before IS NULL     THEN '0 · first turn of session'
+          -- A turn that started before its predecessor finished. 5 turns across 3 sessions
+          -- do this, the worst by 24 minutes. Either turns genuinely run concurrently in a
+          -- session or a timestamp is wrong; either way it is not idleness, and folding a
+          -- negative into 'under 1 min' would hide it while quietly deflating every idle
+          -- total that includes it.
+          WHEN t.idle_seconds_before <     0     THEN '· overlapping turns (negative gap)'
+          WHEN t.idle_seconds_before <    60     THEN '1 · under 1 min'
+          WHEN t.idle_seconds_before <   300     THEN '2 · 1–5 min'
+          WHEN t.idle_seconds_before <  1800     THEN '3 · 5–30 min'
+          WHEN t.idle_seconds_before <  7200     THEN '4 · 30 min – 2 h'
+          ELSE                                        '5 · over 2 h'
+      END AS idle_bucket,
+
+      CASE
+          WHEN t.agent_seconds IS NULL           THEN '(incomplete)'
+          WHEN t.agent_seconds <    30           THEN '1 · under 30 s'
+          WHEN t.agent_seconds <   120           THEN '2 · 30 s – 2 min'
+          WHEN t.agent_seconds <   600           THEN '3 · 2–10 min'
+          WHEN t.agent_seconds <  1800           THEN '4 · 10–30 min'
+          ELSE                                        '5 · over 30 min'
+      END AS agent_duration_bucket
+
+  FROM src_fct_turn t
+  LEFT JOIN src_dim_task     d  ON d.task_id    = t.task_id
+  LEFT JOIN src_dim_session  s  ON s.session_id = t.session_id
+  LEFT JOIN dim_model_family mf ON mf.model     = t.model
+  ASOF LEFT JOIN kandev_step_points p
+      ON p.session_id = t.session_id AND t.started_at >= p.effective_from

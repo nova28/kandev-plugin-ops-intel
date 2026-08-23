@@ -1,0 +1,191 @@
+# Where the time goes. Grain: one agent turn.
+#
+# The split this exists to show is agent time (a turn running) against idle time (the gap
+# before a turn started). In this dataset idle is roughly three and a half times agent, and
+# almost all of it sits in a handful of very long gaps — which is a different problem from
+# "everything is a bit slow" and wants a different fix.
+#
+# WHAT IDLE IS NOT: it is a gap, and the store does not record its cause. Orchestration
+# delay, a queued dispatch, a workflow-step transition and an operator who went to lunch are
+# indistinguishable here. Treat a large idle number as a question, not a diagnosis.
+type: metrics_view
+
+display_name: Turn timing
+description: >-
+  Agent time vs idle time per turn, with the run configuration (model, effort, fast mode)
+  that was in force. Carries no cost measures by design — cost events have no turn_id, so
+  a per-turn dollar figure cannot be derived from this store.
+
+model: kandev_turns
+timeseries: started_at
+smallest_time_grain: hour
+
+dimensions:
+  # Default to the family: `default` and `opus[1m]` are one model, and leaving them apart
+  # files half of Opus's turns under an alias that reads like a separate product.
+  - name: model_family
+    display_name: Model
+    column: model_family
+  # The configured id, suffix intact. Use this — not the family — for anything about the
+  # context lane: `[1m]` vs bare decides the served window, and on 2026-08-14 that difference
+  # was the whole cause of a step dying.
+  - name: model
+    display_name: Model id (raw)
+    column: model
+  - name: mode
+    display_name: Mode
+    column: mode
+  - name: effort
+    display_name: Effort
+    column: effort
+  - name: fast_mode
+    display_name: Fast mode
+    column: fast_mode
+  - name: agent
+    display_name: Agent
+    column: agent
+  - name: agent_type
+    display_name: Agent type
+    column: agent_type
+  - name: config_completeness
+    display_name: Config recorded
+    column: config_completeness
+    description: >-
+      full = the in-force config array was written; baseline_only / truncated = it was not,
+      and the values shown are the profile default. Filter to 'full' before comparing
+      configurations, or you are comparing against a guess.
+  - name: idle_bucket
+    display_name: Idle before turn
+    column: idle_bucket
+  - name: agent_duration_bucket
+    display_name: Turn duration
+    column: agent_duration_bucket
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: step_at_event
+    display_name: Step (when run)
+    column: step_at_event
+    description: The step this turn actually ran under. Group by this for per-step timing.
+  - name: step_attributed
+    display_name: Step resolved
+    column: step_attributed
+  - name: current_step
+    display_name: Card's current step
+    column: current_step
+  - name: stage_type
+    display_name: Stage type
+    column: stage_type
+  - name: task_title
+    display_name: Card
+    column: task_title
+  - name: task_state
+    display_name: Card state
+    column: task_state
+  - name: agent_profile
+    display_name: Agent profile
+    column: agent_profile
+  - name: repository
+    display_name: Repository
+    column: repository
+  - name: autopilot_enabled
+    display_name: Autopilot
+    column: autopilot_enabled
+  - name: is_complete
+    display_name: Turn completed
+    column: is_complete
+
+measures:
+  - name: total_turns
+    display_name: Turns
+    expression: COUNT(*)
+    format_preset: humanize
+
+  - name: agent_hours
+    display_name: Agent hours
+    expression: SUM(agent_seconds) / 3600.0
+    format_d3: ",.1f"
+
+  - name: idle_hours
+    display_name: Idle hours
+    description: >-
+      Sum of gaps before turns. Excludes every session's first turn, whose preceding gap is
+      not recorded — so this understates true waiting.
+    expression: SUM(idle_seconds_before) / 3600.0
+    format_d3: ",.1f"
+    lower_is_better: true
+
+  - name: idle_share
+    display_name: Idle share of elapsed
+    expression: >-
+      SUM(idle_seconds_before) / NULLIF(SUM(idle_seconds_before) + SUM(agent_seconds), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: avg_agent_minutes
+    display_name: Avg turn length (min)
+    expression: AVG(agent_seconds) / 60.0
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: median_agent_minutes
+    display_name: Median turn length (min)
+    expression: MEDIAN(agent_seconds) / 60.0
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: p90_agent_minutes
+    display_name: p90 turn length (min)
+    expression: QUANTILE_CONT(agent_seconds, 0.9) / 60.0
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: longest_idle_hours
+    display_name: Longest single gap (h)
+    expression: MAX(idle_seconds_before) / 3600.0
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: overlapping_turns
+    display_name: Overlapping turns
+    description: >-
+      Turns that started before the previous turn in the same session finished. Either
+      genuine concurrency or a bad timestamp; either way not idleness.
+    expression: COUNT(*) FILTER (WHERE idle_seconds_before < 0)
+    format_preset: humanize
+    lower_is_better: true
+
+  - name: incomplete_turns
+    display_name: Turns never completed
+    expression: COUNT(*) FILTER (WHERE is_complete = 'no')
+    format_preset: humanize
+    lower_is_better: true
+
+  - name: distinct_sessions
+    display_name: Sessions
+    expression: COUNT(DISTINCT session_id)
+    format_preset: humanize
+
+  - name: distinct_cards
+    display_name: Cards
+    expression: COUNT(DISTINCT task_id)
+    format_preset: humanize
+
+explore:
+  display_name: Turn timing
+  defaults:
+    measures:
+      - total_turns
+      - agent_hours
+      - idle_hours
+      - idle_share
+    dimensions:
+      - idle_bucket
+      - model_family
+      - workspace
+      - task_title

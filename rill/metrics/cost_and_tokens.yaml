@@ -1,0 +1,198 @@
+# Where the money goes. Grain: one metered cost event.
+#
+# `usd_per_m_output_tokens` is the measure that earns this dashboard its keep. Ranking
+# models by total spend tells you which one you used most; ranking by cost per unit of
+# output tells you which one was expensive, and in this data those two orderings disagree.
+type: metrics_view
+
+display_name: Cost & tokens
+description: >-
+  Metered spend and token volume per model, workflow and card. Sourced from
+  office_cost_events, which is the only trustworthy token grain in the Kandev store —
+  the task_sessions rollup columns exclude cached input and understate real volume by
+  more than 99.99%.
+
+model: kandev_cost
+timeseries: occurred_at
+smallest_time_grain: hour
+
+dimensions:
+  # Default to the family. `default` is the id the "Opus - Low" profile carries so the workflow
+  # YAML's (agent_name, model, mode) triple can resolve to a second Opus profile — left apart it
+  # reads as its own product and Opus's spend reads low by whatever Opus - Low burned.
+  - name: model_family
+    display_name: Model
+    column: model_family
+  # The configured id, suffix intact. Use this — not the family — for anything about the context
+  # lane: `[1m]` vs bare decides the served window.
+  - name: model
+    display_name: Model id (raw)
+    column: model
+  - name: provider
+    display_name: Provider
+    column: provider
+  - name: token_basis
+    display_name: Token basis
+    column: token_basis
+    description: >-
+      reported = the agent returned token counts; synthesized = Kandev inferred them
+      (the codex bridge emits no usage frame). This says nothing about the dollars:
+      Kandev records no cost provenance, so a figure may be a provider-reported amount
+      or a models.dev list-price calculation and this store cannot tell you which.
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: step_at_event
+    display_name: Step (when spent)
+    column: step_at_event
+    description: >-
+      The step that owned the window this spend bills, resolved against the step timeline.
+      THIS is the one to group by when asking what a step costs.
+  - name: step_attributed
+    display_name: Step resolved
+    column: step_attributed
+    description: >-
+      'no' means nothing is known to have preceded the event — no step stamp before it.
+      ~21% of spend. Filter to 'yes' before comparing steps, or the unattributed pile
+      reads as a step.
+  - name: step_attribution_basis
+    display_name: Step attribution basis
+    column: step_attribution_basis
+    description: >-
+      Whether `step_at_event` is a fact about the window or a majority verdict over one
+      that crossed a step boundary (142 of 668 events). Check it before quoting a single
+      step's total as exact.
+  - name: current_step
+    display_name: Card's current step
+    column: current_step
+    description: >-
+      Where the card sits NOW — its final resting place, not where the money went. Use
+      `step_at_event` for cost questions; this is only useful for "what is stuck where".
+  - name: stage_type
+    display_name: Stage type
+    column: stage_type
+  - name: task_title
+    display_name: Card
+    column: task_title
+  - name: task_state
+    display_name: Card state
+    column: task_state
+  - name: priority
+    display_name: Priority
+    column: priority
+  - name: origin
+    display_name: Card origin
+    column: origin
+  - name: autopilot_enabled
+    display_name: Autopilot
+    column: autopilot_enabled
+  - name: agent_profile
+    display_name: Agent profile
+    column: agent_profile
+  - name: repository
+    display_name: Repository
+    column: repository
+  - name: is_child_task
+    display_name: Is child card
+    column: is_child_task
+  - name: cost_attribution
+    display_name: Card attribution
+    column: cost_attribution
+    description: >-
+      Spend on deleted cards stays in the ledger with an unresolvable task_id. Any per-card
+      view drops it; this dimension is how you see how much was dropped.
+
+measures:
+  - name: total_cost_usd
+    display_name: Total cost
+    # 1 subcent = $0.0001, read from Kandev's frontend currency formatter.
+    expression: SUM(cost_subcents) / 10000.0
+    format_preset: currency_usd
+
+  - name: total_events
+    display_name: Cost events
+    expression: COUNT(*)
+    format_preset: humanize
+
+  - name: output_tokens
+    display_name: Output tokens
+    expression: SUM(tokens_out)
+    format_preset: humanize
+
+  - name: input_tokens
+    display_name: Input tokens (incl. cache)
+    expression: SUM(tokens_input_total)
+    format_preset: humanize
+
+  - name: cached_input_tokens
+    display_name: Cached input tokens
+    expression: SUM(tokens_cached_in)
+    format_preset: humanize
+
+  - name: cache_hit_rate
+    display_name: Cache share of input
+    expression: SUM(tokens_cached_in) / NULLIF(SUM(tokens_input_total), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: usd_per_m_output_tokens
+    display_name: $ per M output tokens
+    description: >-
+      Cost normalised by useful output. This is how you compare two models that were used
+      for different amounts of work — total spend cannot.
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(tokens_out) / 1000000.0, 0)
+    format_d3: "$,.2f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: input_per_output_ratio
+    display_name: Input tokens per output token
+    description: >-
+      How much context the model reads to produce one token. A high ratio is the signature
+      of context churn — re-reading the same material across turns.
+    expression: SUM(tokens_input_total) / NULLIF(SUM(tokens_out), 0)
+    format_d3: ",.0f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # Share of events whose TOKEN COUNTS were synthesized rather than reported by the agent.
+  # Deliberately not named for cost: the old `estimated_share` read as "share of spend that
+  # is a guess", which this store cannot answer — every row's dollar figure is of unrecorded
+  # provenance. This one is answerable and is a real caveat on token-derived rates.
+  - name: synthesized_token_share
+    display_name: Synthesized-token share
+    expression: COUNT(*) FILTER (WHERE token_basis = 'synthesized') / NULLIF(COUNT(*), 0)::DOUBLE
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: cards_touched
+    display_name: Cards
+    expression: COUNT(DISTINCT task_id)
+    format_preset: humanize
+
+  - name: orphaned_cost_usd
+    display_name: Spend on deleted cards
+    description: >-
+      Money the card-level dashboards cannot see, because the card it belongs to no longer
+      exists. Reconciles Card economics against this view.
+    expression: >-
+      SUM(cost_subcents) FILTER (WHERE cost_attribution <> 'attributed to a card') / 10000.0
+    format_preset: currency_usd
+    lower_is_better: true
+
+explore:
+  display_name: Cost & tokens
+  defaults:
+    measures:
+      - total_cost_usd
+      - usd_per_m_output_tokens
+      - output_tokens
+      - input_per_output_ratio
+    dimensions:
+      - model_family
+      - workspace
+      - workflow
+      - task_title

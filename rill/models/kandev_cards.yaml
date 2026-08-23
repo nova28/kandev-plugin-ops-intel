@@ -1,0 +1,125 @@
+# One row per card — the unit a human actually reasons about, and the one place cost, time
+# and activity can be compared against each other.
+#
+# THE MISSING COLUMN IS THE POINT. There is no outcome here, because nothing in Kandev
+# records whether a card SUCCEEDED. `task_state` distinguishes COMPLETED from REVIEW from
+# IN_PROGRESS and carries no notion of correctness or rework, and Kandev's own success chart
+# counts budget-blocked, idle-skipped and user-pressed-Stop runs as successes — so it is
+# worse than absent, it is misleading, and it is deliberately not reproduced here.
+#
+# Everything below is therefore a COST-SIDE measure. It can tell you what a card consumed.
+# It cannot tell you whether that was worth it. Until an outcome label is written by
+# something that knows what good looks like, "cheapest card" is not "best card" — and a
+# dashboard that ranks on cost alone will quietly reward giving up early.
+type: model
+materialize: true
+
+sql: |
+  WITH turn_agg AS (
+      SELECT
+          task_id,
+          COUNT(*)                                     AS turns,
+          COUNT(DISTINCT session_id)                   AS sessions,
+          -- Family, not the raw id — a card that ran only Opus reads as one model even when
+          -- its turns are split between the `opus[1m]` and `default` aliases.
+          COUNT(DISTINCT model_family)                 AS models_used,
+          SUM(agent_seconds)                           AS agent_seconds,
+          -- Excludes the first turn of every session, whose preceding gap is not recorded.
+          SUM(idle_seconds_before)                     AS idle_seconds,
+          MIN(started_at)                              AS first_turn_at,
+          MAX(completed_at)                            AS last_turn_at
+      FROM kandev_turns
+      GROUP BY task_id
+  ),
+  cost_agg AS (
+      SELECT
+          task_id,
+          SUM(cost_subcents)                           AS cost_subcents,
+          SUM(tokens_out)                              AS tokens_out,
+          SUM(tokens_input_total)                      AS tokens_input_total,
+          SUM(tokens_cached_in)                        AS tokens_cached_in,
+          COUNT(*)                                     AS cost_events,
+          COUNT(*) FILTER (WHERE token_basis = 'synthesized') AS synthesized_token_events
+      FROM kandev_cost
+      GROUP BY task_id
+  ),
+  act_agg AS (
+      SELECT
+          task_id,
+          COUNT(*)                                              AS messages,
+          COUNT(*) FILTER (WHERE is_human_gate)                 AS human_gates,
+          COUNT(*) FILTER (WHERE is_step_advance)               AS step_advances,
+          COUNT(*) FILTER (WHERE is_step_move)                  AS step_moves,
+          COUNT(*) FILTER (WHERE is_wait_poll)                  AS wait_polls,
+          COUNT(*) FILTER (WHERE message_type = 'tool_edit')    AS edits,
+          COUNT(*) FILTER (WHERE message_type = 'tool_read')    AS reads,
+          COUNT(*) FILTER (WHERE message_type = 'tool_search')  AS searches,
+          COUNT(*) FILTER (WHERE message_type = 'tool_execute') AS shell_calls,
+          COUNT(DISTINCT tool_target) FILTER (WHERE message_type = 'tool_edit') AS files_edited,
+          COUNT(DISTINCT skill)                                 AS skills_used
+      FROM kandev_activity
+      GROUP BY task_id
+  )
+  SELECT
+      d.task_id,
+      d.task_title,
+      d.workspace,
+      d.workflow,
+      d.current_step,
+      d.stage_type,
+      d.task_state,
+      d.priority,
+      d.origin,
+      d.autopilot_enabled,
+      d.is_child_task,
+      d.is_archived,
+      d.is_ephemeral,
+      d.task_created_at,
+
+      COALESCE(t.turns, 0)            AS turns,
+      COALESCE(t.sessions, 0)         AS sessions,
+      COALESCE(t.models_used, 0)      AS models_used,
+      COALESCE(t.agent_seconds, 0)    AS agent_seconds,
+      COALESCE(t.idle_seconds, 0)     AS idle_seconds,
+      t.first_turn_at,
+      t.last_turn_at,
+      -- First turn start to last turn end. This UNDERSTATES elapsed time: any gap between
+      -- the card being created and its first turn starting is invisible here.
+      COALESCE(date_diff('second', t.first_turn_at, t.last_turn_at), 0) AS wall_seconds,
+
+      COALESCE(c.cost_subcents, 0)      AS cost_subcents,
+      COALESCE(c.tokens_out, 0)         AS tokens_out,
+      COALESCE(c.tokens_input_total, 0) AS tokens_input_total,
+      COALESCE(c.tokens_cached_in, 0)   AS tokens_cached_in,
+      COALESCE(c.cost_events, 0)        AS cost_events,
+      COALESCE(c.synthesized_token_events, 0) AS synthesized_token_events,
+
+      COALESCE(a.messages, 0)         AS messages,
+      COALESCE(a.human_gates, 0)      AS human_gates,
+      COALESCE(a.step_advances, 0)    AS step_advances,
+      COALESCE(a.step_moves, 0)       AS step_moves,
+      COALESCE(a.wait_polls, 0)       AS wait_polls,
+      COALESCE(a.edits, 0)            AS edits,
+      COALESCE(a.reads, 0)            AS reads,
+      COALESCE(a.searches, 0)         AS searches,
+      COALESCE(a.shell_calls, 0)      AS shell_calls,
+      COALESCE(a.files_edited, 0)     AS files_edited,
+      COALESCE(a.skills_used, 0)      AS skills_used,
+
+      -- A card that never ran has no economics to report, and averaging it in as a zero
+      -- would drag every per-card mean toward zero. Filter on this before ranking.
+      COALESCE(t.turns, 0) > 0        AS did_run,
+
+      CASE
+          WHEN COALESCE(t.turns, 0) = 0                      THEN '(never ran)'
+          WHEN COALESCE(c.cost_subcents, 0) <   50000        THEN '1 · under $5'
+          WHEN COALESCE(c.cost_subcents, 0) <  150000        THEN '2 · $5–15'
+          WHEN COALESCE(c.cost_subcents, 0) <  400000        THEN '3 · $15–40'
+          WHEN COALESCE(c.cost_subcents, 0) < 1000000        THEN '4 · $40–100'
+          ELSE                                                    '5 · over $100'
+      END AS cost_bucket
+
+  FROM src_dim_task d
+  LEFT JOIN turn_agg t ON t.task_id = d.task_id
+  LEFT JOIN cost_agg c ON c.task_id = d.task_id
+  LEFT JOIN act_agg  a ON a.task_id = d.task_id

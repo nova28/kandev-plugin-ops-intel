@@ -1,0 +1,11 @@
+# Raw extract, loaded verbatim. All derivation happens downstream in the kandev_* models,
+# so this file never needs editing when the analysis changes.
+#
+# The workflow's DEFINED step order — what was supposed to happen, against which every other
+# model records what did. Used to lay a per-step readout out in the same sequence as the step
+# rail on a task page, rather than in whatever order steps were first observed.
+type: model
+
+connector: local_file
+path: data/dim_workflow_step.csv
+invalidate_on_change: true

@@ -1,0 +1,113 @@
+# One row per git snapshot, carrying the CODE WRITTEN SINCE THE PREVIOUS ONE, attributed to
+# the step that owned that moment.
+#
+# WHY A DELTA AND NOT THE COLUMN ITSELF. `branch_additions` is cumulative — the whole branch
+# against its base. Summing it across a session's 175 snapshots would count the same work 175
+# times. The line written in this window is the increase since the last snapshot, so every
+# figure here is a LAG difference and the raw cumulative column is deliberately not exposed
+# downstream.
+#
+# WHY NOT THE WORKING-TREE DIFF. `uncommitted_*` rises while work is in progress and collapses
+# to zero the moment it is committed. It measures work in flight, which is a risk signal, not
+# output. It is kept for that and never summed as production.
+#
+# THE FIRST SNAPSHOT OF A SESSION IS THE HONEST PROBLEM HERE. Its delta has nothing to
+# subtract from, and its `branch_additions` may include commits made before the session
+# started — a resumed branch arrives already ahead (one measured session opens at 6 commits
+# and 3,365 lines). Counting it would credit this session with another's work; discarding it
+# would silently lose everything written before the first status poll fired. It is therefore
+# counted AND flagged: `is_session_baseline` marks exactly those rows so any measure can
+# exclude them, and the metrics view publishes the baseline total alongside so the size of
+# the ambiguity is visible rather than argued about.
+#
+# NEGATIVE DELTAS ARE REAL AND ARE NOT OUTPUT. A rebase, a reset or a force-push moves
+# `branch_additions` down. Clamping silently would inflate the next positive delta; counting
+# it as negative output would let a rewind cancel real work. Negative deltas contribute zero
+# to lines written and are counted separately as `rewinds`.
+type: model
+materialize: true
+
+sql: |
+  WITH ordered AS (
+      SELECT
+          g.snapshot_id,
+          g.session_id,
+          g.created_at,
+          g.snapshot_type,
+          g.commits_ahead,
+          g.dirty_files,
+          g.uncommitted_additions,
+          g.uncommitted_deletions,
+          COALESCE(g.branch_additions, 0) AS branch_additions,
+          COALESCE(g.branch_deletions, 0) AS branch_deletions,
+
+          g.base_commit,
+
+          LAG(COALESCE(g.branch_additions, 0)) OVER w AS prev_additions,
+          LAG(COALESCE(g.branch_deletions, 0)) OVER w AS prev_deletions,
+          LAG(g.commits_ahead)                 OVER w AS prev_commits_ahead,
+          LAG(g.base_commit)                   OVER w AS prev_base_commit
+      FROM src_fct_git_snapshot g
+      WINDOW w AS (PARTITION BY g.session_id ORDER BY g.created_at)
+  ),
+  deltas AS (
+      SELECT
+          *,
+          CASE WHEN prev_additions IS NULL THEN 1 ELSE 0 END AS is_session_baseline,
+          -- A MOVED BASE IS NOT WORK. Both `branch_additions` and `commits_ahead` are counted
+          -- against `base_commit`; when it changes, the two readings either side are measured
+          -- from different points and subtracting them is meaningless. One session in this
+          -- store re-based mid-flight and produced a single delta of +440,418 lines and
+          -- +8,263 commits — 77% of all lines and 95% of all commits the delta model would
+          -- otherwise report. Treated exactly like a session baseline: the scale restarts,
+          -- and the step is credited with nothing for the jump.
+          CASE
+              WHEN prev_base_commit IS NOT NULL AND prev_base_commit <> base_commit
+              THEN 1 ELSE 0
+          END AS is_base_change,
+          branch_additions - COALESCE(prev_additions, 0)     AS raw_added,
+          branch_deletions - COALESCE(prev_deletions, 0)     AS raw_deleted,
+          commits_ahead    - COALESCE(prev_commits_ahead, 0) AS raw_commits
+      FROM ordered
+  )
+  SELECT
+      d.snapshot_id,
+      d.session_id,
+      d.created_at,
+      d.snapshot_type,
+      d.is_session_baseline,
+      d.is_base_change,
+
+      -- Output. Negatives are rewinds, not work, so they floor at zero here and are counted
+      -- as their own event below. A delta across a moved base is discarded outright rather
+      -- than floored — it is not small work, it is a reading taken on a different ruler.
+      CASE WHEN d.is_base_change = 1 THEN 0 ELSE GREATEST(d.raw_added,   0) END AS lines_added,
+      CASE WHEN d.is_base_change = 1 THEN 0 ELSE GREATEST(d.raw_deleted, 0) END AS lines_deleted,
+      CASE WHEN d.is_base_change = 1 THEN 0 ELSE GREATEST(d.raw_commits, 0) END AS commits_landed,
+      CASE
+          WHEN d.is_base_change = 0 AND (d.raw_added < 0 OR d.raw_commits < 0)
+          THEN 1 ELSE 0
+      END AS is_rewind,
+
+      -- Work in flight at this instant. Never output.
+      d.dirty_files                                 AS dirty_files,
+      d.uncommitted_additions                       AS uncommitted_additions,
+      d.uncommitted_deletions                       AS uncommitted_deletions,
+
+      s.task_id                                     AS task_id,
+      t.workspace                                   AS workspace,
+      t.workflow                                    AS workflow,
+      t.task_title                                  AS task_title,
+      s.repository                                  AS repository,
+
+      -- Same ASOF reconstruction the turns use, and for the same reason: a snapshot's work
+      -- happened BEFORE its timestamp, but the step timeline is all this store has, and
+      -- nearest-stamp-at-or-before is the rule kandev_turns settled on. A snapshot before a
+      -- session's first stamp attributes to nothing and says so.
+      COALESCE(p.step, '(step not attributable)')   AS step_at_event,
+      CASE WHEN p.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed
+  FROM deltas d
+  LEFT JOIN src_dim_session s ON s.session_id = d.session_id
+  LEFT JOIN src_dim_task    t ON t.task_id    = s.task_id
+  ASOF LEFT JOIN kandev_step_points p
+      ON p.session_id = d.session_id AND d.created_at >= p.effective_from

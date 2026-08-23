@@ -1,0 +1,181 @@
+# One row per session: which config environment its work was done under.
+#
+# WHY THIS EXISTS. `kandev_requests` already computes `config_epoch`, and it is the authority.
+# But it computes it *inline*, at request grain, from a key only it has — `transcript_first_seen`,
+# the first priced event in a transcript. Nothing else in the project can reach that. So every
+# reading of cost, turns, steps or outcomes that wants to exclude a retired environment has had to
+# either re-derive the boundary table by hand or skip the cut entirely, and the second is what
+# actually happened: `kandev_cost`, `kandev_turns`, `kandev_card_steps` and `kandev_outcomes` carry
+# no epoch at all.
+#
+# That is not a cosmetic gap. Measured on the 2026-08-20 extract, **$5,771 of the Kandev
+# workspace's $8,778 was spent before the epoch series began** — under a 1M window with no
+# compaction ceiling, on workflow revisions that no longer exist. A step table summed over all of
+# it describes a machine that is not running any more. Every headline this project produces is
+# wrong by roughly 3x until the cut is applied, and the cut was unavailable.
+#
+# ---------------------------------------------------------------------------------------------
+# THE BOUNDARY TABLE IS DUPLICATED HERE, DELIBERATELY, AND MUST BE KEPT IN STEP.
+#
+# `kandev_requests` needs the epoch on a column this model does not have, and Rill models cannot
+# share a scalar macro. The boundaries therefore appear twice. `check.sh` asserts the two
+# derivations agree on every session they both cover — that assertion is the thing that keeps the
+# duplication honest, and it is why the copy is acceptable rather than a bug waiting to happen.
+# If you edit a boundary here, edit it in `kandev_requests.yaml` too and re-run `./check.sh`.
+#
+# Boundaries come from `Forge/docs/kandev/operating-loop/ENVIRONMENTS.md`, which is hand-
+# maintained and has gone stale before: ENV-005 drifted on 08-16 and was not superseded until
+# 08-19, three days in which config moved with no environment minted. That window is labelled
+# rather than folded into a neighbour, because a row inside it is not evidence for either side.
+#
+# ---------------------------------------------------------------------------------------------
+# TWO BASES, AND WHY THE WEAKER ONE IS CARRIED RATHER THAN DROPPED.
+#
+# `transcript_first_seen` is the correct key: the environment binds at process spawn, and the
+# transcript is the only artifact stamped at that moment. It is also missing for most of the
+# store. On the 2026-08-20 extract it reaches **53 of 225 Kandev sessions ($5,070)** and — this is
+# the part that matters — **zero sessions in ENV-007, the current environment.** A cut that
+# admits only transcript-bound rows cannot say anything at all about the config actually running.
+#
+# So `session_started_at` is carried as a fallback. It is present on 404 of 404 sessions, and it
+# is a proxy rather than a reading: Kandev stamps the session row, not the agent process. On the
+# 69 sessions where both keys exist the two agree on **59**, and all 10 disagreements are
+# ADJACENT buckets with the transcript earlier than the session row — the transcript file opens
+# before Kandev finishes writing the session. None crosses more than one boundary.
+#
+# `epoch_basis` therefore travels with every row, in the same spirit as `step_attribution_basis`
+# and `visit_basis` elsewhere in this project: the value is usable, and the reader is told which
+# kind of value it is. Filter on `epoch_basis = 'transcript'` when a claim must be exact; take
+# both when the question is about the current environment, and say so.
+#
+# ---------------------------------------------------------------------------------------------
+# `is_measurable` IS NOT `is_recent`.
+#
+# ENV-003 is marked `void — do not measure in it` upstream: it ran on a proxy whose window had
+# collapsed to 200K, so its context and cost figures describe the collapse, not the workflow.
+# Rows there are excluded by `is_measurable = false`, not by being old. ENV-001 is old and fully
+# measurable *as ENV-001 evidence*; it is simply not evidence about today.
+type: model
+materialize: true
+
+sql: |
+  WITH transcript_bound AS (
+      -- The authority. Same key and same grain `kandev_requests` uses; aggregated to the session
+      -- because a session can hold several transcripts and the earliest is what bound the config.
+      SELECT
+          session_id,
+          MIN(transcript_first_seen)        AS first_seen,
+          MAX(session_transcript_coverage)  AS transcript_coverage
+      FROM kandev_requests
+      WHERE session_id IS NOT NULL AND session_id <> ''
+      GROUP BY 1
+  ),
+  bound AS (
+      SELECT
+          s.session_id,
+          s.task_id,
+          t.transcript_coverage,
+          COALESCE(t.first_seen, s.session_started_at)                       AS epoch_at,
+          CASE WHEN t.first_seen IS NOT NULL THEN 'transcript'
+               WHEN s.session_started_at IS NOT NULL THEN 'session start'
+               ELSE 'unbound' END                                            AS epoch_basis,
+          t.first_seen                                                       AS transcript_at,
+          s.session_started_at                                               AS session_at
+      FROM src_dim_session s
+      LEFT JOIN transcript_bound t ON t.session_id = s.session_id
+  ),
+  labelled AS (
+      SELECT
+          b.*,
+          -- KEEP IN STEP WITH kandev_requests.yaml. See the header.
+          CASE
+              WHEN b.epoch_at IS NULL                                     THEN '(unbound)'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-13 11:02' THEN 'ENV-001 no ceiling'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-13 16:00' THEN 'ENV-002 declared, ceiling NOT observed'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-14 00:00' THEN 'ENV-002 ceiling 300K'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-14 03:48' THEN 'ENV-003 INVALID'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-14 07:58' THEN 'ENV-004 no ceiling'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-16 15:41' THEN 'ENV-005 ceiling 300K'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-19 09:03' THEN 'ENV-005 drifted'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-21 08:39' THEN 'ENV-007 ceiling 300K'
+              ELSE                                                'ENV-008 ceiling 300K both profiles'
+          END AS config_epoch,
+
+          CASE
+              WHEN b.epoch_at IS NULL                                     THEN 'unknown'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-13 11:02' THEN 'none'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-13 16:00' THEN 'none observed'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-14 00:00' THEN '300K'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-14 03:48' THEN 'invalid'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-14 07:58' THEN 'none'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-16 15:41' THEN '300K'
+              WHEN b.epoch_at < TIMESTAMP '2026-08-19 09:03' THEN 'unrecorded'
+              ELSE                                                '300K'
+          END AS ceiling_declared,
+
+          -- The same CASE over the OTHER key, so `check.sh` can compare the two derivations
+          -- without re-stating the boundary table a third time.
+          CASE
+              WHEN b.transcript_at IS NULL                                     THEN NULL
+              WHEN b.transcript_at < TIMESTAMP '2026-08-13 11:02' THEN 'ENV-001 no ceiling'
+              WHEN b.transcript_at < TIMESTAMP '2026-08-13 16:00' THEN 'ENV-002 declared, ceiling NOT observed'
+              WHEN b.transcript_at < TIMESTAMP '2026-08-14 00:00' THEN 'ENV-002 ceiling 300K'
+              WHEN b.transcript_at < TIMESTAMP '2026-08-14 03:48' THEN 'ENV-003 INVALID'
+              WHEN b.transcript_at < TIMESTAMP '2026-08-14 07:58' THEN 'ENV-004 no ceiling'
+              WHEN b.transcript_at < TIMESTAMP '2026-08-16 15:41' THEN 'ENV-005 ceiling 300K'
+              WHEN b.transcript_at < TIMESTAMP '2026-08-19 09:03' THEN 'ENV-005 drifted'
+              WHEN b.transcript_at < TIMESTAMP '2026-08-21 08:39' THEN 'ENV-007 ceiling 300K'
+              ELSE                                                'ENV-008 ceiling 300K both profiles'
+          END AS epoch_by_transcript,
+
+          CASE
+              WHEN b.session_at IS NULL                                     THEN NULL
+              WHEN b.session_at < TIMESTAMP '2026-08-13 11:02' THEN 'ENV-001 no ceiling'
+              WHEN b.session_at < TIMESTAMP '2026-08-13 16:00' THEN 'ENV-002 declared, ceiling NOT observed'
+              WHEN b.session_at < TIMESTAMP '2026-08-14 00:00' THEN 'ENV-002 ceiling 300K'
+              WHEN b.session_at < TIMESTAMP '2026-08-14 03:48' THEN 'ENV-003 INVALID'
+              WHEN b.session_at < TIMESTAMP '2026-08-14 07:58' THEN 'ENV-004 no ceiling'
+              WHEN b.session_at < TIMESTAMP '2026-08-16 15:41' THEN 'ENV-005 ceiling 300K'
+              WHEN b.session_at < TIMESTAMP '2026-08-19 09:03' THEN 'ENV-005 drifted'
+              WHEN b.session_at < TIMESTAMP '2026-08-21 08:39' THEN 'ENV-007 ceiling 300K'
+              ELSE                                                'ENV-008 ceiling 300K both profiles'
+          END AS epoch_by_session_start
+      FROM bound b
+  )
+  SELECT
+      session_id,
+      task_id,
+      epoch_at,
+      epoch_basis,
+      config_epoch,
+      ceiling_declared,
+      transcript_coverage,
+
+      -- Both raw keys are projected, not just the chosen one. `check.sh` compares them directly to
+      -- assert the fallback never overtakes the authority; that check cannot be written against the
+      -- labels alone, because two timestamps inside one boundary produce identical labels.
+      transcript_at,
+      session_at,
+      epoch_by_transcript,
+      epoch_by_session_start,
+
+      -- Do the two keys tell the same story about this session? Only 'differs' is a finding;
+      -- 'transcript only' is the normal state for a session Kandev never stamped, and
+      -- 'session only' is the normal state for everything after 2026-08-19.
+      CASE
+          WHEN epoch_by_transcript IS NULL AND epoch_by_session_start IS NULL THEN 'neither'
+          WHEN epoch_by_transcript IS NULL                                    THEN 'session only'
+          WHEN epoch_by_session_start IS NULL                                 THEN 'transcript only'
+          WHEN epoch_by_transcript = epoch_by_session_start                   THEN 'agree'
+          ELSE                                                                     'differs'
+      END AS epoch_agreement,
+
+      -- ENV-003 ran on a collapsed 200K proxy window. Upstream marks it `do not measure in it`.
+      -- This is the only environment excluded on grounds of validity rather than age.
+      config_epoch <> 'ENV-003 INVALID' AND config_epoch <> '(unbound)' AS is_measurable,
+
+      -- The default cut for "is this evidence about the machine running today". Everything from
+      -- the first boundary at which a compaction ceiling was actually OBSERVED, which is ENV-005
+      -- rather than ENV-002 — see 'A declared boundary is not an observed one' in ENVIRONMENTS.md.
+      epoch_at >= TIMESTAMP '2026-08-14 07:58' AS is_current_series
+  FROM labelled

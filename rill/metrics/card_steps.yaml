@@ -1,0 +1,238 @@
+# Card × step. The pivot: one card down its steps, or one step across every card.
+#
+# HOW TO USE IT, because the two readings need opposite filters:
+#
+#   ONE CARD          filter `Card` to the title -> rows are its steps. Where did this card's
+#                     money go, which step reworked, which step searched instead of editing.
+#   ONE STEP, FLEET   filter `Step` to Build -> rows are cards. Is this card's Build typical?
+#                     Which cards are outliers, and do they share a workflow or a model?
+#
+# It is deliberately an explore rather than a canvas. A fixed layout would have to pick one of
+# those two readings and demote the other, and the whole reason this grain was added is that
+# both are asked constantly.
+#
+# THE ONE THING TO READ FIRST, EVERY TIME: `Clean attribution share`. Kandev records no step on
+# a cost event, so every dollar here was assigned to a step by reconstruction. At a low clean
+# share a row is describing that reconstruction as much as it is describing the step. This is
+# not a caveat to file away — it is the difference between "PR Fixup churns at 725:1" and the
+# 524:1 it actually reads on clean windows, which was the same as Build.
+#
+# NO SUCCESS OR COMPLETION RATE, here as everywhere in this project. The store has no outcome
+# label, and the success signal Kandev computes counts budget-blocked and user-stopped runs as
+# successes. `Cards` and `Lines added` describe volume, never quality.
+type: metrics_view
+display_name: Card × step
+model: kandev_card_steps
+
+dimensions:
+  - name: task_title
+    display_name: Card
+    column: task_title
+  - name: step
+    display_name: Step
+    column: step
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: top_model
+    display_name: Model (most spend)
+    column: top_model
+  - name: task_state
+    display_name: Card state
+    column: task_state
+  - name: stage_type
+    display_name: Stage type
+    column: stage_type
+  - name: origin
+    display_name: Origin
+    column: origin
+  - name: row_coverage
+    display_name: Row coverage
+    column: row_coverage
+  - name: visit_basis
+    display_name: Visit count basis
+    description: >-
+      Whether this row's visit count is a real ledger reading or simply not recorded. Cards
+      before 2026-08-12 predate `session_step_history` and report "not recorded" — never a
+      fabricated 1.
+    column: visit_basis
+  - name: autopilot_enabled
+    display_name: Autopilot
+    column: autopilot_enabled
+  - name: is_archived
+    display_name: Archived
+    column: is_archived
+
+measures:
+  # ------------------------------------------------------------------ the money
+  - name: total_cost_usd
+    display_name: Total cost
+    # 1 subcent = $0.0001, matching every other view in this project.
+    expression: SUM(cost_subcents) / 10000.0
+    format_preset: currency_usd
+
+  - name: cards
+    display_name: Cards
+    description: >-
+      Distinct cards behind the row. Countable here — unlike on the day-grained step table —
+      because this model has no day column for a card to be split across.
+    expression: COUNT(DISTINCT task_id)
+    format_preset: humanize
+
+  - name: avg_cost_per_card_usd
+    display_name: $ per card at this step
+    description: >-
+      The headline for a one-step-across-cards reading: what Build typically costs, rather than
+      what Build cost in total.
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(COUNT(DISTINCT task_id), 0)
+    format_preset: currency_usd
+    valid_percent_of_total: false
+
+  - name: clean_attribution_share
+    display_name: Clean attribution share
+    description: >-
+      How much of this row's spend came from a billing window that sat entirely inside one
+      step, rather than crossing a boundary and being assigned by message-count majority. Read
+      every other ratio on the row through it.
+    expression: SUM(clean_cost_subcents) / NULLIF(SUM(cost_subcents), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  # ------------------------------------------------------------------ the rework
+  #
+  # The reason a card × step grain earns its keep. A step visited three times is a step that
+  # sent work backwards twice, and nothing at whole-card or day grain can see it.
+  - name: total_visits
+    display_name: Step entries
+    description: >-
+      Times cards entered this step. Ledger-covered cards only; rows reading "not recorded" on
+      Visit count basis contribute nothing rather than a guessed 1.
+    expression: SUM(visits)
+    format_preset: humanize
+
+  - name: avg_visits_per_card
+    display_name: Entries per card
+    description: >-
+      The rework rate. 1.0 means every card passed through once. Build at 1.8 means most cards
+      come back — and since a Build round is the most expensive thing on the board, this is
+      usually the cheapest number on this page to act on.
+    expression: SUM(visits) / NULLIF(COUNT(DISTINCT task_id) FILTER (WHERE visits IS NOT NULL), 0)
+    format_d3: ",.2f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # ------------------------------------------------------------------ the round trips
+  #
+  # Same definitions as the step-diagnostics view, at card grain. None of them is a quality
+  # score: an unfamiliar subsystem earns a high explore-to-edit ratio honestly, and a card that
+  # ran no searches has no answer for scope rather than a perfect one.
+  - name: tool_calls
+    display_name: Tool calls
+    expression: SUM(tool_calls)
+    format_preset: humanize
+
+  - name: usd_per_tool_call
+    display_name: $ per tool call
+    description: >-
+      The marginal price of one agent action. A turn may hold one tool call or eighty, but
+      every call re-sends the whole context prefix — so this is the unit that bills. A step
+      whose $ per turn looks fine and whose $ per tool call does not is a long unreset session.
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(tool_calls), 0)
+    format_d3: "$,.3f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: explore_edit_ratio
+    display_name: Explore-to-edit ratio
+    description: >-
+      Recon calls (reads, searches, greps) per editing call. Because every result stays in the
+      window, search is paid for again on every later call in the same session. A prompt to
+      look, not a verdict.
+    expression: SUM(recon_calls) / NULLIF(SUM(edit_calls), 0)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: recon_share
+    display_name: Recon share of calls
+    expression: SUM(recon_calls) / NULLIF(SUM(tool_calls), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: unscoped_share
+    display_name: Unscoped search/test share
+    description: >-
+      Of the calls where breadth was both meaningful and readable from the command, how many
+      were aimed at the whole tree. Most useful for ruling a theory OUT — a low figure means an
+      expensive step is expensive for some reason other than sloppy commands.
+    expression: SUM(unscoped_calls) / NULLIF(SUM(scopeable_calls), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # ------------------------------------------------------------------ the tokens
+  - name: cached_input_tokens
+    display_name: Input tokens (cached)
+    expression: SUM(tokens_cached_in)
+    format_preset: humanize
+
+  - name: output_tokens
+    display_name: Output tokens
+    expression: SUM(tokens_out)
+    format_preset: humanize
+
+  - name: input_per_output_ratio
+    display_name: Input tokens per output token
+    description: >-
+      How much context is read to produce one token. A high ratio is the signature of context
+      churn — re-reading the same material on every round trip.
+    expression: SUM(tokens_input_total) / NULLIF(SUM(tokens_out), 0)
+    format_d3: ",.0f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # ------------------------------------------------------------------ the clock
+  - name: total_turns
+    display_name: Turns
+    expression: SUM(turns)
+    format_preset: humanize
+
+  - name: agent_hours
+    display_name: Agent hours
+    expression: SUM(agent_seconds) / 3600.0
+    format_d3: ",.1f"
+
+  - name: idle_share
+    display_name: Idle share of elapsed
+    description: >-
+      Waiting rather than working. Negative gaps are overlapping turns and are summed as
+      recorded rather than clamped, matching turn_timing.
+    expression: >-
+      SUM(idle_seconds) / NULLIF(SUM(agent_seconds) + SUM(idle_seconds), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # ------------------------------------------------------------------ what came out
+  - name: lines_added
+    display_name: Lines added
+    expression: SUM(lines_added)
+    format_preset: humanize
+
+  - name: commits_landed
+    display_name: Commits
+    expression: SUM(commits_landed)
+    format_preset: humanize
+
+  - name: usd_per_1k_lines
+    display_name: $ per 1k lines
+    description: >-
+      Crude — a rewritten line counts again, and a review step legitimately writes none. But it
+      is the only ratio here whose denominator is not another measure of effort.
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(lines_added) / 1000.0, 0)
+    format_d3: "$,.2f"
+    valid_percent_of_total: false
+    lower_is_better: true

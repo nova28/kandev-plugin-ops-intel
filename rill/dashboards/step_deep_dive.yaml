@@ -1,0 +1,233 @@
+# Workspace × step. What each stage of the board actually costs and how long it waits.
+#
+# HOW THIS IS POSSIBLE AT ALL, and where it stops being true:
+#
+# Kandev records no step on a cost event and no step on a turn. `session_step_history` is
+# zero rows. What exists is a step name stamped onto ~400 messages, marking step ENTRY. The
+# models rebuild a timeline from those stamps and resolve cost and turns against it. A turn
+# asks "which step was this session in when the turn started". A cost event cannot ask that —
+# it is flushed AT a step transition and bills the work behind it — so it asks "which step
+# owned the window this event bills" instead. See the header of `models/kandev_cost.yaml`.
+#
+# So the resolution here is exactly as good as how often Kandev happens to stamp. Concretely:
+#   * ~21% of spend lands before its session's first stamp and is not attributable.
+#   * A step entered and left with no stamped message in between is invisible.
+#   * An operator dragging a card writes nothing, so human-driven moves are missing entirely.
+#
+# Pin the `Step resolved` filter to 'yes' before reading any comparison, which this dashboard
+# does by default. The unattributed pile is larger than most real steps and will otherwise
+# sit at the top of every leaderboard looking like the most expensive stage of the board.
+type: canvas
+
+display_name: Kandev — workspace & step deep dive
+
+max_width: 1600
+
+filters:
+  pinned:
+    - workspace
+    - step_at_event
+
+time_ranges:
+  - P7D
+  - P14D
+  - P30D
+  - inf
+
+defaults:
+  time_range: inf
+
+rows:
+  - height: 170px
+    items:
+      - width: 12
+        markdown:
+          content: |
+            ## Where the board spends and where it waits
+
+            Step attribution is **reconstructed** from ~400 step stamps on messages — Kandev
+            stores no step on a cost event or a turn. Roughly **a fifth of spend happens
+            before its session's first stamp** and cannot be attributed; every panel here is
+            filtered to resolved steps only, so totals will not match the overview.
+
+            The pairing to read: **cost per card** says which stage is expensive to run,
+            **idle hours** says which stage is waiting on a human. They are rarely the same
+            stage, and they want opposite fixes.
+
+  # ------------------------------------------------ cost per step
+  - height: 200px
+    items:
+      - width: 12
+        kpi_grid:
+          metrics_view: cost_and_tokens
+          dimension_filters: step_attributed IN ('yes')
+          measures:
+            - total_cost_usd
+            - usd_per_m_output_tokens
+            - input_per_output_ratio
+            - cards_touched
+          sparkline: bottom
+
+  - height: 420px
+    items:
+      - width: 6
+        leaderboard:
+          metrics_view: cost_and_tokens
+          title: Cost by step
+          description: Resolved steps only. Group by workspace using the pinned filter.
+          dimension_filters: step_attributed IN ('yes')
+          dimensions:
+            - step_at_event
+            - workspace
+          measures:
+            - total_cost_usd
+            - cards_touched
+            - output_tokens
+          num_rows: 15
+      - width: 6
+        stacked_bar:
+          metrics_view: cost_and_tokens
+          title: Spend over time by step
+          dimension_filters: step_attributed IN ('yes')
+          x:
+            type: temporal
+            field: occurred_at
+          y:
+            type: quantitative
+            field: total_cost_usd
+          color:
+            type: nominal
+            field: step_at_event
+
+  # ------------------------------------------------ time per step
+  - height: 420px
+    items:
+      - width: 6
+        leaderboard:
+          metrics_view: turn_timing
+          title: Agent time vs idle time by step
+          description: >-
+            A step with far more idle than agent time is waiting on a person, not working.
+            That is a queue problem and no model choice fixes it.
+          dimension_filters: step_attributed IN ('yes')
+          dimensions:
+            - step_at_event
+          measures:
+            - agent_hours
+            - idle_hours
+            - idle_share
+            - total_turns
+          num_rows: 15
+      - width: 6
+        bar_chart:
+          metrics_view: turn_timing
+          title: Idle hours by step
+          color: primary
+          dimension_filters: step_attributed IN ('yes')
+          x:
+            type: nominal
+            field: step_at_event
+            limit: 12
+            sort: -y
+          y:
+            type: quantitative
+            field: idle_hours
+
+  - height: 400px
+    items:
+      - width: 6
+        leaderboard:
+          metrics_view: turn_timing
+          title: Turn length by step
+          description: >-
+            Long average turns mean heavy work per round trip. Very short turns paired with
+            high idle mean the step is mostly handoff.
+          dimension_filters: step_attributed IN ('yes')
+          dimensions:
+            - step_at_event
+          measures:
+            - avg_agent_minutes
+            - p90_agent_minutes
+            - total_turns
+          num_rows: 15
+      - width: 6
+        leaderboard:
+          metrics_view: turn_timing
+          title: Model mix by step
+          description: Which step is running which model, and at what effort.
+          dimension_filters: step_attributed IN ('yes')
+          dimensions:
+            - step_at_event
+            - model
+          measures:
+            - total_turns
+            - agent_hours
+          num_rows: 15
+
+  # ------------------------------------------------ activity per step
+  - height: 420px
+    items:
+      - width: 6
+        leaderboard:
+          metrics_view: agent_activity
+          title: What each step does
+          description: >-
+            Human gates say where the agent stopped to ask. External agent calls are work
+            billed to a SEPARATE account — those steps cost more than the cost panels show.
+          dimension_filters: step_attributed IN ('yes')
+          dimensions:
+            - step_at_event
+          measures:
+            - total_messages
+            - human_gates
+            - external_agent_calls
+            - read_to_edit_ratio
+          num_rows: 15
+      - width: 6
+        leaderboard:
+          metrics_view: agent_activity
+          title: Tool mix by step
+          dimension_filters: step_attributed IN ('yes')
+          dimensions:
+            - step_at_event
+            - tool_family
+          measures:
+            - total_messages
+          num_rows: 15
+
+  # ------------------------------------------------ the blind spot
+  - height: 360px
+    items:
+      - width: 6
+        leaderboard:
+          metrics_view: agent_activity
+          title: External agents — the accounting blind spot
+          description: >-
+            codex and agy run as subprocesses on another account. Kandev's ledger holds five
+            OpenAI events totalling under a dollar against hundreds of invocations, so this
+            work is effectively free in every cost view here. It is not free.
+          dimension_filters: external_agent IN ('codex', 'agy')
+          dimensions:
+            - external_agent
+            - workspace
+            - step_at_event
+          measures:
+            - external_agent_calls
+            - distinct_cards
+          num_rows: 12
+      - width: 6
+        leaderboard:
+          metrics_view: cost_and_tokens
+          title: What could not be attributed
+          description: >-
+            Spend before a session's first step stamp, plus spend on deleted cards. Shown so
+            the size of the hole is visible rather than inferred from a total that does not
+            add up.
+          dimensions:
+            - step_attributed
+            - cost_attribution
+            - workspace
+          measures:
+            - total_cost_usd
+            - total_events
+          num_rows: 10

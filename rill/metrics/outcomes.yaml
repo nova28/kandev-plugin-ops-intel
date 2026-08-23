@@ -1,0 +1,204 @@
+# What a shipped card costs. Grain: one card.
+#
+# Every other metrics view in this project measures effort — dollars, tokens, turns, hours.
+# This one divides that effort by what came out of it, which is the only way to tell an
+# expensive card that shipped from an expensive card that did not.
+#
+# READ `outcome` BEFORE READING ANY RATIO. Most cards never open a PR, and they are present
+# here with their full spend under `outcome = 'no PR observed'`. `cost_per_merged_pr` divides
+# only merged spend by merged PRs; it is a rate for that group, not a share of the total.
+# `merged_cost_share` is published alongside precisely so the gap is visible rather than
+# inferred.
+#
+# WHAT THIS STILL CANNOT TELL YOU. A merged PR is evidence that work landed, not that it was
+# correct — nothing here counts a revert, a follow-up fix, or an incident. Ranking cards on
+# cost-per-merged-PR rewards small PRs the same way ranking on cost alone rewards giving up
+# early. It is a better denominator than output tokens, not a verdict.
+type: metrics_view
+
+display_name: Outcomes
+description: >-
+  Card-level spend joined to GitHub PR state — merged, closed unmerged, in flight, or no
+  PR observed. The first view in this project with a denominator that means shipped work rather
+  than emitted tokens. Coverage is partial by construction; read `outcome` first.
+
+model: kandev_outcomes
+timeseries: task_created_at
+smallest_time_grain: day
+
+dimensions:
+  - name: outcome
+    display_name: Outcome
+    column: outcome
+    description: >-
+      merged = at least one PR landed. closed unmerged — reason unrecorded = every PR was
+      closed without merging, and nothing records whether that was abandonment, a split, a
+      supersession or a deliberate experiment. in flight = a PR is still open. no PR
+      observed = none was seen for this card, which is not the same as none existing; the
+      card keeps its spend here rather than being dropped from the denominator.
+
+  - name: checks_outcome
+    display_name: CI outcome
+    column: checks_outcome
+
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+
+  - name: task_title
+    display_name: Card
+    column: task_title
+
+  - name: task_state
+    display_name: Card state
+    column: task_state
+
+  - name: current_step
+    display_name: Step the card sits in
+    column: current_step
+
+measures:
+  # ------------------------------------------------------------------ the money
+  - name: total_cost_usd
+    display_name: Total cost
+    expression: SUM(cost_subcents) / 10000.0
+    format_preset: currency_usd
+
+  - name: cards
+    display_name: Cards
+    expression: COUNT(*)
+    format_preset: humanize
+
+  # A CARD IS NOT A PULL REQUEST, and in this store the two disagree: PR kandev#2418 is
+  # shared by two cards, so counting merged cards says 12 where 11 pull requests merged.
+  # Both counts are published because they answer different questions, and a ratio that
+  # silently picked one would be quoted as if it were the other.
+  - name: merged_prs
+    display_name: Merged PRs
+    expression: COUNT(DISTINCT merged_pr_key)
+    format_preset: humanize
+
+  - name: merged_cards
+    display_name: Cards with a merged PR
+    expression: COUNT(*) FILTER (WHERE outcome = 'merged')
+    format_preset: humanize
+
+  # ------------------------------------------------------------------ the ratios that earn this view
+  - name: cost_per_merged_pr
+    display_name: $ per merged PR
+    description: >-
+      Merged spend over DISTINCT merged pull requests, so a PR shared by two cards is one
+      pull request. A rate for the merged group only — not total spend divided by PRs, which
+      would charge closed-unmerged and PR-less work to the work that shipped. It is spend over the
+      card's whole life, not spend incurred after the PR opened; nothing in the store dates
+      spend against the review.
+    expression: >-
+      (SUM(cost_subcents) FILTER (WHERE outcome = 'merged') / 10000.0)
+      / NULLIF(COUNT(DISTINCT merged_pr_key), 0)
+    format_preset: currency_usd
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: usd_per_1k_lines_by_outcome
+    display_name: $ per 1k lines (this outcome)
+    description: >-
+      The size-normalised comparison, and the one that survives contact with the sample. Per
+      CARD, closed-unmerged work looks 5.3x a merged one; per LINE it is about 1.2x, because
+      the two closed pull requests are large. With n=2 the per-card ratio is describing two
+      outliers, not the economics of work that does not land.
+    expression: >-
+      (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(lines_changed) / 1000.0, 0)
+    format_d3: "$,.2f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: closed_unmerged_cost_usd
+    display_name: Spend on PRs closed unmerged
+    description: >-
+      Work that reached a pull request and was closed without merging. This used to be
+      published as "spend on abandoned PRs" and called entirely avoidable — which the store
+      cannot support. GitHub records no closure reason for a pull request and Kandev never
+      closes one, so a split, a supersession and a genuine dead end are indistinguishable
+      here. `lower_is_better` is deliberately NOT set for the same reason: it would restate
+      the abandonment claim as a colour.
+    expression: >-
+      SUM(cost_subcents) FILTER (WHERE outcome = 'closed unmerged — reason unrecorded') / 10000.0
+    format_preset: currency_usd
+
+  - name: closed_unmerged_share_of_pr_cost
+    display_name: Closed-unmerged share of PR spend
+    description: >-
+      Spend on PRs closed without merging, over all spend that reached a PR. Deliberately
+      excludes cards with no observed PR from both halves, so it answers "of the work that
+      got as far as review, how much did not land" — landing, not worth, which is all the
+      store observes.
+    expression: >-
+      (SUM(cost_subcents) FILTER (WHERE outcome = 'closed unmerged — reason unrecorded'))
+      / NULLIF(SUM(cost_subcents) FILTER (WHERE outcome <> 'no PR observed'), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: merged_cost_share
+    display_name: Merged share of all spend
+    description: >-
+      How much of every dollar in this view sits behind a merged PR. The honesty check on
+      cost_per_merged_pr — a low figure means most spend is not represented by that rate.
+    expression: >-
+      (SUM(cost_subcents) FILTER (WHERE outcome = 'merged'))
+      / NULLIF(SUM(cost_subcents), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: usd_per_1k_lines
+    display_name: $ per 1k lines changed
+    description: >-
+      Cost over additions plus deletions on merged PRs. Lines are a crude unit of work, but
+      unlike output tokens they survived review.
+    expression: >-
+      (SUM(cost_subcents) FILTER (WHERE outcome = 'merged') / 10000.0)
+      / NULLIF(SUM(lines_changed) FILTER (WHERE outcome = 'merged') / 1000.0, 0)
+    format_d3: "$,.2f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # ------------------------------------------------------------------ what shipped
+  - name: lines_added
+    display_name: Lines added
+    expression: SUM(additions)
+    format_preset: humanize
+
+  - name: lines_deleted
+    display_name: Lines deleted
+    expression: SUM(deletions)
+    format_preset: humanize
+
+  - name: median_hours_to_merge
+    display_name: Median hours PR open
+    description: PR opened to merged. Excludes everything before the branch existed.
+    expression: MEDIAN(pr_open_seconds) / 3600.0
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: unresolved_threads
+    display_name: Unresolved review threads
+    expression: SUM(unresolved_review_threads)
+    format_preset: humanize
+
+explore:
+  display_name: Outcomes
+  defaults:
+    measures:
+      - total_cost_usd
+      - cost_per_merged_pr
+      - closed_unmerged_cost_usd
+      - merged_prs
+      - usd_per_1k_lines
+    dimensions:
+      - outcome
+      - workflow
+      - workspace
+      - task_title

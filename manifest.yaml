@@ -1,0 +1,34 @@
+# Operational cost and efficiency intelligence for Kandev — so a run's economics are visible
+# where the work happens, rather than in a separate tool nobody remembers to open.
+#
+# NAMED FOR THE PURPOSE, NOT THE IMPLEMENTATION. Today the whole surface is an embedded Rill
+# instance, which is why the first draft of this was called kandev-plugin-rill. That name
+# would have had to change the moment the plugin grew anything native — per-task cost, the
+# model in force, a budget warning on a card — and a plugin id is expensive to change once
+# installs exist. The scope is "what does our operation cost and where does it leak", by
+# whatever mechanism serves that.
+#
+# Rill lives in rill/ and is started separately. The managed executable exists
+# because Kandev requires a supervised binary even for UI-only plugins.
+id: "kandev-plugin-ops-intel"
+api_version: 1
+version: "0.32.0"
+display_name: "Ops Intel"
+description: "Operational cost and efficiency intelligence — spend per model, per build step, and anomaly detection."
+author: "henry"
+categories: ["tools"]
+repo_url: "https://github.com/kdlbs/kandev-plugin-template"
+
+runtime:
+  type: binary
+  executables:
+    # @@PLATFORM@@ is substituted by `make package` with the BUILDING machine's own
+    # GOOS-GOARCH (see the Makefile) — every developer who clones this repo and runs
+    # `make install` ships a binary for their own platform, not a hardcoded one. This file as
+    # checked into git is a template, not something Kandev ever installs directly.
+    "@@PLATFORM@@": "server/plugin-@@PLATFORM@@"
+
+capabilities: {}
+
+ui:
+  bundle: "/ui/bundle.js"

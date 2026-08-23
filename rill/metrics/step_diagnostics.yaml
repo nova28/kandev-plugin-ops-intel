@@ -1,0 +1,330 @@
+# Why a step cost what it cost. Grain: one day × workspace × workflow × step.
+#
+# `cost_and_tokens` answers "how much", `turn_timing` answers "how long". This view exists so
+# both can be read on ONE row, because the interesting question is the ratio between them: a
+# step at $400 across three long runs and a step at $400 across three hundred six-second
+# retries are the same number and completely different problems.
+#
+# The join behind it is documented in kandev_step_diagnostics.yaml. The short version: no
+# dollar is attributed to a turn here — cost events carry no turn_id — both sides are simply
+# aggregated to the same step-day and lined up.
+#
+# WHAT IS DELIBERATELY ABSENT: any distinct count of cards or sessions. Those cannot be
+# re-derived from a day-grained aggregate without counting a card once per day it was worked
+# on. `cards_touched` on `cost_and_tokens` remains the honest place to read a card count.
+type: metrics_view
+
+display_name: Step diagnostics
+description: >-
+  Cost, token mix, turn count and the agent-vs-idle split for every build step, on one row.
+  Both halves are attributed to a step against the same reconstructed step timeline — turns
+  by where the turn started, cost by which step owned the window the event bills — so a step
+  that was never stamped appears in neither.
+
+model: kandev_step_diagnostics
+timeseries: day
+smallest_time_grain: day
+
+# A row stamped 2026-08-12T00:00 covers that whole day, so the measures stay valid until that
+# day ends — MAX(day) would declare them stale from midnight, twenty-four hours early. This
+# does not change what the canvas displays (its "All Time" is unbounded, and the range label
+# it prints comes from MAX(day), not from here); it matters to anything that reads the
+# watermark to decide freshness, such as alerts and scheduled reports.
+watermark: MAX(day) + INTERVAL 1 DAY
+
+dimensions:
+  - name: step
+    display_name: Step
+    column: step
+
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+
+  - name: top_model
+    display_name: Model (most spend)
+    column: top_model
+    description: >-
+      The model carrying the most cost events on this step-day. It describes the SPEND, not
+      the turns — a step running two models shows only the dominant one.
+
+  - name: row_coverage
+    display_name: Row coverage
+    column: row_coverage
+    description: >-
+      Whether this step-day has both halves. "turns only" is work billed to another account
+      (codex/agy); "spend only" is spend landing outside any recorded turn.
+
+measures:
+  # ------------------------------------------------------------------ the money
+  - name: total_cost_usd
+    display_name: Total cost
+    # 1 subcent = $0.0001, matching cost_and_tokens.
+    expression: SUM(cost_subcents) / 10000.0
+    format_preset: currency_usd
+
+  - name: usd_per_m_output_tokens
+    display_name: $ per M output tokens
+    description: >-
+      Cost normalised by useful output — the only way to compare two steps that did different
+      amounts of work.
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(tokens_out) / 1000000.0, 0)
+    format_d3: "$,.2f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: usd_per_turn
+    display_name: $ per turn
+    description: >-
+      Reads against turn count: a low figure over many turns is a retry loop, a high figure
+      over few turns is a small number of expensive runs.
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(turns), 0)
+    format_d3: "$,.2f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: usd_per_tool_call
+    display_name: $ per tool call
+    description: >-
+      The marginal price of one agent action. A turn is elastic — it may hold one tool call or
+      eighty — but every tool call re-sends the whole context prefix, so this is the unit that
+      actually bills. Read it beside $ per turn, not instead of it: a step can look cheap per
+      turn and ruinous per call, and that gap is where a long unreset session hides. Carries
+      the same step-window attribution caveat as $ per turn, so read it with Clean attribution
+      share.
+    expression: (SUM(cost_subcents) / 10000.0) / NULLIF(SUM(tool_calls), 0)
+    format_d3: "$,.3f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # ------------------------------------------------------------------ the tokens
+  #
+  # Declared input-before-output, in the order the tokens flow: context read first, tokens
+  # produced last. Anything consuming this view in declaration order — the explore dashboard's
+  # measure list, a new table — inherits that reading order for free.
+  - name: fresh_input_tokens
+    display_name: Input tokens (uncached)
+    description: >-
+      Context read for the first time. In this store it is a rounding error next to the cached
+      figure — which is the finding, not a defect in the column.
+    expression: SUM(tokens_in)
+    format_preset: humanize
+
+  - name: cached_input_tokens
+    display_name: Input tokens (cached)
+    expression: SUM(tokens_cached_in)
+    format_preset: humanize
+
+  - name: output_tokens
+    display_name: Output tokens
+    expression: SUM(tokens_out)
+    format_preset: humanize
+
+  - name: input_per_output_ratio
+    display_name: Input tokens per output token
+    description: >-
+      How much context is read to produce one token. A high ratio is the signature of context
+      churn — re-reading the same material every turn.
+    expression: SUM(tokens_input_total) / NULLIF(SUM(tokens_out), 0)
+    format_d3: ",.0f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: cache_share
+    display_name: Cache share of input
+    expression: SUM(tokens_cached_in) / NULLIF(SUM(tokens_input_total), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  # ------------------------------------------------------------------ the clock
+  - name: total_turns
+    display_name: Turns
+    expression: SUM(turns)
+    format_preset: humanize
+
+  - name: agent_hours
+    display_name: Agent hours
+    expression: SUM(agent_seconds) / 3600.0
+    format_d3: ",.1f"
+
+  - name: idle_hours
+    display_name: Idle hours
+    description: >-
+      Time waiting, not working. Summed as recorded, so overlapping turns (negative gaps) pull
+      it down rather than being clamped away — turn_timing publishes that overlap count.
+    expression: SUM(idle_seconds) / 3600.0
+    format_d3: ",.1f"
+    lower_is_better: true
+
+  - name: idle_share
+    display_name: Idle share of elapsed
+    description: >-
+      The number that decides what to do next. A step heavy in agent time responds to model
+      and prompt changes; a step heavy in idle time is a queue and will not.
+    expression: >-
+      SUM(idle_seconds) / NULLIF(SUM(idle_seconds) + SUM(agent_seconds), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: avg_turn_minutes
+    display_name: Avg turn length (min)
+    description: >-
+      Derived from totals rather than averaging a per-day average, so it stays correct across
+      any time range. A median cannot be recovered from a day-grained aggregate; read
+      turn_timing for that.
+    expression: (SUM(agent_seconds) / 60.0) / NULLIF(SUM(turns), 0)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: longest_turn_minutes
+    display_name: Longest turn (min)
+    expression: MAX(max_agent_seconds) / 60.0
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+
+  - name: cost_events
+    display_name: Cost events
+    expression: SUM(cost_events)
+    format_preset: humanize
+
+  - name: clean_attribution_share
+    display_name: Share of spend cleanly attributed
+    description: >-
+      How much of this row's spend came from a billing window that sat entirely inside one
+      step, rather than one that crossed a boundary and was assigned by message-count
+      majority. Read every other ratio on this row through it: at a low share the step's
+      figures are describing an attribution guess as much as the step. PR Fixup reads 725:1
+      input:output overall and 524:1 restricted to clean windows — indistinguishable from
+      Build — and nothing here said so until this measure existed.
+    expression: SUM(clean_cost_subcents) / NULLIF(SUM(cost_subcents), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  # ------------------------------------------------------------------ the round trips
+  #
+  # What the step actually DID, at the grain that bills. These three exist to answer the
+  # question `$ per turn` cannot: a turn may hold one tool call or eighty, so a step with a
+  # comfortable per-turn figure can still be spending most of its money re-reading context
+  # across hundreds of round trips.
+  #
+  # None of them is a quality score, and Explore-to-edit especially is not. A subsystem the
+  # agent has never touched legitimately costs more to search than a familiar one, and nothing
+  # in this store knows which case a row is. Treat a high ratio as a place to look — usually at
+  # whether the step is running too long in one context — never as a verdict on the run.
+  - name: tool_calls
+    display_name: Tool calls
+    description: >-
+      Round trips that carried an action: shell, read, edit, search, MCP and todo writes.
+      Prose and thinking are excluded — they are parts of a reply, not requests of their own.
+    expression: SUM(tool_calls)
+    format_preset: humanize
+
+  - name: explore_edit_ratio
+    display_name: Explore-to-edit ratio
+    description: >-
+      Recon calls (reads, searches, greps) per editing call. High means the step spent its
+      round trips finding things rather than changing them — and because every result stays in
+      the context window, that search is paid for again on every later call in the same
+      session. A prompt to look, not a defect: an unfamiliar subsystem earns a high ratio
+      honestly.
+    expression: SUM(recon_calls) / NULLIF(SUM(edit_calls), 0)
+    format_d3: ",.1f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: recon_share
+    display_name: Recon share of calls
+    expression: SUM(recon_calls) / NULLIF(SUM(tool_calls), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: unscoped_share
+    display_name: Unscoped search/test share
+    description: >-
+      Of the calls where breadth was both a meaningful question and readable from the command —
+      searches and test runs — how many were aimed at the whole tree. The denominator excludes
+      calls whose breadth could not be determined as well as calls where it does not apply, so
+      it is a sample rather than a census; read it with Tool calls beside it. Most useful for
+      ruling a theory OUT: a low figure means an expensive step is expensive for some reason
+      other than sloppy commands, which is the more common case.
+    expression: SUM(unscoped_calls) / NULLIF(SUM(scopeable_calls), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  # ------------------------------------------------------------------ what came out
+  #
+  # Lines are a crude unit and a rewritten line counts again — but unlike output tokens they
+  # are the thing the work was for, and `$ per 1k lines` is the first per-step ratio on this
+  # page whose denominator is not another measure of effort.
+  - name: lines_added
+    display_name: Lines added
+    expression: SUM(lines_added)
+    format_preset: humanize
+
+  - name: lines_deleted
+    display_name: Lines deleted
+    expression: SUM(lines_deleted)
+    format_preset: humanize
+
+  - name: commits_landed
+    display_name: Commits
+    expression: SUM(commits_landed)
+    format_preset: humanize
+
+  - name: usd_per_1k_lines
+    display_name: $ per 1k lines
+    description: >-
+      Step spend over the lines that step produced. Blank where a step legitimately writes no
+      code — a review or a spec step is not free, it just does not commit — so read it only
+      on the steps that build.
+    expression: >-
+      (SUM(cost_subcents) / 10000.0)
+      / NULLIF((SUM(lines_added) + SUM(lines_deleted)) / 1000.0, 0)
+    format_d3: "$,.2f"
+    valid_percent_of_total: false
+    lower_is_better: true
+
+  - name: baseline_line_share
+    display_name: Share of lines from a session baseline
+    description: >-
+      How much of this step's output rests on a first-snapshot delta, which may include
+      commits made before the session opened. High here means the line count is soft.
+    expression: SUM(baseline_lines_added) / NULLIF(SUM(lines_added), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: rewinds
+    display_name: Rewinds
+    description: >-
+      Snapshots where the branch diffstat or commit count went DOWN — a rebase, reset or
+      force-push. They contribute no lines, and a step with many is a step whose line count
+      understates the work done.
+    expression: SUM(rewinds)
+    format_preset: humanize
+
+  - name: peak_uncommitted_lines
+    display_name: Peak uncommitted lines
+    description: Largest amount of work sitting uncommitted at any one moment in this step.
+    expression: MAX(peak_uncommitted_lines)
+    format_preset: humanize
+
+explore:
+  display_name: Step diagnostics
+  defaults:
+    measures:
+      - total_cost_usd
+      - usd_per_turn
+      - total_turns
+      - idle_share
+      - input_per_output_ratio
+    dimensions:
+      - step
+      - workspace
+      - top_model
+      - workflow

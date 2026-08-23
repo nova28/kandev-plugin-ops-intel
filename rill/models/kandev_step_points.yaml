@@ -1,0 +1,128 @@
+# The step timeline: every point at which a session was known to be in a named step.
+#
+# Everything that asks "what did step X cost / take / involve" ASOF- or window-joins against
+# this model. It has two possible sources and prefers the honest one.
+#
+# ---------------------------------------------------------------------------------------
+# WHY THIS WAS REWRITTEN
+#
+# It used to read ONLY `stamped_step` on messages — `workflow_step_name`, which Kandev writes
+# solely when the workflow ENGINE injects a message to start a step
+# (`orchestrator/message_meta.go`, guarded by `if m.WorkflowMessage`). Three consequences,
+# all structural:
+#
+#   * A human dragging a card writes no message and therefore no stamp. Manual moves were
+#     invisible, and in the live ledger they are 13 of 28 transitions — roughly half.
+#   * A session that works before the engine injects anything has NO step context at all.
+#     One card ran 44 minutes and $74.87 that way; its first stamp landed one second after
+#     the cost row, and 93% of the card was unattributable.
+#   * Coverage was ~400 stamps across 42 of 67 sessions.
+#
+# `session_step_history` — the table this project's research recorded as ZERO ROWS, and
+# designed around the absence of — started filling on 2026-08-12 (kandev
+# `feature/wire-session-step-hi-u06`, now on local/integration). It is a real ledger: one row
+# per transition, with `from_step_id`, a `trigger`, and an actor.
+#
+# ---------------------------------------------------------------------------------------
+# THE RULE: PER SESSION, ONE SOURCE. NEVER MIXED.
+#
+# A session with any ledger row uses the ledger for its whole timeline. A session with none
+# falls back to stamps. Mixing them inside one session would interleave an exact clock with
+# an approximate one and produce intervals that belong to neither — worse than either alone,
+# and impossible to reason about afterwards.
+#
+# Historical sessions therefore keep the old reconstruction forever; the ledger cannot be
+# backfilled. `basis` says which source a point came from so no reader has to guess, and the
+# panel reports it.
+type: model
+materialize: true
+
+sql: |
+  WITH ledger AS (
+      SELECT
+          h.session_id,
+          h.occurred_at,
+          h.from_step_id,
+          h.to_step_id,
+          h.trigger,
+          ROW_NUMBER() OVER (PARTITION BY h.session_id ORDER BY h.occurred_at) AS n
+      FROM src_fct_step_transition h
+  ),
+
+  -- Sessions the ledger covers at all. Membership, not per-row: see the rule above.
+  covered AS (
+      SELECT DISTINCT session_id FROM ledger
+  ),
+
+  -- Step id -> name. A workflow can hold two steps with the same name, so this collapses to
+  -- one row per id and takes any name for it; the id is what the ledger stores and what
+  -- stays stable across a rename.
+  step_name AS (
+      SELECT workflow_step_id, any_value(step) AS step
+      FROM src_dim_workflow_step
+      GROUP BY 1
+  ),
+
+  points AS (
+      -- 1. THE TRANSITION ITSELF. The session entered `to_step_id` at this instant.
+      SELECT
+          l.session_id,
+          l.occurred_at                                   AS effective_from,
+          COALESCE(sn.step, '(unknown step)')             AS step,
+          'ledger'                                        AS basis,
+          l.trigger                                       AS trigger
+      FROM ledger l
+      LEFT JOIN step_name sn ON sn.workflow_step_id = l.to_step_id
+
+      UNION ALL
+
+      -- 2. THE ORIGIN POINT, and the reason this rewrite is worth doing.
+      --
+      -- The first transition of a session names the step it was leaving. That step was in
+      -- force from the session's start until this moment — a window the stamp reconstruction
+      -- could never see, because nothing was written during it. This is precisely where the
+      -- $74.87 sat.
+      --
+      -- Emitted only when `from_step_id` is present (a session created directly into its
+      -- first step has none) and only for the FIRST transition, or every later row would
+      -- re-open a step the session had already left.
+      SELECT
+          l.session_id,
+          s.session_started_at                            AS effective_from,
+          COALESCE(sn.step, '(unknown step)')             AS step,
+          'ledger (origin)'                               AS basis,
+          'session start'                                 AS trigger
+      FROM ledger l
+      JOIN src_dim_session s ON s.session_id = l.session_id
+      LEFT JOIN step_name sn ON sn.workflow_step_id = l.from_step_id
+      WHERE l.n = 1
+        AND l.from_step_id <> ''
+        AND s.session_started_at IS NOT NULL
+        -- A clock that disagrees with itself is not a fact. Drop rather than emit a window
+        -- that ends before it begins.
+        AND s.session_started_at <= l.occurred_at
+
+      UNION ALL
+
+      -- 3. FALLBACK, for sessions the ledger does not cover — every session that ran before
+      -- 2026-08-12. Same reconstruction as before, and just as approximate.
+      SELECT
+          m.session_id,
+          m.created_at                                    AS effective_from,
+          m.stamped_step                                  AS step,
+          'message stamp'                                 AS basis,
+          '(unrecorded)'                                  AS trigger
+      FROM src_fct_message m
+      WHERE m.stamped_step IS NOT NULL
+        AND m.session_id NOT IN (SELECT session_id FROM covered)
+  )
+
+  -- One point per (session, instant). Two transitions in the same second would otherwise
+  -- open two overlapping windows and double-count every event inside them.
+  SELECT session_id, effective_from, step, basis, trigger
+  FROM points
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY session_id, effective_from
+      -- Prefer a real transition over the synthetic origin when they collide.
+      ORDER BY CASE basis WHEN 'ledger' THEN 0 WHEN 'ledger (origin)' THEN 1 ELSE 2 END
+  ) = 1

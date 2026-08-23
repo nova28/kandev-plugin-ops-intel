@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hourly Rill snapshot refresh. Installed by `make refresh-agent-install`, which substitutes
+  @@…@@ with this checkout's paths — the plist has to carry absolute paths, and this repo is
+  cloned wherever the operator put it.
+
+  A LaunchAgent (per-user, at login), never a LaunchDaemon. The extract reads
+  ~/.kandev/data/kandev.db and writes into this checkout, and Rill is the operator's own
+  process; a root daemon would refresh a store nobody is looking at, with the wrong ownership
+  on every CSV it wrote.
+
+  StartInterval rather than fifteen StartCalendarInterval entries: launchd fires an interval
+  job on wake as well as on schedule, which is exactly the behaviour wanted here (open the
+  laptop, the snapshot catches up), and auto-refresh.sh already owns the working-hours window
+  and the minimum gap. Encoding the window here as well would put the same policy in two
+  places and let them disagree.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@@LABEL@@</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@SCRIPT@@</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@@RILL_DIR@@</string>
+
+    <!-- Hourly, plus once at login. Both are gated by the window and the minimum gap. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!--
+          launchd gives a job PATH=/usr/bin:/bin:/usr/sbin:/sbin. Missing entries here do not
+          fail loudly: the extract still writes its CSVs and only the `rill` restart fails —
+          and refresh.sh has ALREADY pkill'd the old Rill by then, so the failure mode is not
+          "a fresh snapshot the running Rill never reads" but no Rill running at all, every
+          hour, until someone starts one by hand.
+
+          /usr/local/bin IS THE ONE THAT MATTERS AND IT WAS THE ONE MISSING. Rill's installer
+          puts the binary in /usr/local/bin, not under Homebrew; this list carried
+          /opt/homebrew/bin only, so `rill start` was never found. Observed as 24 consecutive
+          runs at "last exit code = 1" with "error: no Rill at http://localhost:9009", while
+          the extract half succeeded every time. Verify with `command -v rill` before trusting
+          this list.
+          /usr/sbin carries lsof, which refresh.sh uses to wait for the port to free.
+        -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:@@HOME@@/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+
+        <!-- Working hours. Local time, both ends inclusive; an end before the start spans midnight. -->
+        <key>OPS_INTEL_REFRESH_WINDOW</key>
+        <string>@@WINDOW@@</string>
+
+        <!-- Minutes that must pass between refreshes, so a wake-triggered run does not re-extract. -->
+        <key>OPS_INTEL_REFRESH_MIN_GAP_MIN</key>
+        <string>50</string>
+
+        <!--
+          1 = refresh only while Rill is answering on :9009. The plugin's own rule is that it
+          never starts Rill; a timer that did so on the operator's behalf would break the same
+          rule from the outside. Set 0 to have the hourly run bring Rill up as well.
+        -->
+        <key>OPS_INTEL_REFRESH_REQUIRE_RILL</key>
+        <string>1</string>
+    </dict>
+
+    <!-- Both streams go to the same log the script appends to, so skips, refresh output and
+         launchd's own errors read in one timeline. auto-refresh.sh trims it past 4 MB. -->
+    <key>StandardOutPath</key>
+    <string>@@LOG@@</string>
+    <key>StandardErrorPath</key>
+    <string>@@LOG@@</string>
+
+    <!-- A 25 MB extract plus a DuckDB reconcile should never compete with the operator's own
+         work; this is a background chore by definition. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <!-- WITHOUT THIS, RILL NEVER SURVIVES A REFRESH. refresh.sh backgrounds `rill start` with
+         `nohup ... &`, which only blocks SIGHUP — the process stays in the process group
+         launchd created for this job, because macOS ships no `setsid` to move it into its own.
+         launchd's default (AbandonProcessGroup=false) sends the whole group SIGTERM/SIGKILL the
+         moment auto-refresh.sh itself exits, success or failure alike — so every hourly run
+         restarted Rill and then killed it again seconds later when the script returned. Observed
+         directly as "Rill shutdown gracefully" landing right after "refresh ok"/"refresh FAILED"
+         in kandev-ops-intel-refresh.log, and as a `last-refresh` stamp that was never written
+         despite dozens of "runs". This key tells launchd to leave processes the job leaves
+         behind alone instead of reaping the group on exit — the launchd-native equivalent of
+         `setsid`. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+</dict>
+</plist>

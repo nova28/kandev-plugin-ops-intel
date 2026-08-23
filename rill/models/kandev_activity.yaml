@@ -1,0 +1,142 @@
+# One row per message — what the agent actually did, with no message content.
+#
+# This is where the step-transition ledger gets reconstructed. `workflow_step_decisions` is
+# zero rows and `session_step_history` (586 rows) covers only 148 of 312 sessions (47.4%),
+# so transitions are read from tool calls instead:
+# `step_complete_kandev` is an advance and `move_task_kandev` is an explicit move. Two
+# limits follow and neither is fixable downstream:
+#
+#   * An operator dragging a card on the board issues no tool call and writes no row. Only
+#     AGENT-initiated transitions are visible here. A workflow that looks smooth may simply
+#     be one a human kept nudging.
+#   * There is no step exit, only entry and advance, so step dwell time is an approximation
+#     over agent-driven flow — not a measurement.
+type: model
+materialize: true
+
+sql: |
+  WITH filled AS (
+      SELECT
+          *,
+          -- Forward-fill the stamped step across the session. A stamp marks step ENTRY, so
+          -- every message after it belongs to that step until the next stamp. This is the
+          -- step-transition ledger reconstructed — `session_step_history` exists (586 rows)
+          -- but covers only 148 of 312 sessions, so it cannot be the sole source.
+          --
+          -- Two honest limits, both visible in the data rather than papered over:
+          --  * The first stamp lands on average at message ~61 of a session, so everything
+          --    before it cannot be attributed and is labelled, not guessed.
+          --  * 25 of 67 sessions carry no stamp at all. Those are labelled too.
+          last_value(stamped_step IGNORE NULLS) OVER (
+              PARTITION BY session_id ORDER BY created_at
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS step_filled
+      FROM src_fct_message
+  )
+  SELECT
+      m.message_id,
+      m.created_at,
+      m.session_id,
+      m.task_id,
+      m.turn_id,
+      m.author_type,
+      m.message_type,
+      m.tool_name,
+      m.tool_target,
+      m.skill,
+      m.requests_input,
+
+      -- Companion flag so a leaderboard can exclude the ~56k messages that named no skill.
+      -- Canvas `dimension_filters` only speaks `IN (...)`, so "not null" has to be modelled
+      -- as a value rather than expressed as a predicate.
+      CASE WHEN m.skill IS NOT NULL THEN 'yes' ELSE 'no' END AS skill_named,
+
+      -- THE step dimension. Use this, not `current_step`, for any question of the form
+      -- "what does step X cost / take / involve".
+      COALESCE(m.step_filled, '(before first stamped step)') AS step_at_event,
+      CASE WHEN m.step_filled IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
+
+      -- Work handed to an agent outside Kandev. See the measure comment in the metrics view:
+      -- these calls are REAL WORK WITH NO COST ROW, so any card leaning on them is
+      -- understated by whatever they spent on someone else's bill.
+      COALESCE(m.external_agent, '(none)') AS external_agent,
+      m.external_agent IS NOT NULL         AS is_external_agent_call,
+
+      -- Which model an off-ledger call named, when the invocation said so explicitly (see
+      -- extract.sql for the two flag forms this reads). Still no price — see the measure
+      -- comment in the metrics view for why that figure does not exist anywhere in this store.
+      COALESCE(m.external_agent_model, '(unspecified)') AS external_agent_model,
+
+      -- Real tokens an off-ledger call reported, read from its own captured stdout (see
+      -- extract.sql). external_agent_tokens_total is the plain sum (input+output), present
+      -- for both codex review's native output and Challenge/Consult's --json output; the
+      -- five *_in/*_cached_input/*_cache_write/*_out/*_reasoning_output columns are the
+      -- richer breakdown, present only where the skill's CODEX_USAGE line was captured.
+      -- Still never a price — token counts alone don't tell you a rate.
+      m.external_agent_tokens_total             AS external_agent_tokens_total,
+      m.external_agent_tokens_in                 AS external_agent_tokens_in,
+      m.external_agent_tokens_cached_input       AS external_agent_tokens_cached_input,
+      m.external_agent_tokens_cache_write        AS external_agent_tokens_cache_write,
+      m.external_agent_tokens_out                AS external_agent_tokens_out,
+      m.external_agent_tokens_reasoning_output   AS external_agent_tokens_reasoning_output,
+
+      -- Coarse grouping, so "where does a turn's activity go" is one chart rather than a
+      -- 200-row tool leaderboard.
+      CASE
+          WHEN m.tool_name LIKE 'mcp__kandev__%'                  THEN 'Kandev MCP'
+          WHEN m.tool_name LIKE 'mcp__%'                          THEN 'Other MCP'
+          WHEN m.message_type = 'tool_read'                       THEN 'Read'
+          WHEN m.message_type = 'tool_edit'                       THEN 'Edit'
+          WHEN m.message_type = 'tool_search'                     THEN 'Search'
+          WHEN m.message_type = 'tool_execute'                    THEN 'Shell'
+          WHEN m.tool_name IN ('Task', 'Agent', 'ToolSearch', 'Skill', 'Monitor',
+                               'ScheduleWakeup', 'TaskOutput', 'TaskCreate',
+                               'TaskUpdate', 'SendMessage', 'Workflow')
+                                                                  THEN 'Agent control'
+          WHEN m.message_type = 'thinking'                        THEN 'Thinking'
+          WHEN m.message_type = 'todo'                            THEN 'Todo'
+          WHEN m.message_type = 'message'                         THEN 'Message'
+          ELSE 'Other'
+      END AS tool_family,
+
+      -- The binary a shell call invoked. Arguments were dropped at extract time — a command
+      -- line is the likeliest place in this store for a credential to appear.
+      CASE WHEN m.message_type = 'tool_execute' THEN m.tool_name END AS shell_binary,
+
+      -- The closest available proxy for human-gate integrity. Read it as "how often did the
+      -- agent stop and ask", NOT as "how often did a human decide" — the table that would
+      -- record decisions is empty.
+      (m.tool_name = 'mcp__kandev__ask_user_question_kandev'
+       OR m.message_type = 'clarification_request'
+       OR m.requests_input = 'yes')                     AS is_human_gate,
+
+      m.tool_name = 'mcp__kandev__step_complete_kandev' AS is_step_advance,
+      m.tool_name = 'mcp__kandev__move_task_kandev'     AS is_step_move,
+
+      -- 'blocking watch' | 'polling loop' | 'sleep' | 'state check' | NULL, classified in
+      -- extract.sql where the whole command line is still readable. See that file for why it
+      -- cannot be derived here: the leading token is `cd` on most commands in this store.
+      m.wait_kind                                       AS wait_kind,
+
+      -- A round trip spent waiting rather than working. Now derived from the command's shape
+      -- instead of its first word, and deliberately EXCLUDING 'state check' — reading PR
+      -- state once is work, not waiting, and folding the two together is what made the old
+      -- counter useless. Treat a high count as a prompt to look at the workflow step, not as
+      -- a defect on its own; some waits are legitimately correct.
+      (m.wait_kind IN ('blocking watch', 'polling loop', 'sleep')) AS is_wait_poll,
+
+      d.workspace,
+      d.workflow,
+      d.current_step,
+      d.stage_type,
+      d.task_title,
+      d.task_state,
+      d.origin,
+      d.autopilot_enabled,
+
+      s.agent_profile,
+      s.repository
+
+  FROM filled m
+  LEFT JOIN src_dim_task    d ON d.task_id    = m.task_id
+  LEFT JOIN src_dim_session s ON s.session_id = m.session_id

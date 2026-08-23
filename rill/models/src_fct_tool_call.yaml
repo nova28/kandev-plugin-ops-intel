@@ -1,0 +1,12 @@
+# Raw extract, loaded verbatim. All derivation happens downstream in the kandev_* models,
+# so this file never needs editing when the analysis changes.
+#
+# OPTIONAL SOURCE. Written by extract_requests.py from Claude Code transcripts, which a given
+# machine may not have. When the file is absent this model errors and everything downstream of
+# it errors with it — by design, so the failure is visible rather than silently reading as
+# zero cost. The eleven Kandev-derived CSVs are unaffected.
+type: model
+
+connector: local_file
+path: data/fct_tool_call.csv
+invalidate_on_change: true

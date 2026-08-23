@@ -1,0 +1,239 @@
+# One row per API request. The grain Kandev's own store does not have.
+#
+# WHY IT IS WORTH A SECOND SOURCE. Cost in an agent loop is `requests x context size`, and
+# `office_cost_events` can express neither factor: 857 events describe the entire fleet while a
+# single card issues 867 requests, and `tokens_cached_in` sums reads and writes into one column
+# across a 20x price gap. This model supplies both, and everything surprising in the analysis
+# that prompted it came from here rather than from the store — that 74% of one card's requests
+# ran above 200K, that Testing inherited a 649K window to do 40K of work, that the marginal
+# cost of a tool call rises ninefold across a step as the window fills.
+#
+# PRICING LIVES HERE, ONCE. Every other dollar in this project is read from Kandev, which
+# prices its own events. Transcripts carry tokens only, so these rows must be priced, and the
+# rates below are the single definition. `ephemeral_1h` writes are 20x reads and 1.6x the 5m
+# rate, which is why the two write classes are kept apart rather than summed — a step that
+# rebuilds a long-lived prefix is a materially different animal from one that churns a short
+# one, and a single `cache_write` column would hide it.
+#
+# THESE ARE LIST-PRICE EQUIVALENTS. The accounts are subscriptions, so no cash moves per
+# request. The figure is a faithful measure of resource consumption and quota burn, which is
+# what every ranking here depends on; it is not a bill, and `kandev_cost` remains the place to
+# read what Kandev itself recorded.
+#
+# STEP RESOLUTION IS THE SAME RULE AS EVERYWHERE ELSE. ASOF against `kandev_step_points` on the
+# request's own instant — a request is an instant event, like a turn start. It is NOT joined
+# through `fct_message`: a request and a message are different things and pairing them would
+# invent a correspondence the transcripts do not record.
+type: model
+materialize: true
+
+sql: |
+  WITH priced AS (
+      SELECT
+          r.request_id,
+          r.occurred_at::TIMESTAMP                  AS occurred_at,
+          NULLIF(r.session_id, '')                  AS session_id,
+          NULLIF(r.task_id, '')                     AS task_id,
+          r.transcript_session_id,
+          NULLIF(r.parent_transcript_session_id,'') AS parent_transcript_session_id,
+          COALESCE(NULLIF(r.model,''), '(unrecorded)')  AS model,
+          COALESCE(NULLIF(r.effort,''), '(unrecorded)') AS effort,
+          r.agent_kind,
+
+          r.tokens_read, r.tokens_write_1h, r.tokens_write_5m,
+          r.tokens_input, r.tokens_output,
+
+          -- The whole prefix this request re-sent. THE actionable number in the system.
+          r.context_tokens,
+
+          -- RATES PER MODEL, PER MTok. An earlier version of this model hardcoded Sonnet
+          -- rates for every row with a comment claiming only one model appeared in the data.
+          -- That claim was false — 8,589 Opus requests were being priced at Sonnet's cache
+          -- read, understating them by 40%. A rate table is not optional the moment a second
+          -- model exists, and a comment asserting otherwise is worse than no comment.
+          --
+          -- CHOSEN BY RECONCILIATION, not by quoting a price list. Kandev prices its own cost
+          -- events; the rates that reproduce those events from these token counts are the
+          -- rates Kandev is using, and matching them is what lets the two sources be read on
+          -- one page. Sonnet at 0.30/6.00/3.75/15.00 reconciles to 0.7% on the reference card.
+          -- Opus is taken from Kandev's own models.dev cache (`~/.kandev/cache/models-dev.json`,
+          -- `claude-opus-5`); it appears 29% light against Kandev's recorded Opus spend, but
+          -- that gap is missing transcripts rather than a wrong rate — see the coverage
+          -- columns below, which show that session only 58% present on disk.
+          --
+          -- The 1h write rate is 1.6x the 5m rate, the ratio Anthropic applies across every
+          -- model in this table (Sonnet 3.75 -> 6.00, Opus 6.25 -> 10.00).
+          CASE
+              WHEN r.model LIKE '%opus%'   THEN 0.50
+              WHEN r.model LIKE '%haiku%'  THEN 0.10
+              WHEN r.model LIKE '%fable%'  THEN 1.00
+              WHEN r.model LIKE '%sonnet%' THEN 0.30
+              ELSE 0.0
+          END AS rate_read,
+          CASE
+              WHEN r.model LIKE '%opus%'   THEN 25.00
+              WHEN r.model LIKE '%haiku%'  THEN  5.00
+              WHEN r.model LIKE '%fable%'  THEN 50.00
+              WHEN r.model LIKE '%sonnet%' THEN 15.00
+              ELSE 0.0
+          END AS rate_out,
+          CASE
+              WHEN r.model LIKE '%opus%'   THEN  6.25
+              WHEN r.model LIKE '%haiku%'  THEN  1.25
+              WHEN r.model LIKE '%fable%'  THEN 12.50
+              WHEN r.model LIKE '%sonnet%' THEN  3.75
+              ELSE 0.0
+          END AS rate_write_5m,
+          -- An unknown model prices at zero and says so rather than borrowing a neighbour's
+          -- rate. A visible zero is a bug report; a plausible wrong number is not.
+          CASE
+              WHEN r.model LIKE '%opus%' OR r.model LIKE '%haiku%'
+                OR r.model LIKE '%fable%' OR r.model LIKE '%sonnet%' THEN 'reconciled'
+              ELSE 'model not in rate table — priced at zero'
+          END AS rate_basis
+      FROM src_fct_request r
+  ),
+  -- HOW MUCH OF EACH SESSION IS ACTUALLY ON DISK. Claude Code prunes transcripts, so an older
+  -- session is present only in part — the reference card's Opus session has 5.7M of the 9.8M
+  -- cache reads Kandev recorded for it, 58%. Without this column that session simply looks
+  -- cheap, and "Spec is cheap on Opus" is exactly the wrong conclusion to hand someone.
+  --
+  -- Kandev's own cost events are the denominator because they are the one source that saw the
+  -- whole session. Above 100% is normal and not an error: transcripts include subagent
+  -- requests that Kandev's event stream does not always bill to the same session.
+  -- CONFIG EPOCH. THE DIMENSION WHOSE ABSENCE COST THE MOST.
+  --
+  -- Process-start config -- CLAUDE_CODE_AUTO_COMPACT_WINDOW, the model alias, the base URL --
+  -- is read once, when the Claude Code process starts. A session already running when the value
+  -- changes KEEPS ITS OLD CONFIG FOR ITS ENTIRE LIFE, and those are the long sessions, so they
+  -- carry disproportionate request volume into whatever bucket you assign them to.
+  --
+  -- Bucketing requests by their OWN timestamp therefore smears pre-change behaviour across the
+  -- post-change epoch. Bucketing by the transcript's FIRST request does not. On 2026-08-19 the
+  -- two methods disagreed violently on one step: by request date, PR Fixup showed 292,890 mean
+  -- context and 26.3% of requests above the 300K ceiling; by transcript start, 199,652 and
+  -- 0.0%. A workflow change had already been written against the first pair before the second
+  -- was computed. Every context- or window-shaped figure in this project needs this cut.
+  --
+  -- A DECLARED BOUNDARY IS NOT AN OBSERVED ONE, and this dimension proved it on its first run.
+  -- ENV-002 declares the 300K ceiling from 2026-08-13 11:02 (EXP-001's applied timestamp). The
+  -- data says otherwise: NEW transcripts started at 11:00, 12:00 and 15:00 that day still ran to
+  -- 445K-593K, 20-54% of their requests above 300K. Transcripts started from 16:00 onward observe
+  -- it, and from 08-14 03:00 every one caps at 244K-269K. So the config reached new processes
+  -- roughly FIVE HOURS after the profile was edited -- a propagation delay nobody had measured,
+  -- and every figure in that window was labelled with a ceiling it did not have. The epoch below
+  -- is therefore cut at the OBSERVED boundary, and the declared-but-unobserved window is named as
+  -- its own value rather than folded into either neighbour.
+  --
+  -- BOUNDARIES COME FROM `Forge/docs/kandev/operating-loop/ENVIRONMENTS.md` and must be extended
+  -- when an ENV id is minted. They are not self-maintaining -- but they are self-CHECKING:
+  -- `check.sh` asserts that an epoch declaring a ceiling actually observes one, so config that
+  -- changes without a mint (which happened, unnoticed, for three days from 08-16) fails the
+  -- extract instead of quietly polluting a mean.
+  transcript_start AS (
+      SELECT transcript_session_id, MIN(occurred_at) AS transcript_first_seen
+      FROM priced
+      GROUP BY 1
+  ),
+  kandev_tokens AS (
+      SELECT session_id, SUM(tokens_cached_in) AS kandev_read
+      FROM src_fct_cost_event
+      WHERE session_id <> ''
+      GROUP BY 1
+  ),
+  transcript_tokens AS (
+      SELECT session_id, SUM(tokens_read) AS transcript_read
+      FROM priced
+      WHERE session_id IS NOT NULL
+      GROUP BY 1
+  )
+  SELECT
+      p.*,
+
+      p.tokens_read     * p.rate_read      / 1000000.0
+    + p.tokens_write_1h * p.rate_write_5m * 1.6 / 1000000.0
+    + p.tokens_write_5m * p.rate_write_5m / 1000000.0
+    + p.tokens_output   * p.rate_out       / 1000000.0     AS cost_usd,
+      p.tokens_read * p.rate_read / 1000000.0              AS read_cost_usd,
+
+      -- Read every total on this page through it. Below ~90% the step is understated by
+      -- whatever was pruned, and the shortfall is invisible in every other column.
+      tt.transcript_read * 1.0 / NULLIF(kt.kandev_read, 0) AS session_transcript_coverage,
+
+      ts.transcript_first_seen,
+
+      -- Which environment this transcript STARTED in. Read every context figure through it.
+      CASE
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-13 11:02' THEN 'ENV-001 no ceiling'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-13 16:00' THEN 'ENV-002 declared, ceiling NOT observed'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 00:00' THEN 'ENV-002 ceiling 300K'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 03:48' THEN 'ENV-003 INVALID'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 07:58' THEN 'ENV-004 no ceiling'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-16 15:41' THEN 'ENV-005 ceiling 300K'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-19 09:03' THEN 'ENV-005 drifted'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-21 08:39' THEN 'ENV-007 ceiling 300K'
+          ELSE                                                               'ENV-008 ceiling 300K both profiles'
+      END AS config_epoch,
+
+      -- What that epoch CLAIMS about the compaction ceiling. `check.sh` asserts the claim against
+      -- observed behaviour; a mismatch means config moved without an ENV being minted.
+      CASE
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-13 11:02' THEN 'none'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-13 16:00' THEN 'none observed'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 00:00' THEN '300K'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 03:48' THEN 'invalid'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 07:58' THEN 'none'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-16 15:41' THEN '300K'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-19 09:03' THEN 'unrecorded'
+          ELSE                                                               '300K'
+      END AS ceiling_declared,
+
+      COALESCE(sp.step, '(step not attributable)')  AS step_at_event,
+      CASE WHEN sp.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
+
+      -- Above a standard 200K window. Not a threshold anyone configured — it is the point
+      -- past which a request is re-reading more context than a default session can hold, and
+      -- on the card this was built for, 74% of requests were past it.
+      CASE WHEN p.context_tokens > 200000 THEN 'yes' ELSE 'no' END AS over_200k,
+
+      -- Coarse bands, so "where does this step live" is one chart rather than a histogram.
+      CASE
+          WHEN p.context_tokens <  50000 THEN 'a. under 50K'
+          WHEN p.context_tokens < 100000 THEN 'b. 50-100K'
+          WHEN p.context_tokens < 200000 THEN 'c. 100-200K'
+          WHEN p.context_tokens < 400000 THEN 'd. 200-400K'
+          WHEN p.context_tokens < 600000 THEN 'e. 400-600K'
+          ELSE                                'f. over 600K'
+      END AS context_band,
+
+      -- Position within the step, and how many requests follow it THERE. The second makes a
+      -- tool result's tail cost computable: a result read into the prefix is re-read by every
+      -- request after it, and by none once the step ends.
+      --
+      -- PARTITIONED BY TRANSCRIPT SESSION, NOT JUST BY STEP. A subagent's requests interleave
+      -- with its parent's in time but read a completely separate prefix — counting them as
+      -- "after" a parent's tool result would bill the parent for context the subagent never
+      -- held. Partitioning by session keeps each prefix to its own timeline.
+      --
+      -- IT STILL DOES NOT SPLIT REPEAT VISITS. A card that bounces into Build three times has
+      -- one Build partition, so a result from round 1 counts requests in round 3 as following
+      -- it — hours later, across a reset. That overstates tail on reworked steps. It is left
+      -- overstated rather than guessed at because tail is documented as an upper bound and
+      -- erring high never makes a large result look cheap; splitting it properly needs a step
+      -- occupancy id this model does not carry.
+      ROW_NUMBER() OVER (PARTITION BY p.task_id, COALESCE(sp.step,'?'), p.transcript_session_id
+                         ORDER BY p.occurred_at)  AS seq_in_step,
+      COUNT(*) OVER (PARTITION BY p.task_id, COALESCE(sp.step,'?'), p.transcript_session_id)
+        - ROW_NUMBER() OVER (PARTITION BY p.task_id, COALESCE(sp.step,'?'),
+                             p.transcript_session_id ORDER BY p.occurred_at)
+                                                             AS requests_after_in_step,
+
+      d.workspace, d.workflow, d.task_title, d.task_state, d.stage_type, d.origin,
+      d.is_archived, d.autopilot_enabled
+  FROM priced p
+  ASOF LEFT JOIN kandev_step_points sp
+      ON sp.session_id = p.session_id AND p.occurred_at >= sp.effective_from
+  LEFT JOIN src_dim_task d ON d.task_id = p.task_id
+  LEFT JOIN kandev_tokens     kt ON kt.session_id = p.session_id
+  LEFT JOIN transcript_tokens tt ON tt.session_id = p.session_id
+  LEFT JOIN transcript_start  ts ON ts.transcript_session_id = p.transcript_session_id

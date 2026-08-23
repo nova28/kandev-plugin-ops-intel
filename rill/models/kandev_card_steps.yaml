@@ -1,0 +1,205 @@
+# One row per card × step: what one step cost ON one card.
+#
+# WHY THIS GRAIN EXISTS. It is the cell the other two models leave empty, and both of the
+# questions people actually ask live in it:
+#
+#   * "why did THIS card cost that"      -> filter one card, read its steps down the page
+#   * "what does Build cost, generally"  -> filter step = Build, read the cards down the page
+#
+# `kandev_cards` answers the first question only at whole-card grain — it knows a card cost
+# $112 but not that $67 of it was Build. `kandev_step_diagnostics` answers the second only at
+# day grain, and its own header explains why it can never carry a card: a card worked on
+# across three days would count three times. Neither can be filtered into the other's
+# question. This model is both, and drops `day` to make it possible — a step occupancy that
+# straddles midnight is one row here, not two.
+#
+# WHAT IT DELIBERATELY DOES NOT DO: separate the visits. A card that bounced Build -> Testing
+# -> Build appears as ONE Build row carrying the sum of both rounds, with `visits = 2`. The
+# per-occupancy split (Build #1 cost $50, Build #2 cost $1) is a genuinely different and
+# useful reading, but it is per-card forensics rather than a fleet grain — averaging "Build
+# #2" across cards that bounced different numbers of times means nothing. `visits` is carried
+# instead because THAT aggregates honestly: "Build averages 1.8 visits per card on this
+# workflow" is a rework rate, and it is the fleet-legible half of the same fact.
+#
+# ATTRIBUTION IS INHERITED, NOT IMPROVED. Every side resolves its step exactly as it does in
+# `kandev_step_diagnostics` — cost by its turn stamp where it has one and by the window it
+# bills otherwise, turns and messages by ASOF on their own instant. `clean_cost_subcents` is
+# carried for the same reason it is carried there: at a low clean share this row's ratios
+# describe an attribution guess as much as they describe the step. Read them together.
+#
+# `clean` means 'turn stamp' OR 'window sat in one step'. The first is exact and the second
+# is a sound inference; what it excludes is the majority-verdict case. Do not narrow it back
+# to the window value alone — that would drop every post-2026-08-16 row, which is to say all
+# the rows whose attribution is a reading rather than a guess.
+type: model
+materialize: true
+
+sql: |
+  WITH cost AS (
+      SELECT
+          task_id,
+          step_at_event                         AS step,
+          SUM(cost_subcents)                    AS cost_subcents,
+          SUM(tokens_in)                        AS tokens_in,
+          SUM(tokens_cached_in)                 AS tokens_cached_in,
+          SUM(tokens_in + tokens_cached_in)     AS tokens_input_total,
+          SUM(tokens_out)                       AS tokens_out,
+          COUNT(*)                              AS cost_events,
+          -- Family, not the raw id: `default` and `opus[1m]` are one model, so counting the
+          -- raw ids reports a step as multi-model when it ran Opus throughout, and can hand
+          -- `top_model` to whichever alias happened to appear more often.
+          mode(model_family)                    AS top_model,
+          COUNT(DISTINCT model_family)          AS models_used,
+          SUM(cost_subcents) FILTER (WHERE step_attribution_basis IN ('turn stamp', 'window sat in one step'))
+                                                AS clean_cost_subcents
+      FROM kandev_cost
+      WHERE step_attributed = 'yes'
+      GROUP BY 1, 2
+  ),
+  turns AS (
+      SELECT
+          task_id,
+          step_at_event                         AS step,
+          COUNT(*)                              AS turns,
+          COUNT(DISTINCT session_id)            AS sessions,
+          SUM(agent_seconds)                    AS agent_seconds,
+          SUM(idle_seconds_before)              AS idle_seconds,
+          MAX(agent_seconds)                    AS max_agent_seconds
+      FROM kandev_turns
+      WHERE step_attributed = 'yes'
+      GROUP BY 1, 2
+  ),
+  code AS (
+      SELECT
+          task_id,
+          step_at_event                         AS step,
+          SUM(lines_added)                      AS lines_added,
+          SUM(lines_deleted)                    AS lines_deleted,
+          SUM(commits_landed)                   AS commits_landed,
+          SUM(is_rewind)                        AS rewinds
+      FROM kandev_code_output
+      WHERE step_attributed = 'yes'
+      GROUP BY 1, 2
+  ),
+  -- Round trips and what they were for. Resolves its own step against `kandev_step_points`
+  -- rather than reading `kandev_activity.step_at_event`, for the reason set out at length in
+  -- `kandev_step_diagnostics`: that model still forward-fills from message stamps while
+  -- everything else resolves against the ledger, and a ratio whose halves used different
+  -- attribution rules is not a ratio.
+  activity_msgs AS (
+      SELECT
+          m.task_id,
+          m.tool_purpose,
+          m.scope_discipline,
+          p.step
+      FROM src_fct_message m
+      ASOF LEFT JOIN kandev_step_points p
+          ON p.session_id = m.session_id AND m.created_at >= p.effective_from
+      WHERE p.step IS NOT NULL
+  ),
+  activity AS (
+      SELECT
+          task_id,
+          step,
+          COUNT(*) FILTER (WHERE tool_purpose IS NOT NULL)   AS tool_calls,
+          COUNT(*) FILTER (WHERE tool_purpose = 'recon')     AS recon_calls,
+          COUNT(*) FILTER (WHERE tool_purpose = 'edit')      AS edit_calls,
+          COUNT(*) FILTER (WHERE tool_purpose = 'verify')    AS verify_calls,
+          COUNT(*) FILTER (WHERE scope_discipline = 'unscoped recursive') AS unscoped_calls,
+          COUNT(*) FILTER (WHERE scope_discipline
+                                 IN ('scoped by name', 'scoped by path', 'unscoped recursive'))
+                                                             AS scopeable_calls
+      FROM activity_msgs
+      GROUP BY 1, 2
+  ),
+  -- HOW MANY TIMES THE CARD ENTERED THIS STEP. The rework signal, and the one column here
+  -- that is a direct reading rather than a reconstruction — `session_step_history` records
+  -- one row per transition with the step it moved INTO.
+  --
+  -- Ledger-covered sessions only, which means sessions from 2026-08-12 onward. Older cards
+  -- get NULL rather than 1: a card whose transitions were never recorded has an UNKNOWN
+  -- visit count, and defaulting it to 1 would quietly report every historical card as having
+  -- sailed through first time. That is the opposite of the truth this column exists to tell.
+  visits AS (
+      SELECT
+          s.task_id,
+          COALESCE(w.step, '(unknown step)')    AS step,
+          COUNT(*)                              AS visits,
+          COUNT(*) FILTER (WHERE h.trigger <> 'auto_complete') AS non_advance_entries
+      FROM src_fct_step_transition h
+      JOIN src_dim_session s ON s.session_id = h.session_id
+      LEFT JOIN (
+          SELECT workflow_step_id, any_value(step) AS step
+          FROM src_dim_workflow_step GROUP BY 1
+      ) w ON w.workflow_step_id = h.to_step_id
+      GROUP BY 1, 2
+  ),
+  keys AS (
+      SELECT task_id, step FROM cost
+      UNION SELECT task_id, step FROM turns
+      UNION SELECT task_id, step FROM code
+      UNION SELECT task_id, step FROM activity
+      UNION SELECT task_id, step FROM visits
+  )
+  SELECT
+      k.task_id                           AS task_id,
+      k.step                              AS step,
+
+      d.workspace                         AS workspace,
+      d.workflow                          AS workflow,
+      d.task_title                        AS task_title,
+      d.task_state                        AS task_state,
+      d.stage_type                        AS stage_type,
+      d.origin                            AS origin,
+      d.is_archived                       AS is_archived,
+      d.autopilot_enabled                 AS autopilot_enabled,
+
+      COALESCE(c.cost_subcents, 0)        AS cost_subcents,
+      COALESCE(c.tokens_in, 0)            AS tokens_in,
+      COALESCE(c.tokens_cached_in, 0)     AS tokens_cached_in,
+      COALESCE(c.tokens_input_total, 0)   AS tokens_input_total,
+      COALESCE(c.tokens_out, 0)           AS tokens_out,
+      COALESCE(c.cost_events, 0)          AS cost_events,
+      COALESCE(c.top_model, '(no metered spend)') AS top_model,
+      COALESCE(c.models_used, 0)          AS models_used,
+      COALESCE(c.clean_cost_subcents, 0)  AS clean_cost_subcents,
+
+      COALESCE(t.turns, 0)                AS turns,
+      COALESCE(t.sessions, 0)             AS sessions,
+      COALESCE(t.agent_seconds, 0)        AS agent_seconds,
+      COALESCE(t.idle_seconds, 0)         AS idle_seconds,
+      t.max_agent_seconds                 AS max_agent_seconds,
+
+      COALESCE(cd.lines_added, 0)         AS lines_added,
+      COALESCE(cd.lines_deleted, 0)       AS lines_deleted,
+      COALESCE(cd.commits_landed, 0)      AS commits_landed,
+      COALESCE(cd.rewinds, 0)             AS rewinds,
+
+      COALESCE(ac.tool_calls, 0)          AS tool_calls,
+      COALESCE(ac.recon_calls, 0)         AS recon_calls,
+      COALESCE(ac.edit_calls, 0)          AS edit_calls,
+      COALESCE(ac.verify_calls, 0)        AS verify_calls,
+      COALESCE(ac.unscoped_calls, 0)      AS unscoped_calls,
+      COALESCE(ac.scopeable_calls, 0)     AS scopeable_calls,
+
+      -- NULL, not 0, when the ledger does not cover this card. See the `visits` CTE.
+      v.visits                            AS visits,
+      v.non_advance_entries               AS non_advance_entries,
+      CASE WHEN v.visits IS NULL THEN 'not recorded' ELSE 'ledger' END AS visit_basis,
+
+      -- Which sides of this card-step are real. A step legitimately has spend and no code
+      -- (Review), or activity and no metered spend (a step that ran on codex). Saying so is
+      -- cheaper than making every reader check five columns for zero.
+      CASE
+          WHEN c.task_id IS NULL AND t.task_id IS NULL THEN 'no spend, no turns'
+          WHEN c.task_id IS NULL                       THEN 'turns only — no metered spend'
+          WHEN t.task_id IS NULL                       THEN 'spend only — no turn records'
+          ELSE                                              'spend and turns'
+      END AS row_coverage
+  FROM keys k
+  LEFT JOIN src_dim_task d ON d.task_id = k.task_id
+  LEFT JOIN cost     c  ON c.task_id  = k.task_id AND c.step  = k.step
+  LEFT JOIN turns    t  ON t.task_id  = k.task_id AND t.step  = k.step
+  LEFT JOIN code     cd ON cd.task_id = k.task_id AND cd.step = k.step
+  LEFT JOIN activity ac ON ac.task_id = k.task_id AND ac.step = k.step
+  LEFT JOIN visits   v  ON v.task_id  = k.task_id AND v.step  = k.step

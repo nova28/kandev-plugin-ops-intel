@@ -1,0 +1,16 @@
+# Raw extract, loaded verbatim. All derivation happens downstream in the kandev_* models,
+# so this file never needs editing when the analysis changes.
+#
+# Provenance for the whole project: when the snapshot was taken, and the row counts of the
+# source tables behind it. Exposed as a model — rather than living only in the CSV — because
+# `check.sh` asserts against it. Several documented facts in this project are claims about a
+# table being EMPTY or POPULATED, and those rot silently: the fix that falsifies them lands
+# upstream, invisible from where the note is written. On 2026-08-19 one such note
+# ("`session_step_history` is zero rows") was read three times as evidence a measurement was
+# impossible, seven days after the table filled. An assertion is the only version of that
+# claim that cannot go stale unnoticed.
+type: model
+
+connector: local_file
+path: data/_manifest.csv
+invalidate_on_change: true

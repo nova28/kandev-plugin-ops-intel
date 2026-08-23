@@ -1,0 +1,272 @@
+# One row per day × workspace × workflow × step: the money, the clock, the code and the
+# round trips, side by side.
+#
+# WHY THIS MODEL EXISTS. Cost and turns answer different halves of "why was this step
+# expensive", and until now they lived in two tables that could only be read side by side:
+# `kandev_cost` knows the dollars and the tokens, `kandev_turns` knows the turn count and the
+# agent-vs-idle split. Neither alone distinguishes "one long expensive run" from "three
+# hundred six-second retries", which is the distinction that changes what you do next.
+#
+# `code` and `activity` extend the same idea in the two directions that were still missing.
+# `code` asks what the step produced. `activity` asks what it DID — how many round trips the
+# money bought and what they were for — because a turn is an elastic unit that may hold one
+# tool call or eighty, while a round trip is the thing that actually re-reads the context and
+# therefore the thing that actually bills. A step can look cheap per turn and be ruinous per
+# call; that gap is the whole reason the fourth side is here.
+#
+# WHY IT JOINS AT STEP GRAIN AND NOT TURN GRAIN. `office_cost_events` carries no turn_id — see
+# the header of kandev_turns — so there is no per-turn dollar figure and there cannot be one.
+# What both sides *do* carry is `step_at_event`, resolved against the same step timeline —
+# each by the rule that fits its direction in time. A turn's work happens after its start, so
+# `kandev_turns` ASOF-joins on `started_at`. A cost event bills the work behind it, so
+# `kandev_cost` attributes to the step that owned the window it bills; see that model's header
+# for why an ASOF join was wrong there. Aggregating each side to (day, workspace, workflow, step) and joining
+# those aggregates claims nothing that is not already claimed by the step attribution itself.
+# A dollar is never attributed to a turn here; it is attributed to a step-day, which is
+# exactly what `kandev_cost` already does.
+#
+# WHAT THIS MODEL DELIBERATELY DOES NOT CARRY:
+#
+#   * `model` as a grain column. Both sides record a model, but joining on it would pair a
+#     step-day's sonnet cost rows against its sonnet turn rows on the assumption that the two
+#     always agree — an assumption nothing in the store backs. `top_model` and `models_used`
+#     below are computed from the cost side only and describe the spend, not the turns.
+#
+#   * A card count. Distinct cards cannot be re-derived from a day-grained aggregate: a card
+#     worked on across three days would count three times, and a total that silently triples
+#     is worse than a column that is absent. `cards_touched` on `cost_and_tokens` remains the
+#     honest place to read that.
+#
+# FULL OUTER JOIN, not inner: a step-day can have turns and no metered spend (a step that ran
+# on an externally-billed agent) or spend and no turns (spend landing between turn records).
+# Dropping either side would quietly shrink a total that the other dashboards still show.
+type: model
+materialize: true
+
+sql: |
+  WITH cost AS (
+      SELECT
+          date_trunc('day', occurred_at)        AS day,
+          workspace,
+          workflow,
+          step_at_event                         AS step,
+
+          SUM(cost_subcents)                    AS cost_subcents,
+          SUM(tokens_in)                        AS tokens_in,
+          SUM(tokens_cached_in)                 AS tokens_cached_in,
+          SUM(tokens_in + tokens_cached_in)     AS tokens_input_total,
+          SUM(tokens_out)                       AS tokens_out,
+          COUNT(*)                              AS cost_events,
+
+          -- Describes the SPEND on this step-day, not the turns. The step is a mix whenever
+          -- models_used > 1, and the dashboard shows both so a single-model row cannot be
+          -- confused with a dominant-model-of-many row.
+          --
+          -- Family, not the raw id. `default` and `opus[1m]` are the same model under two
+          -- names, so raw ids would report a step-day as two-model when it ran Opus start to
+          -- finish — the exact false mix this column exists to rule out.
+          mode(model_family)                    AS top_model,
+          COUNT(DISTINCT model_family)          AS models_used,
+
+          -- HOW SOLID IS THIS ROW'S STEP ASSIGNMENT. `step_attributed = 'yes'` is a coarse
+          -- filter: it admits both an event whose billing window sat entirely inside one step
+          -- and one whose window crossed a boundary and was assigned to whichever step held
+          -- the majority of its messages. Only 47% of spend in this store is the former.
+          --
+          -- Carrying this is not bookkeeping. Blending the two silently is what let PR Fixup
+          -- read 725:1 input:output — "the worst churn on the board" — when the figure
+          -- restricted to clean windows is 524:1, against Build's 523. The ratio was an
+          -- artifact of soft attribution and one card, and nothing on the step table said so.
+          SUM(cost_subcents) FILTER (WHERE step_attribution_basis IN ('turn stamp', 'window sat in one step'))
+                                                AS clean_cost_subcents
+      FROM kandev_cost
+      WHERE step_attributed = 'yes'
+      GROUP BY 1, 2, 3, 4
+  ),
+  turns AS (
+      SELECT
+          date_trunc('day', started_at)         AS day,
+          workspace,
+          workflow,
+          step_at_event                         AS step,
+
+          COUNT(*)                              AS turns,
+          COUNT(DISTINCT session_id)            AS sessions,
+          SUM(agent_seconds)                    AS agent_seconds,
+          -- Negative gaps are overlapping turns, not idleness. They are summed as recorded so
+          -- this model reconciles against turn_timing, which publishes the overlap count
+          -- separately rather than clamping it away.
+          SUM(idle_seconds_before)              AS idle_seconds,
+          MEDIAN(agent_seconds)                 AS median_agent_seconds,
+          MAX(agent_seconds)                    AS max_agent_seconds
+      FROM kandev_turns
+      WHERE step_attributed = 'yes'
+      GROUP BY 1, 2, 3, 4
+  ),
+  -- The third side: what the money and the clock actually produced. Already a per-snapshot
+  -- delta in kandev_code_output, so these SUM correctly; the cumulative branch column it was
+  -- derived from would not.
+  code AS (
+      SELECT
+          date_trunc('day', created_at)         AS day,
+          workspace,
+          workflow,
+          step_at_event                         AS step,
+
+          SUM(lines_added)                      AS lines_added,
+          SUM(lines_deleted)                    AS lines_deleted,
+          SUM(commits_landed)                   AS commits_landed,
+          SUM(is_rewind)                        AS rewinds,
+          -- Baseline lines are counted in lines_added above and totalled again here, so a
+          -- reader can see how much of a step's output rests on a first-snapshot delta that
+          -- may include work from before the session opened.
+          SUM(lines_added) FILTER (WHERE is_session_baseline = 1) AS baseline_lines_added,
+          MAX(uncommitted_additions + uncommitted_deletions)      AS peak_uncommitted_lines
+      FROM kandev_code_output
+      WHERE step_attributed = 'yes'
+      GROUP BY 1, 2, 3, 4
+  ),
+  -- The fourth side: how many round trips the money bought, and what they were for.
+  --
+  -- WHY THIS EARNS A SIDE. `turns` counts turns, but a turn is a whole agent reply and may
+  -- contain one tool call or eighty. The round trip is the real unit of both action and spend:
+  -- every tool call re-sends the entire context prefix, so cost divided by tool calls is the
+  -- closest this store gets to a marginal price of acting. On the card that prompted this, one
+  -- Build step ran 414 calls at roughly $0.105 each, and reading that against `usd_per_turn`
+  -- alone would have shown a cheap-looking step.
+  --
+  -- WHY IT RESOLVES ITS OWN STEP INSTEAD OF READING `kandev_activity`. That model forward-fills
+  -- from message stamps; `cost`, `turns` and `code` all resolve against `kandev_step_points`,
+  -- which prefers the real `session_step_history` ledger. Joining a stamp-resolved COUNT to a
+  -- ledger-resolved SUM would produce a ratio whose numerator and denominator were attributed
+  -- by different rules — precisely the mixing `kandev_step_points` refuses to do inside a
+  -- session. A message is an instant event like a turn start, so it takes the `turns` rule:
+  -- ASOF on its own timestamp. Migrating `kandev_activity` onto the spine would retire this
+  -- duplication, but it backs the agent_activity dashboard and that is a change with its own
+  -- blast radius; it is not a prerequisite for this one.
+  activity_msgs AS (
+      SELECT
+          m.task_id,
+          m.created_at,
+          m.tool_purpose,
+          m.scope_discipline,
+          p.step
+      FROM src_fct_message m
+      ASOF LEFT JOIN kandev_step_points p
+          ON p.session_id = m.session_id AND m.created_at >= p.effective_from
+      WHERE p.step IS NOT NULL
+  ),
+  activity AS (
+      SELECT
+          date_trunc('day', a.created_at)       AS day,
+          d.workspace,
+          d.workflow,
+          a.step                                AS step,
+
+          -- A round trip, not a message. `tool_purpose` is NULL for prose and thinking — parts
+          -- of a reply rather than requests of their own — so this counts only the messages
+          -- that actually cost a request. Todo writes and MCP calls do, and are counted.
+          COUNT(*) FILTER (WHERE a.tool_purpose IS NOT NULL)   AS tool_calls,
+          COUNT(*) FILTER (WHERE a.tool_purpose = 'recon')     AS recon_calls,
+          COUNT(*) FILTER (WHERE a.tool_purpose = 'edit')      AS edit_calls,
+          COUNT(*) FILTER (WHERE a.tool_purpose = 'verify')    AS verify_calls,
+
+          -- Denominator carried beside the numerator so the share is computed over calls where
+          -- breadth was a meaningful question, never over all calls. A step with no searches
+          -- and no tests should read as "not applicable", not as perfectly disciplined.
+          --
+          -- `not determinable` is excluded from BOTH sides, not folded into the denominator.
+          -- Those are searches whose breadth the surviving command text cannot settle (see
+          -- extract.sql); counting them as scoped-and-not-unscoped would quietly assert
+          -- discipline this store cannot observe.
+          COUNT(*) FILTER (WHERE a.scope_discipline = 'unscoped recursive') AS unscoped_calls,
+          COUNT(*) FILTER (WHERE a.scope_discipline
+                                 IN ('scoped by name', 'scoped by path', 'unscoped recursive'))
+                                                                           AS scopeable_calls
+      FROM activity_msgs a
+      LEFT JOIN src_dim_task d ON d.task_id = a.task_id
+      GROUP BY 1, 2, 3, 4
+  ),
+  -- A key spine, not a chain of FULL OUTER JOINs. With four sides, chaining forces every
+  -- later ON clause to compare against a COALESCE of the earlier ones, and a single NULL key
+  -- silently drops the row from one side only. Enumerating the keys once and LEFT JOINing
+  -- each side to it makes "present on some sides, absent on others" the normal case it is.
+  keys AS (
+      SELECT day, workspace, workflow, step FROM cost
+      UNION
+      SELECT day, workspace, workflow, step FROM turns
+      UNION
+      SELECT day, workspace, workflow, step FROM code
+      UNION
+      SELECT day, workspace, workflow, step FROM activity
+  )
+  SELECT
+      k.day                               AS day,
+      k.workspace                         AS workspace,
+      k.workflow                          AS workflow,
+      k.step                              AS step,
+
+      COALESCE(c.cost_subcents, 0)        AS cost_subcents,
+      COALESCE(c.tokens_in, 0)            AS tokens_in,
+      COALESCE(c.tokens_cached_in, 0)     AS tokens_cached_in,
+      COALESCE(c.tokens_input_total, 0)   AS tokens_input_total,
+      COALESCE(c.tokens_out, 0)           AS tokens_out,
+      COALESCE(c.cost_events, 0)          AS cost_events,
+      COALESCE(c.top_model, '(no metered spend)')   AS top_model,
+      COALESCE(c.models_used, 0)          AS models_used,
+      COALESCE(c.clean_cost_subcents, 0)  AS clean_cost_subcents,
+
+      COALESCE(t.turns, 0)                AS turns,
+      COALESCE(t.sessions, 0)             AS sessions,
+      COALESCE(t.agent_seconds, 0)        AS agent_seconds,
+      COALESCE(t.idle_seconds, 0)         AS idle_seconds,
+      t.median_agent_seconds              AS median_agent_seconds,
+      t.max_agent_seconds                 AS max_agent_seconds,
+
+      COALESCE(cd.lines_added, 0)         AS lines_added,
+      COALESCE(cd.lines_deleted, 0)       AS lines_deleted,
+      COALESCE(cd.commits_landed, 0)      AS commits_landed,
+      COALESCE(cd.rewinds, 0)             AS rewinds,
+      COALESCE(cd.baseline_lines_added, 0) AS baseline_lines_added,
+      COALESCE(cd.peak_uncommitted_lines, 0) AS peak_uncommitted_lines,
+
+      COALESCE(ac.tool_calls, 0)          AS tool_calls,
+      COALESCE(ac.recon_calls, 0)         AS recon_calls,
+      COALESCE(ac.edit_calls, 0)          AS edit_calls,
+      COALESCE(ac.verify_calls, 0)        AS verify_calls,
+      COALESCE(ac.unscoped_calls, 0)      AS unscoped_calls,
+      COALESCE(ac.scopeable_calls, 0)     AS scopeable_calls,
+
+      -- Which sides of the row are real, so a reader can tell "this step had no spend" from
+      -- "this step wrote no code" without checking three columns for zero. Code is reported
+      -- separately from the money/clock pair because its absence is ordinary: a review or a
+      -- spec step legitimately produces no lines, and scoring that as missing data would
+      -- flag half the board.
+      CASE
+          -- A turn that starts before midnight and a message that lands after it fall on
+          -- different day-keys, so `activity` can legitimately open a row neither `cost` nor
+          -- `turns` has. Enumerated rather than folded into the first branch below, which
+          -- would report "turns only" on a row that has no turns.
+          WHEN c.day IS NULL AND t.day IS NULL THEN 'activity only — no spend or turn records'
+          WHEN c.day IS NULL THEN 'turns only — no metered spend'
+          WHEN t.day IS NULL THEN 'spend only — no turn records'
+          ELSE                    'spend and turns'
+      END AS row_coverage,
+      CASE
+          WHEN cd.day IS NULL          THEN 'no snapshots in this step'
+          WHEN COALESCE(cd.lines_added, 0) = 0 THEN 'snapshots but no new lines'
+          ELSE                              'code written'
+      END AS code_coverage
+  FROM keys k
+  LEFT JOIN cost c
+    ON  c.day = k.day AND c.workspace = k.workspace
+    AND c.workflow = k.workflow AND c.step = k.step
+  LEFT JOIN turns t
+    ON  t.day = k.day AND t.workspace = k.workspace
+    AND t.workflow = k.workflow AND t.step = k.step
+  LEFT JOIN code cd
+    ON  cd.day = k.day AND cd.workspace = k.workspace
+    AND cd.workflow = k.workflow AND cd.step = k.step
+  LEFT JOIN activity ac
+    ON  ac.day = k.day AND ac.workspace = k.workspace
+    AND ac.workflow = k.workflow AND ac.step = k.step

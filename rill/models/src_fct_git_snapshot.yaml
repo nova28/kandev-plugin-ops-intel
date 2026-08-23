@@ -1,0 +1,7 @@
+# Raw extract, loaded verbatim. All derivation happens downstream in the kandev_* models,
+# so this file never needs editing when the analysis changes.
+type: model
+
+connector: local_file
+path: data/fct_git_snapshot.csv
+invalidate_on_change: true

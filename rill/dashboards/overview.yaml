@@ -1,0 +1,189 @@
+# The landing page. Four questions in order: what did it cost, where did the time go, what
+# was the agent doing, and which cards did it happen on.
+#
+# Deliberately absent: any "success rate", "completion rate" or throughput headline. The
+# store has no outcome label, and the one signal Kandev does compute counts user-pressed-
+# Stop as a success. A number that goes up when a run is abandoned is worse than no number.
+type: canvas
+
+display_name: Kandev — operational overview
+
+max_width: 1600
+
+time_ranges:
+  - P7D
+  - P14D
+  - P30D
+  - inf
+
+defaults:
+  time_range: inf
+
+rows:
+  - height: 150px
+    items:
+      - width: 12
+        markdown:
+          content: |
+            ## Kandev operational telemetry
+
+            Everything below is **telemetry about runs** — what the execution engine
+            consumed, not whether the work was any good. There is no outcome label in this
+            store, so treat every ranking as *"where effort concentrated"* and go read the
+            card before concluding anything. Counts of turns, messages and tool calls are
+            diagnostic only; they measure motion, not coherence.
+
+            Cost figures come from the per-event ledger, never the session rollup columns —
+            those exclude cached input and understate real token volume by >99.99%.
+
+  # ---------------------------------------------------------------- cost
+  - height: 200px
+    items:
+      - width: 12
+        kpi_grid:
+          metrics_view: cost_and_tokens
+          measures:
+            - total_cost_usd
+            - usd_per_m_output_tokens
+            - output_tokens
+            - input_per_output_ratio
+            - cards_touched
+          sparkline: bottom
+
+  - height: 380px
+    items:
+      - width: 5
+        leaderboard:
+          metrics_view: cost_and_tokens
+          title: Model economics
+          description: >-
+            Total spend and cost per unit of output. These two orderings do not have to
+            agree — and in this data they do not.
+          dimensions:
+            - model
+          measures:
+            - total_cost_usd
+            - usd_per_m_output_tokens
+            - input_per_output_ratio
+          num_rows: 8
+      - width: 7
+        stacked_bar:
+          metrics_view: cost_and_tokens
+          title: Spend over time by model
+          x:
+            type: temporal
+            field: occurred_at
+          y:
+            type: quantitative
+            field: total_cost_usd
+          color:
+            type: nominal
+            field: model
+
+  # ---------------------------------------------------------------- time
+  - height: 200px
+    items:
+      - width: 12
+        kpi_grid:
+          metrics_view: turn_timing
+          measures:
+            - total_turns
+            - agent_hours
+            - idle_hours
+            - idle_share
+            - longest_idle_hours
+          sparkline: bottom
+
+  - height: 380px
+    items:
+      - width: 5
+        leaderboard:
+          metrics_view: turn_timing
+          title: Where the waiting is
+          description: >-
+            Idle is a GAP, not a diagnosis — orchestration delay, a queued dispatch and an
+            operator at lunch are indistinguishable in this store.
+          dimensions:
+            - idle_bucket
+          measures:
+            - idle_hours
+            - total_turns
+          num_rows: 8
+      - width: 7
+        bar_chart:
+          metrics_view: turn_timing
+          title: Turn length distribution
+          color: primary
+          x:
+            type: nominal
+            field: agent_duration_bucket
+            sort: x
+          y:
+            type: quantitative
+            field: total_turns
+
+  # ---------------------------------------------------------------- activity
+  - height: 380px
+    items:
+      - width: 4
+        leaderboard:
+          metrics_view: agent_activity
+          title: Where the effort goes
+          dimensions:
+            - tool_family
+          measures:
+            - total_messages
+          num_rows: 11
+      - width: 4
+        leaderboard:
+          metrics_view: agent_activity
+          title: Shell commands
+          description: >-
+            Arguments were dropped at extract time. A large `cd` count means the agent is
+            re-establishing its working directory rather than doing work.
+          dimension_filters: tool_family IN ('Shell')
+          dimensions:
+            - shell_binary
+          measures:
+            - total_messages
+          num_rows: 11
+      - width: 4
+        leaderboard:
+          metrics_view: agent_activity
+          title: Skills invoked
+          description: Diagnostic only — invocation count says nothing about what was caught.
+          dimension_filters: skill_named IN ('yes')
+          dimensions:
+            - skill
+          measures:
+            - total_messages
+          num_rows: 11
+
+  # ---------------------------------------------------------------- cards
+  - height: 420px
+    items:
+      - width: 7
+        leaderboard:
+          metrics_view: card_economics
+          title: Most expensive cards
+          description: >-
+            Cost-side only. The cheapest card here may simply be the one that was abandoned.
+          dimensions:
+            - task_title
+          measures:
+            - total_cost_usd
+            - agent_hours
+            - total_turns
+            - total_human_gates
+          num_rows: 12
+      - width: 5
+        leaderboard:
+          metrics_view: card_economics
+          title: By workspace
+          dimensions:
+            - workspace
+          measures:
+            - total_cost_usd
+            - avg_cost_per_card_usd
+            - idle_share
+          num_rows: 8
