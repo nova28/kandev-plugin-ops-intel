@@ -166,3 +166,7 @@ surfaces, so the ledger visibly reports its snapshot freshness rather than imply
 
 See `CLAUDE.md` for the full constraint list and the reasoning behind each one — command
 reference, the UI source layout, and every domain fact the cost figures depend on.
+
+## License
+
+[MIT](LICENSE).
