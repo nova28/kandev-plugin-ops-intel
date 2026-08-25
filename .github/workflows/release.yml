@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      # Same sibling-checkout trick as ci.yml — see its comment. go.mod's
+      # replace directive is untouched; this just reproduces the layout it
+      # already expects.
+      - name: Check out plugin
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          path: plugin
+
+      - name: Check out kandev SDK
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          repository: kdlbs/kandev
+          path: o/kandev
+          sparse-checkout: apps/backend
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: plugin/go.mod
+          cache-dependency-path: plugin/go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      # `make package` already runs build + bundle + test in that order (see
+      # the Makefile) — a failing test stops the release from packaging, same
+      # as a local `make install` would refuse to ship a broken bundle.
+      # GOOS/GOARCH cross-compile the host binary; `make build`'s PLATFORM
+      # var reads them via `go env`, which respects an exported override.
+      - name: Build, test, and package
+        working-directory: plugin
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: make package
+
+      # PKG has no platform in its filename (see the Makefile — a single
+      # local build only ever produces one), so each matrix leg's output
+      # would collide on upload without this rename. Legs run on separate
+      # runners, so there's no collision building it, only naming it.
+      - name: Rename package with platform suffix
+        working-directory: plugin
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          src=".build/kandev-plugin-ops-intel-${version}.tar.gz"
+          dest="kandev-plugin-ops-intel-${version}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
+          mv "$src" "plugin/$dest"
+          echo "PKG_NAME=$dest" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: plugin/${{ env.PKG_NAME }}
+          retention-days: 5
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: package-*
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
