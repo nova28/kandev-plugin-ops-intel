@@ -72,8 +72,21 @@ package: build bundle test
 	@cp README.md $(STAGE)/
 	@cp server/plugin-$(PLATFORM) $(STAGE)/server/
 	@cp ui/bundle.js $(STAGE)/ui/
-	cd $(KANDEV)/apps/backend && $(GO) run ./cmd/plugin-pack \
-		-dir $(CURDIR)/$(STAGE) -out $(CURDIR)/$(PKG) -platform-only
+	# GOOS/GOARCH=GOHOSTOS/GOHOSTARCH here, deliberately overriding whatever cross-compile
+	# target is set for `build` above (e.g. from a CI release matrix). `go run` compiles AND
+	# executes plugin-pack immediately — unlike `go build`, it can't just cross-compile and
+	# save the binary for later. Left inheriting a cross GOOS/GOARCH, the tool itself gets
+	# built for the TARGET platform and then fails to execute on the machine building it
+	# ("exec format error"), even though the plugin binary it's packaging cross-compiled fine.
+	#
+	# No -platform-only: that flag filters server/ executables against runtime.GOOS/GOARCH —
+	# compile-time constants of the plugin-pack BINARY, which the line above just pinned to
+	# the native host, not the target. It would filter for the wrong platform on every
+	# cross-compiled build and reject the very executable `build` just produced. Harmless to
+	# drop: $(STAGE)/server/ only ever holds the one binary matching $(PLATFORM) above, so
+	# there is never a second platform's executable for it to filter out.
+	cd $(KANDEV)/apps/backend && GOOS=$$($(GO) env GOHOSTOS) GOARCH=$$($(GO) env GOHOSTARCH) \
+		$(GO) run ./cmd/plugin-pack -dir $(CURDIR)/$(STAGE) -out $(CURDIR)/$(PKG)
 
 # Piping curl into `head` used to mask the exit status, so a 409 ("version already installed")
 # printed nothing and reported success — leaving the old bundle serving while it looked like the
