@@ -35,11 +35,53 @@ parent alone did.
 """
 import csv, glob, json, os, sqlite3, sys
 
-TRANSCRIPT_ROOT = os.environ.get(
-    "CLAUDE_TRANSCRIPTS",
-    os.path.expanduser("~/.claude-work/projects"))
+# EVERY ROOT, NOT ONE. Claude Code writes transcripts under whichever CLAUDE_CONFIG_DIR the
+# process was started with, and this machine has two live ones: agents launched by Kandev land
+# in ~/.claude/projects, an isolated worker config in ~/.claude-work/projects. Reading a single
+# root is not a partial answer, it is a silent one — with only ~/.claude-work scanned, 48 of
+# 655 tasks had any request row at all and every per-task context figure for the other 607 read
+# as empty rather than as missing. Both roots are scanned and the union is emitted; a root that
+# does not exist is skipped, so this stays correct on a machine that has only one.
+#
+# CLAUDE_TRANSCRIPTS overrides the default and takes an os.pathsep-separated LIST, so a caller
+# can still pin one root (tests do) without losing the ability to name several.
+_DEFAULT_TRANSCRIPT_ROOTS = [
+    os.path.expanduser("~/.claude/projects"),
+    os.path.expanduser("~/.claude-work/projects"),
+]
+TRANSCRIPT_ROOTS = [
+    p for p in (
+        os.environ["CLAUDE_TRANSCRIPTS"].split(os.pathsep)
+        if os.environ.get("CLAUDE_TRANSCRIPTS") else _DEFAULT_TRANSCRIPT_ROOTS
+    ) if p and os.path.isdir(p)
+]
 KANDEV_DB = os.environ.get("KANDEV_DB", os.path.expanduser("~/.kandev/data/kandev.db"))
 OUT = sys.argv[1] if len(sys.argv) > 1 else "data"
+
+# ONLY A CARD WORKTREE MAY CLAIM A PREFIX. Per-card worktrees live under ~/.kandev/tasks/<slug>/,
+# where exactly one card runs, so a cwd beneath one identifies that card. Every other path is a
+# SHARED checkout — the operator's own dev tree — where the fleet, the operator's interactive
+# sessions, and any card launched without an executor profile all run in the same directory.
+# Attributing by prefix there does not identify a card, it invents one.
+#
+# Found 2026-09-01. Card `99670243` held a single CANCELLED session whose workspace_path was
+# `~/Projects/<workspace>/kandev`. That one row let it claim 137 transcripts and
+# 24,454 requests spanning 07-30 to 09-01, nearly all of them the operator's own interactive
+# sessions — including the very session that found this bug. 40 sessions across 36 tasks name that
+# same directory, so the winner was decided by prefix-sort order rather than by fact. Downstream it
+# read as a runaway agent: this card alone pushed ENV-008's Opus requests-over-ceiling to 21.4% and
+# failed check.sh's "declared ceiling is an observed ceiling" assertion.
+#
+# `kandev-measure-run.py` already draws this line (`CARD_WORKTREE_PREFIX`, flagging such rows
+# `partial-shared` rather than counting them). Same rule here: a request in a shared checkout is
+# emitted UNATTRIBUTED rather than billed to whichever card sorts first. Unattributed is honest and
+# visible downstream; misattributed is neither.
+#
+# The cost: cards that genuinely ran in a shared checkout lose their request rows. That is the
+# correct trade — those requests cannot be distinguished from the operator's own, and a card
+# reading "not observable" is recoverable while a card reading someone else's 717K context is not.
+CARD_WORKTREE_PREFIX = os.environ.get(
+    "CARD_WORKTREE_PREFIX", os.path.expanduser("~/.kandev/tasks/"))
 
 
 def classify(name, cmd):
@@ -85,12 +127,37 @@ def main():
     # directory), so the path cannot choose between them. The step timeline is per session, so
     # picking the wrong one resolves every step wrong. The session whose lifetime contains the
     # request is the right answer and the only one available.
+    # TWO PATH SOURCES, BECAUSE `task_sessions.workspace_path` IS NOT RELIABLE. It is empty on
+    # 256 of 738 sessions here and, on 33 more, holds a path the task never ran in — several
+    # name the operator's own dev checkout while the session actually ran in an isolated
+    # worktree. `task_environments.workspace_path` is the materialized workspace and is correct
+    # in every one of those cases, so both are loaded and the environment is preferred.
+    #
+    # This is why a card could show a full cost rail and an empty context chart: the cost path
+    # resolves a step without needing a directory, and only this join needs one. Reading just
+    # the session table dropped 39% of sessions before the prefix match even ran.
     db = sqlite3.connect(KANDEV_DB)
     ws_task = []
-    for tid, path in db.execute(
+    shared_paths = set()   # dropped, not attributed — reported at the end so it stays visible
+    for sql in (
+            "SELECT DISTINCT task_id, workspace_path FROM task_environments "
+            "WHERE workspace_path <> '' AND task_id <> ''",
             "SELECT DISTINCT task_id, workspace_path FROM task_sessions "
             "WHERE workspace_path <> '' AND task_id <> ''"):
-        ws_task.append((os.path.normpath(path), tid))
+        try:
+            rows = list(db.execute(sql))
+        except sqlite3.Error:
+            # A schema without task_environments still works off sessions alone.
+            continue
+        for tid, path in rows:
+            norm = os.path.normpath(path)
+            # Shared checkouts identify no card — see CARD_WORKTREE_PREFIX above.
+            if not norm.startswith(os.path.normpath(CARD_WORKTREE_PREFIX) + os.sep):
+                shared_paths.add(norm)
+                continue
+            ws_task.append((norm, tid))
+    # Longest prefix first (PART 1). Ties keep insertion order, so the environment row —
+    # loaded first above — wins over a session row claiming the same directory.
     ws_task.sort(key=lambda x: -len(x[0]))
 
     sessions = {}
@@ -131,7 +198,12 @@ def main():
     # Recursive: main transcripts sit at <project>/<session>.jsonl, subagents one level
     # deeper at <project>/<session>/subagents/agent-*.jsonl. Missing the nested level is a
     # silent 0-subagent result, which reads as "no fan-out happened" rather than "not looked".
-    files = sorted(glob.glob(os.path.join(TRANSCRIPT_ROOT, "**", "*.jsonl"), recursive=True))
+    # Across every root (see TRANSCRIPT_ROOTS). Sorted per root and concatenated rather than
+    # globally sorted, so a file's provenance stays adjacent in the scan order; nothing
+    # downstream depends on cross-root ordering because rows carry their own timestamps.
+    files = []
+    for root in TRANSCRIPT_ROOTS:
+        files.extend(sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)))
     for f in files:
         # The directory above `subagents/` is the PARENT session id. This is the only link
         # between a subagent's spend and the step that caused it.
@@ -251,6 +323,11 @@ def main():
     subs = sum(1 for r in reqs.values() if r["agent_kind"] == "subagent")
     print(f"    fct_request.csv        {len(reqs):8d} rows "
           f"({matched} joined to a card, {subs} subagent, {adopted} adopted from parent)")
+    if shared_paths:
+        print(f"    shared checkouts       {len(shared_paths):8d} paths NOT used for attribution "
+              f"(requests there are unattributed, not billed to a card)")
+        for p in sorted(shared_paths)[:5]:
+            print(f"      - {p}")
     print(f"    fct_tool_call.csv      {len(calls):8d} rows")
 
 
