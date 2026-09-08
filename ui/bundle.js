@@ -47,6 +47,17 @@
   var TURNS_MODEL = "kandev_turns";
   var STEPS_MODEL = "src_dim_workflow_step";
 
+  // The fifth is the only one at REQUEST grain, and the only one that carries `context_tokens` —
+  // the size of the prefix each request re-sent. Cost in an agent loop is `requests x context`,
+  // and the other four models can express neither factor, so "why was this step expensive" is
+  // answerable here and nowhere else.
+  //
+  // It is sourced from Claude Code's own transcripts rather than from Kandev, which records no
+  // per-request grain at all — so it is the one model on this page that can be INCOMPLETE for a
+  // card while every other model is complete. The panel must say so rather than drawing a
+  // partial curve as if it were the whole session.
+  var REQUESTS_MODEL = "kandev_requests";
+
   var VIEWS = [
     { id: "embedded", label: "Cost, steps & anomalies", path: "/canvas/embedded" },
     { id: "steps", label: "Workspace & step deep dive", path: "/canvas/step_deep_dive" },
@@ -604,7 +615,48 @@
       "   THEN cost_subcents ELSE 0 END), 0) AS inferred" +
       " FROM kandev_cost WHERE task_id = '" + id + "' AND step_attributed = 'yes'";
 
-    return [cost, external, timing, peers, order, modelTiming, presence, freshness, stepSource];
+    // CONTEXT PER STEP. The second half of `requests x context`, and the half no other model on
+    // this page can express. A step's spend is already on the rail; this says whether it was
+    // expensive because it did a lot or because everything it did was re-reading a huge prefix.
+    //
+    // `mean` and `peak` are both kept because they answer different questions and disagree
+    // usefully: a step can hold a modest mean and still have run to the ceiling once, and a step
+    // whose mean IS its peak never got a compaction and simply inherited a full window.
+    //
+    // Ordered by first request, not by name, so it can be zipped onto the rail the panel already
+    // builds from the cost query without re-deriving step order.
+    var contextByStep =
+      "SELECT step_at_event AS step, count(*) AS requests," +
+      " max(context_tokens) AS peak," +
+      " CAST(avg(context_tokens) AS BIGINT) AS mean_ctx," +
+      " count(*) FILTER (WHERE context_tokens > 200000) AS over_200k," +
+      " min(occurred_at) AS first_at" +
+      " FROM " + REQUESTS_MODEL + " WHERE task_id = '" + id + "'" +
+      " AND context_tokens > 0 GROUP BY 1 ORDER BY first_at";
+
+    // CONTEXT OVER TIME — the sawtooth. Every request is a point, so a long card is thousands of
+    // them; bucketing to a fixed 200 keeps the payload flat regardless of card size.
+    //
+    // PEAK AND TROUGH PER BUCKET, NOT A MEAN. The mean of a bucket that straddles a compaction is
+    // a number the session never held, and it erases the only event the chart exists to show. The
+    // envelope keeps the drop visible: peak is where the window got to, trough is what it was cut
+    // back to, and a compaction is exactly a bucket whose trough falls far below the last peak.
+    //
+    // Bucketing is on the TIME axis, not on row order, so idle gaps read as gaps rather than
+    // being compressed away — a step that sat waiting looks different from one that ran flat out.
+    var contextSeries =
+      "WITH r AS (SELECT occurred_at, context_tokens FROM " + REQUESTS_MODEL +
+      " WHERE task_id = '" + id + "' AND context_tokens > 0)," +
+      " s AS (SELECT min(occurred_at) AS t0, max(occurred_at) AS t1 FROM r)" +
+      " SELECT CAST(FLOOR(CASE WHEN epoch(s.t1) = epoch(s.t0) THEN 0" +
+      "   ELSE (epoch(r.occurred_at) - epoch(s.t0)) / (epoch(s.t1) - epoch(s.t0)) * 199 END)" +
+      "   AS INTEGER) AS bucket," +
+      " min(r.occurred_at) AS t, max(r.context_tokens) AS peak," +
+      " min(r.context_tokens) AS trough, count(*) AS n" +
+      " FROM r, s GROUP BY 1 ORDER BY 1";
+
+    return [cost, external, timing, peers, order, modelTiming, presence, freshness, stepSource,
+            contextByStep, contextSeries];
   }
 
   // Below this much recorded agent time, a throughput figure is one or two turns' luck and is
@@ -643,7 +695,30 @@
    * null, and null always means "could not read", never "no rows".
    */
   function assembleLedger(cost, external, timing, peers, order, modelTiming, presence,
-                                 freshness, stepSource) {
+                                 freshness, stepSource, contextByStep, contextSeries) {
+    // Context is the one input that is legitimately ABSENT rather than unreadable: it comes from
+    // transcripts on disk, which Claude Code prunes, and a card whose transcripts are gone has no
+    // rows without anything being broken. `null` (unreadable) and `[]` (nothing recorded) are
+    // therefore kept apart all the way to the panel, which says "not readable" for one and
+    // "no transcript" for the other instead of drawing an empty chart for both.
+    var ctxSteps = {};
+    (contextByStep || []).forEach(function (r) {
+      if (!r || !r.step) return;
+      ctxSteps[String(r.step)] = {
+        requests: Number(r.requests || 0),
+        peak: Number(r.peak || 0),
+        mean: Number(r.mean_ctx || 0),
+        over200k: Number(r.over_200k || 0),
+      };
+    });
+    var series = (contextSeries || []).map(function (r) {
+      return {
+        t: r.t || null,
+        peak: Number(r.peak || 0),
+        trough: Number(r.trough || 0),
+        n: Number(r.n || 0),
+      };
+    }).filter(function (p) { return p.peak > 0; });
     var snapshotAt = freshness && freshness.length ? freshness[0].last_activity || null : null;
     var src = stepSource && stepSource.length ? stepSource[0] : null;
     // "stamp" | "inferred" | "mixed" | null. Mixed means a card whose spend straddles the
@@ -803,6 +878,12 @@
       return a.firstAt < b.firstAt ? -1 : a.firstAt > b.firstAt ? 1 : 0;
     });
 
+    // Zip context onto the rail the cost query already ordered. Attached by step NAME because
+    // both sides resolve a step the same way (ASOF onto kandev_step_points), so the labels are
+    // the same strings by construction; a step with spend but no transcript simply gets null and
+    // renders as "no context data" rather than as a zero, which would read as a free step.
+    rail.forEach(function (s) { s.context = ctxSteps[s.step] || null; });
+
     // Steps the workflow defines but that hold no spend are simply absent — rendering seven
     // zero rows to explain that a card skipped them would bury the six that cost something.
     var undefinedSteps = rail.filter(function (s) { return position[s.step] == null; })
@@ -875,11 +956,26 @@
       // A partial read is still worth rendering, but the footer has to admit which parts are
       // missing rather than showing a rail with silently absent hours — or, worse, a rail in
       // observation order that looks like the workflow order and is not.
+      // The sawtooth, and the summary that goes with it. `series` is empty rather than absent
+      // when a card has no transcript on disk — see the note where it is built.
+      context: {
+        series: series,
+        peak: series.reduce(function (m, p) { return p.peak > m ? p.peak : m; }, 0),
+        requests: Object.keys(ctxSteps).reduce(function (n, k) {
+          return n + ctxSteps[k].requests;
+        }, 0),
+        over200k: Object.keys(ctxSteps).reduce(function (n, k) {
+          return n + ctxSteps[k].over200k;
+        }, 0),
+      },
       degraded: {
         timing: timing === null,
         external: external === null,
         peers: peers === null,
         order: order === null || !Object.keys(position).length,
+        // Distinct from "no rows": null means the query itself failed, and only then is the
+        // absence of a chart this panel's problem rather than a pruned transcript.
+        context: contextByStep === null || contextSeries === null,
       },
     };
   }
@@ -953,7 +1049,7 @@
     return Promise.all(ledgerQueries(taskId).map(function (sql) { return run(sql); }))
       .then(function (res) {
         return assembleLedger(res[0], res[1], res[2], res[3], res[4], res[5], res[6], res[7],
-                              res[8]);
+                              res[8], res[9], res[10]);
       });
   }
 
@@ -1338,7 +1434,135 @@
               fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap",
               overflow: "hidden", textOverflow: "ellipsis",
             },
-          }, fmtTokenSplit(s.fresh, s.cached, s.out))
+          }, fmtTokenSplit(s.fresh, s.cached, s.out)),
+          // CONTEXT — THE OTHER HALF OF THE BILL. Spend is `requests x context`, and every line
+          // above this one is a form of the first factor. Without this a reader sees that Fixup
+          // cost more than Build and cannot see that it did so on a fifth of the requests, each
+          // re-reading twice the prefix — a different problem with a different fix.
+          //
+          // Absent for a step whose transcripts were pruned, and then rendered as nothing rather
+          // than as zeros: a zero here reads as "this step held no context", which is never true
+          // of a step that ran.
+          s.context
+            ? jsx("div", {
+                title: "Context re-sent per request, over " + fmtCount(s.context.requests) +
+                  " requests in this step\nmean " + fmtCount(s.context.mean) +
+                  " · peak " + fmtCount(s.context.peak) + "\n" +
+                  fmtCount(s.context.over200k) + " above 200K" +
+                  "\n\nRead from Claude Code transcripts, not from Kandev. A pruned transcript " +
+                  "makes this an undercount.",
+                style: {
+                  display: "flex", alignItems: "center", gap: "6px",
+                  fontFamily: MONO, fontSize: "9.5px", opacity: 0.45,
+                  fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap",
+                },
+              },
+                jsx("span", null, "ctx"),
+                // Mean as the bar, the step's own peak as a tick, both against the card's peak.
+                // The pair is the point: a short bar with a far-right tick is a step that ran
+                // lean and spiked once; a bar that reaches its own tick never got a compaction.
+                jsx("div", { style: {
+                  position: "relative", flex: "none", width: "54px", height: "3px",
+                  background: SUNK, borderRadius: "1px",
+                } },
+                  jsx("div", { style: {
+                    height: "100%", borderRadius: "1px", background: "currentColor", opacity: 0.5,
+                    width: (props.maxContext > 0
+                      ? Math.min(100, (s.context.mean / props.maxContext) * 100) : 0) + "%",
+                  } }),
+                  jsx("div", { style: {
+                    position: "absolute", top: "-1px", height: "5px", width: "1px",
+                    background: "currentColor", opacity: 0.85,
+                    left: (props.maxContext > 0
+                      ? Math.min(100, (s.context.peak / props.maxContext) * 100) : 0) + "%",
+                  } })
+                ),
+                jsx("span", null, fmtMTok(s.context.mean) + " avg"),
+                jsx("span", { style: { opacity: 0.7 } }, "peak " + fmtMTok(s.context.peak)),
+                s.context.over200k > 0
+                  ? jsx("span", { style: { marginLeft: "auto", opacity: 0.8 } },
+                      Math.round((s.context.over200k / Math.max(1, s.context.requests)) * 100) +
+                        "% >200K")
+                  : null
+              )
+            : null
+        )
+      );
+    }
+
+    /**
+     * THE SAWTOOTH — context held, over the life of the card.
+     *
+     * Every other number on this panel is a total or a mean, and both hide the shape that
+     * actually drives the bill: a window that climbs, gets cut back, and climbs again. Forty-six
+     * of those cycles on one card is not visible in any aggregate, and it is the whole reason
+     * that card cost what it did.
+     *
+     * PLOTTED AS AN ENVELOPE, NOT A LINE. Each bucket carries the peak and the trough of the
+     * requests inside it, and the band between them is drawn. A single averaged line would erase
+     * every compaction — the mean of a bucket spanning a drop is a value the session never held.
+     * The drop IS the signal, so it is what the chart is built to show.
+     *
+     * No axis labels beyond the two extremes: this is a shape, read at a glance, next to the
+     * money it explains. Anyone who needs the numbers has the Ops Intel tab.
+     */
+    function ContextChart(props) {
+      var pts = props.series || [];
+      if (pts.length < 2) return null;
+      var W = 100, H = 34;
+      var peak = pts.reduce(function (m, p) { return p.peak > m ? p.peak : m; }, 0);
+      if (!peak) return null;
+      var x = function (i) { return (i / (pts.length - 1)) * W; };
+      var y = function (v) { return H - (v / peak) * H; };
+      // One closed path: peaks left-to-right, troughs back again. Cheaper than two polylines and
+      // it fills as a band without a second element to keep in sync.
+      var top = pts.map(function (p, i) { return x(i).toFixed(2) + "," + y(p.peak).toFixed(2); });
+      var bot = pts.slice().reverse().map(function (p, i) {
+        return x(pts.length - 1 - i).toFixed(2) + "," + y(p.trough).toFixed(2);
+      });
+      var band = "M" + top.join("L") + "L" + bot.join("L") + "Z";
+      var line = "M" + top.join("L");
+      // The 200K mark, drawn only when the card actually crossed it. A reference line for a
+      // threshold nothing reached is furniture.
+      var ref = peak > 200000 ? y(200000) : null;
+
+      return jsx("div", { style: { display: "flex", flexDirection: "column", gap: "3px" } },
+        jsx("div", { style: { display: "flex", alignItems: "baseline", gap: "6px" } },
+          jsx(Label, null, "context held"),
+          jsx("span", { style: {
+            marginLeft: "auto", fontFamily: MONO, fontSize: "9.5px", opacity: 0.5,
+            fontVariantNumeric: "tabular-nums",
+          } }, "peak " + fmtMTok(peak))
+        ),
+        jsx("svg", {
+          viewBox: "0 0 " + W + " " + H,
+          preserveAspectRatio: "none",
+          style: { width: "100%", height: "34px", display: "block", overflow: "visible" },
+          role: "img",
+          "aria-label": "Context tokens held per request over the life of this card, peak " +
+            fmtCount(peak),
+        },
+          ref != null
+            ? jsx("line", {
+                x1: 0, x2: W, y1: ref, y2: ref,
+                stroke: "currentColor", strokeWidth: 0.4, strokeDasharray: "2 2", opacity: 0.28,
+                vectorEffect: "non-scaling-stroke",
+              })
+            : null,
+          jsx("path", { d: band, fill: "currentColor", opacity: 0.16 }),
+          jsx("path", {
+            d: line, fill: "none", stroke: "currentColor", strokeWidth: 1, opacity: 0.55,
+            vectorEffect: "non-scaling-stroke",
+          })
+        ),
+        jsx("div", { style: {
+          display: "flex", fontFamily: MONO, fontSize: "9px", opacity: 0.4,
+        } },
+          jsx("span", null, "start"),
+          ref != null
+            ? jsx("span", { style: { margin: "0 auto" } }, "dashed line = 200K")
+            : null,
+          jsx("span", { style: { marginLeft: ref != null ? 0 : "auto" } }, "now")
         )
       );
     }
@@ -1550,6 +1774,17 @@
       var maxTime = data.rail.reduce(function (m, s) {
         return Math.max(m, s.agentS + s.idleS);
       }, 0);
+      // The card's own peak, so every step's context bar is read against the same ceiling and
+      // the rows stay comparable. NOT a fixed 200K or a model's window: the point of the bar is
+      // which step in THIS card held the most, and a global scale flattens a card that never
+      // came near the limit into a row of empty bars.
+      //
+      // Unfiltered on purpose. A model filter changes whose money a step spent, not how much
+      // context the step held, so rescaling this when a filter is applied would move a bar for a
+      // reason that has nothing to do with it.
+      var maxContext = data.rail.reduce(function (m, s) {
+        return Math.max(m, s.context ? s.context.peak : 0);
+      }, 0);
       // Summed from the steps rather than read off a legend, because two filters can apply at
       // once and no single legend row knows about the other one.
       var shownTotal = selected || selectedProfile
@@ -1626,11 +1861,41 @@
           data.rail.map(function (s, i) {
             return jsx(StepRow, {
               key: s.step, step: s, first: i === 0, maxCost: maxCost, maxTime: maxTime,
+              maxContext: maxContext,
               order: order, selected: selected, selectedProfile: selectedProfile,
               showProfiles: (data.profiles || []).length > 1,
             });
           })
         ),
+
+        // ---- the sawtooth, directly under the rail it explains.
+        //
+        // BELOW THE RAIL AND NOT ABOVE IT. The rail answers "where did the money go", which is
+        // the question people open this panel with. This answers "why", which is only worth
+        // asking once you have the first answer — and putting a chart above the number it
+        // explains makes the reader scroll past it to find what they came for.
+        //
+        // Silent when there is nothing to draw. A card whose transcripts were pruned gets no
+        // empty frame and no apology: the rail above it is still complete and correct, and this
+        // is an extra reading rather than a missing part of the panel.
+        data.context && data.context.series && data.context.series.length > 1
+          ? jsx("div", { key: "ctx", style: {
+              display: "flex", flexDirection: "column", gap: "4px",
+              padding: "9px 0 2px", borderTop: "1px solid " + BORDER,
+            } },
+              jsx(ContextChart, { series: data.context.series }),
+              jsx("div", { style: {
+                fontFamily: MONO, fontSize: "9.5px", opacity: 0.45,
+                fontVariantNumeric: "tabular-nums",
+              } },
+                fmtCount(data.context.requests) + " requests" +
+                (data.context.over200k > 0
+                  ? " · " + Math.round(
+                      (data.context.over200k / Math.max(1, data.context.requests)) * 100
+                    ) + "% over 200K"
+                  : ""))
+            )
+          : null,
 
         // Spend before the card's first step stamp. Shown, never folded into a step —
         // attributing it to whichever step happened to come first would be a guess presented

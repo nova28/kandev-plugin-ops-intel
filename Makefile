@@ -18,20 +18,40 @@ GOARCH   := $(shell $(GO) env GOARCH)
 PLATFORM := $(GOOS)-$(GOARCH)
 
 # The snapshot refresh (see rill/auto-refresh.sh). REFRESH_WINDOW is local time, both ends
-# inclusive; override either at install time, e.g. `make refresh-agent-install
-# REFRESH_WINDOW=07:00-23:00 REFRESH_POLL_SECONDS=30`.
+# inclusive; override any of these at install time, e.g. `make refresh-agent-install
+# REFRESH_WINDOW=07:00-23:00 REFRESH_POLL_SECONDS=30 REFRESH_TIMEOUT_MIN=45`.
 REFRESH_LABEL  := com.kandev-plugin-ops-intel.refresh
 REFRESH_PLIST  := $(HOME)/Library/LaunchAgents/$(REFRESH_LABEL).plist
 REFRESH_LOG    := $(HOME)/Library/Logs/kandev-ops-intel-refresh.log
-# 08:00-23:00 rather than a 9-to-5: the work this measures routinely runs into the evening, and
-# a window that closes at 22:00 leaves the snapshot stalest exactly when it is being read.
-REFRESH_WINDOW ?= 08:00-23:00
+# The window exists for FRESHNESS, not to spare the machine load (the agent is already
+# ProcessType Background / LowPriorityIO / Nice 5, gated by REFRESH_MIN_GAP_MIN) — so it should
+# cover every hour the dashboard is actually read, and no more.
+#
+# 08:00-06:00 rather than the old 08:00-23:00. The end-at-23:00 version assumed work stops in
+# the evening. Measured 2026-08-31/09-01 on this install, agent activity ran 14:00 through 05:00
+# with the heaviest hour at 23:00 (33 cost events, $240) — entirely outside the window. Two
+# refreshes failed at 22:46 and 22:57, the window shut at 23:00, and auto-refresh.sh then logged
+# `skip: outside working hours` every 60s for six hours while $1,478 of spend accumulated
+# invisibly. An overnight-spanning end is supported (an end before the start crosses midnight);
+# 06:00-08:00 stays quiet so the knob still means something. Set 00:00-23:59 for a true 24h.
+REFRESH_WINDOW ?= 08:00-06:00
 # How often launchd wakes auto-refresh.sh to CHECK, not how often it actually refreshes — most
 # wake-ups just read the signal file and go back to sleep (see auto-refresh.sh's SIGNAL-DRIVEN
 # FAST PATH). 60s keeps event-driven latency low without noticeable overhead; it does not need
 # to be anywhere near QUIET_SECONDS/MAX_WAIT_SECONDS, which live in Settings > Plugins > Ops
 # Intel (config_schema), not here.
 REFRESH_POLL_SECONDS ?= 60
+
+# Hard cap on ONE refresh, covering the whole chain — VACUUM INTO snapshot, then the CSV
+# extract, then the Rill restart — not just the snapshot. It exists so a wedged run cannot hold
+# the lock forever, so it has to clear the slowest legitimate run rather than the typical one.
+#
+# 30 rather than 10, because the 10 was set when kandev.db was small. Measured 2026-09-01: a
+# 1.5 GB kandev.db vacuums at ~2.9 MB/s (disk at 100% capacity, agents writing concurrently),
+# so the snapshot ALONE needs ~9 min, before 130 MB of CSVs and a ~20s Rill restart. Both runs
+# on 2026-08-31 died at exactly 10m00s part-way through, so nothing was ever stamped and the
+# dashboard silently served a 12-hour-old snapshot. Raise this again if the DB keeps growing.
+REFRESH_TIMEOUT_MIN ?= 30
 
 .PHONY: build bundle test package install reinstall uninstall clean \
 	refresh refresh-agent-install refresh-agent-uninstall refresh-agent-status
@@ -141,11 +161,12 @@ refresh-agent-install:
 	     -e 's|@@HOME@@|$(HOME)|g' \
 	     -e 's|@@WINDOW@@|$(REFRESH_WINDOW)|g' \
 	     -e 's|@@POLL_SECONDS@@|$(REFRESH_POLL_SECONDS)|g' \
+	     -e 's|@@TIMEOUT_MIN@@|$(REFRESH_TIMEOUT_MIN)|g' \
 	     rill/launchd/$(REFRESH_LABEL).plist.template > $(REFRESH_PLIST)
 	@plutil -lint $(REFRESH_PLIST)
 	@launchctl bootout gui/$$(id -u)/$(REFRESH_LABEL) 2>/dev/null || true
 	launchctl bootstrap gui/$$(id -u) $(REFRESH_PLIST)
-	@echo "installed $(REFRESH_LABEL): checks every $(REFRESH_POLL_SECONDS)s within $(REFRESH_WINDOW) (refreshes only on a signal or the backstop gap), log $(REFRESH_LOG)"
+	@echo "installed $(REFRESH_LABEL): checks every $(REFRESH_POLL_SECONDS)s within $(REFRESH_WINDOW), $(REFRESH_TIMEOUT_MIN)m timeout per refresh (refreshes only on a signal or the backstop gap), log $(REFRESH_LOG)"
 
 refresh-agent-uninstall:
 	@launchctl bootout gui/$$(id -u)/$(REFRESH_LABEL) 2>/dev/null || true

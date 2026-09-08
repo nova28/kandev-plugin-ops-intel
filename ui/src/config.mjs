@@ -28,6 +28,17 @@ export var ACTIVITY_MODEL = "kandev_activity";
 export var TURNS_MODEL = "kandev_turns";
 export var STEPS_MODEL = "src_dim_workflow_step";
 
+// The fifth is the only one at REQUEST grain, and the only one that carries `context_tokens` —
+// the size of the prefix each request re-sent. Cost in an agent loop is `requests x context`,
+// and the other four models can express neither factor, so "why was this step expensive" is
+// answerable here and nowhere else.
+//
+// It is sourced from Claude Code's own transcripts rather than from Kandev, which records no
+// per-request grain at all — so it is the one model on this page that can be INCOMPLETE for a
+// card while every other model is complete. The panel must say so rather than drawing a
+// partial curve as if it were the whole session.
+export var REQUESTS_MODEL = "kandev_requests";
+
 export var VIEWS = [
   { id: "embedded", label: "Cost, steps & anomalies", path: "/canvas/embedded" },
   { id: "steps", label: "Workspace & step deep dive", path: "/canvas/step_deep_dive" },

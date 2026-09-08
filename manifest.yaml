@@ -59,7 +59,7 @@ config_schema:
     event_driven:
       {
         type: boolean,
-        default: true,
+        default: false,
         title: "React to task moves",
         description: "Refresh shortly after real activity (Quiet window / Max wait below). Turn off to ignore task moves entirely and refresh on a fixed schedule instead (Fixed interval) — e.g. to cap this at once an hour regardless of how often cards move.",
       }

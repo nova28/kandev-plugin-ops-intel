@@ -381,7 +381,135 @@ export function createTaskCostPanel(host) {
             fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap",
             overflow: "hidden", textOverflow: "ellipsis",
           },
-        }, fmtTokenSplit(s.fresh, s.cached, s.out))
+        }, fmtTokenSplit(s.fresh, s.cached, s.out)),
+        // CONTEXT — THE OTHER HALF OF THE BILL. Spend is `requests x context`, and every line
+        // above this one is a form of the first factor. Without this a reader sees that Fixup
+        // cost more than Build and cannot see that it did so on a fifth of the requests, each
+        // re-reading twice the prefix — a different problem with a different fix.
+        //
+        // Absent for a step whose transcripts were pruned, and then rendered as nothing rather
+        // than as zeros: a zero here reads as "this step held no context", which is never true
+        // of a step that ran.
+        s.context
+          ? jsx("div", {
+              title: "Context re-sent per request, over " + fmtCount(s.context.requests) +
+                " requests in this step\nmean " + fmtCount(s.context.mean) +
+                " · peak " + fmtCount(s.context.peak) + "\n" +
+                fmtCount(s.context.over200k) + " above 200K" +
+                "\n\nRead from Claude Code transcripts, not from Kandev. A pruned transcript " +
+                "makes this an undercount.",
+              style: {
+                display: "flex", alignItems: "center", gap: "6px",
+                fontFamily: MONO, fontSize: "9.5px", opacity: 0.45,
+                fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap",
+              },
+            },
+              jsx("span", null, "ctx"),
+              // Mean as the bar, the step's own peak as a tick, both against the card's peak.
+              // The pair is the point: a short bar with a far-right tick is a step that ran
+              // lean and spiked once; a bar that reaches its own tick never got a compaction.
+              jsx("div", { style: {
+                position: "relative", flex: "none", width: "54px", height: "3px",
+                background: SUNK, borderRadius: "1px",
+              } },
+                jsx("div", { style: {
+                  height: "100%", borderRadius: "1px", background: "currentColor", opacity: 0.5,
+                  width: (props.maxContext > 0
+                    ? Math.min(100, (s.context.mean / props.maxContext) * 100) : 0) + "%",
+                } }),
+                jsx("div", { style: {
+                  position: "absolute", top: "-1px", height: "5px", width: "1px",
+                  background: "currentColor", opacity: 0.85,
+                  left: (props.maxContext > 0
+                    ? Math.min(100, (s.context.peak / props.maxContext) * 100) : 0) + "%",
+                } })
+              ),
+              jsx("span", null, fmtMTok(s.context.mean) + " avg"),
+              jsx("span", { style: { opacity: 0.7 } }, "peak " + fmtMTok(s.context.peak)),
+              s.context.over200k > 0
+                ? jsx("span", { style: { marginLeft: "auto", opacity: 0.8 } },
+                    Math.round((s.context.over200k / Math.max(1, s.context.requests)) * 100) +
+                      "% >200K")
+                : null
+            )
+          : null
+      )
+    );
+  }
+
+  /**
+   * THE SAWTOOTH — context held, over the life of the card.
+   *
+   * Every other number on this panel is a total or a mean, and both hide the shape that
+   * actually drives the bill: a window that climbs, gets cut back, and climbs again. Forty-six
+   * of those cycles on one card is not visible in any aggregate, and it is the whole reason
+   * that card cost what it did.
+   *
+   * PLOTTED AS AN ENVELOPE, NOT A LINE. Each bucket carries the peak and the trough of the
+   * requests inside it, and the band between them is drawn. A single averaged line would erase
+   * every compaction — the mean of a bucket spanning a drop is a value the session never held.
+   * The drop IS the signal, so it is what the chart is built to show.
+   *
+   * No axis labels beyond the two extremes: this is a shape, read at a glance, next to the
+   * money it explains. Anyone who needs the numbers has the Ops Intel tab.
+   */
+  function ContextChart(props) {
+    var pts = props.series || [];
+    if (pts.length < 2) return null;
+    var W = 100, H = 34;
+    var peak = pts.reduce(function (m, p) { return p.peak > m ? p.peak : m; }, 0);
+    if (!peak) return null;
+    var x = function (i) { return (i / (pts.length - 1)) * W; };
+    var y = function (v) { return H - (v / peak) * H; };
+    // One closed path: peaks left-to-right, troughs back again. Cheaper than two polylines and
+    // it fills as a band without a second element to keep in sync.
+    var top = pts.map(function (p, i) { return x(i).toFixed(2) + "," + y(p.peak).toFixed(2); });
+    var bot = pts.slice().reverse().map(function (p, i) {
+      return x(pts.length - 1 - i).toFixed(2) + "," + y(p.trough).toFixed(2);
+    });
+    var band = "M" + top.join("L") + "L" + bot.join("L") + "Z";
+    var line = "M" + top.join("L");
+    // The 200K mark, drawn only when the card actually crossed it. A reference line for a
+    // threshold nothing reached is furniture.
+    var ref = peak > 200000 ? y(200000) : null;
+
+    return jsx("div", { style: { display: "flex", flexDirection: "column", gap: "3px" } },
+      jsx("div", { style: { display: "flex", alignItems: "baseline", gap: "6px" } },
+        jsx(Label, null, "context held"),
+        jsx("span", { style: {
+          marginLeft: "auto", fontFamily: MONO, fontSize: "9.5px", opacity: 0.5,
+          fontVariantNumeric: "tabular-nums",
+        } }, "peak " + fmtMTok(peak))
+      ),
+      jsx("svg", {
+        viewBox: "0 0 " + W + " " + H,
+        preserveAspectRatio: "none",
+        style: { width: "100%", height: "34px", display: "block", overflow: "visible" },
+        role: "img",
+        "aria-label": "Context tokens held per request over the life of this card, peak " +
+          fmtCount(peak),
+      },
+        ref != null
+          ? jsx("line", {
+              x1: 0, x2: W, y1: ref, y2: ref,
+              stroke: "currentColor", strokeWidth: 0.4, strokeDasharray: "2 2", opacity: 0.28,
+              vectorEffect: "non-scaling-stroke",
+            })
+          : null,
+        jsx("path", { d: band, fill: "currentColor", opacity: 0.16 }),
+        jsx("path", {
+          d: line, fill: "none", stroke: "currentColor", strokeWidth: 1, opacity: 0.55,
+          vectorEffect: "non-scaling-stroke",
+        })
+      ),
+      jsx("div", { style: {
+        display: "flex", fontFamily: MONO, fontSize: "9px", opacity: 0.4,
+      } },
+        jsx("span", null, "start"),
+        ref != null
+          ? jsx("span", { style: { margin: "0 auto" } }, "dashed line = 200K")
+          : null,
+        jsx("span", { style: { marginLeft: ref != null ? 0 : "auto" } }, "now")
       )
     );
   }
@@ -593,6 +721,17 @@ export function createTaskCostPanel(host) {
     var maxTime = data.rail.reduce(function (m, s) {
       return Math.max(m, s.agentS + s.idleS);
     }, 0);
+    // The card's own peak, so every step's context bar is read against the same ceiling and
+    // the rows stay comparable. NOT a fixed 200K or a model's window: the point of the bar is
+    // which step in THIS card held the most, and a global scale flattens a card that never
+    // came near the limit into a row of empty bars.
+    //
+    // Unfiltered on purpose. A model filter changes whose money a step spent, not how much
+    // context the step held, so rescaling this when a filter is applied would move a bar for a
+    // reason that has nothing to do with it.
+    var maxContext = data.rail.reduce(function (m, s) {
+      return Math.max(m, s.context ? s.context.peak : 0);
+    }, 0);
     // Summed from the steps rather than read off a legend, because two filters can apply at
     // once and no single legend row knows about the other one.
     var shownTotal = selected || selectedProfile
@@ -669,11 +808,41 @@ export function createTaskCostPanel(host) {
         data.rail.map(function (s, i) {
           return jsx(StepRow, {
             key: s.step, step: s, first: i === 0, maxCost: maxCost, maxTime: maxTime,
+            maxContext: maxContext,
             order: order, selected: selected, selectedProfile: selectedProfile,
             showProfiles: (data.profiles || []).length > 1,
           });
         })
       ),
+
+      // ---- the sawtooth, directly under the rail it explains.
+      //
+      // BELOW THE RAIL AND NOT ABOVE IT. The rail answers "where did the money go", which is
+      // the question people open this panel with. This answers "why", which is only worth
+      // asking once you have the first answer — and putting a chart above the number it
+      // explains makes the reader scroll past it to find what they came for.
+      //
+      // Silent when there is nothing to draw. A card whose transcripts were pruned gets no
+      // empty frame and no apology: the rail above it is still complete and correct, and this
+      // is an extra reading rather than a missing part of the panel.
+      data.context && data.context.series && data.context.series.length > 1
+        ? jsx("div", { key: "ctx", style: {
+            display: "flex", flexDirection: "column", gap: "4px",
+            padding: "9px 0 2px", borderTop: "1px solid " + BORDER,
+          } },
+            jsx(ContextChart, { series: data.context.series }),
+            jsx("div", { style: {
+              fontFamily: MONO, fontSize: "9.5px", opacity: 0.45,
+              fontVariantNumeric: "tabular-nums",
+            } },
+              fmtCount(data.context.requests) + " requests" +
+              (data.context.over200k > 0
+                ? " · " + Math.round(
+                    (data.context.over200k / Math.max(1, data.context.requests)) * 100
+                  ) + "% over 200K"
+                : ""))
+          )
+        : null,
 
       // Spend before the card's first step stamp. Shown, never folded into a step —
       // attributing it to whichever step happened to come first would be a guess presented

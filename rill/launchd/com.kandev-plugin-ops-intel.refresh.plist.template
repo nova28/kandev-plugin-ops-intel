@@ -67,10 +67,35 @@
         <string>50</string>
 
         <!--
+          Hard cap on one refresh, covering VACUUM INTO + the CSV extract + the Rill restart.
+          Must clear the SLOWEST legitimate run, not the typical one: a timed-out refresh does
+          not stamp, so the dashboard keeps serving the previous snapshot with nothing on the
+          page to say so. See the Makefile's REFRESH_TIMEOUT_MIN for the measurements.
+        -->
+        <key>OPS_INTEL_REFRESH_TIMEOUT_MIN</key>
+        <string>@@TIMEOUT_MIN@@</string>
+
+        <!--
           1 = refresh only while Rill is answering on :9009. The plugin's own rule is that it
           never starts Rill; a timer that did so on the operator's behalf would break the same
           rule from the outside. Set 0 to have the hourly run bring Rill up as well.
         -->
+        <!--
+          CADENCE PIN, independent of the plugin. 0 forces fixed-interval mode and outranks
+          whatever main.go writes into $SIGNAL from Kandev's stored config. Set here because
+          the shell script is the only half of this we can change without restarting Kandev,
+          and because a lost or defaulted plugin config silently reverts the cadence to
+          event-driven — which demands a refresh every 5 minutes against a VACUUM INTO that
+          needs 9-50 minutes on a multi-gigabyte store. Those overlap permanently, and a
+          timed-out run used to orphan its sqlite3 grandchild, pinning Kandev's WAL until the
+          process was killed by hand. Leave unset only if you want Settings to be in charge.
+        -->
+        <key>OPS_INTEL_REFRESH_EVENT_DRIVEN</key>
+        <string>0</string>
+
+        <key>OPS_INTEL_REFRESH_FIXED_INTERVAL_MINUTES</key>
+        <string>60</string>
+
         <key>OPS_INTEL_REFRESH_REQUIRE_RILL</key>
         <string>1</string>
     </dict>

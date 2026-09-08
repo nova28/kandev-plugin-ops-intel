@@ -52,9 +52,17 @@
 #   OPS_INTEL_REFRESH_MAX_WAIT_MINUTES    5 — fallback max-wait, same caveat as above.
 #   OPS_INTEL_REFRESH_FIXED_INTERVAL_MINUTES  60 — fallback fixed-mode interval, same caveat
 #                                          (config_schema.fixed_interval_minutes).
-#   OPS_INTEL_REFRESH_TIMEOUT_MIN         10 — a refresh past this is killed, so it cannot hold
+#   OPS_INTEL_REFRESH_TIMEOUT_MIN         30 — a refresh past this is killed, so it cannot hold
 #                                          the lock into the next several polls. Anything named
-#                                          rill is spared.
+#                                          rill is spared. Scales with kandev.db — see the
+#                                          TIMEOUT_MIN assignment below.
+#   OPS_INTEL_REFRESH_EVENT_DRIVEN        unset — operator override of the mode the plugin
+#                                          writes into $SIGNAL. Unset believes the plugin; 0
+#                                          forces fixed-interval mode (using
+#                                          OPS_INTEL_REFRESH_FIXED_INTERVAL_MINUTES) and 1
+#                                          forces event-driven, regardless of Settings. Use 0
+#                                          to pin the cadence without depending on plugin
+#                                          config durability.
 #   OPS_INTEL_REFRESH_REQUIRE_RILL        1 — refresh only while Rill is listening. 0 refreshes
 #                                          (and therefore starts Rill) regardless.
 #   OPS_INTEL_REFRESH_LOG                 ~/Library/Logs/kandev-ops-intel-refresh.log
@@ -76,15 +84,37 @@ MIN_GAP_MIN="${OPS_INTEL_REFRESH_MIN_GAP_MIN:-50}"
 QUIET_SECONDS_DEFAULT=$(( ${OPS_INTEL_REFRESH_QUIET_MINUTES:-2} * 60 ))
 MAX_WAIT_SECONDS_DEFAULT=$(( ${OPS_INTEL_REFRESH_MAX_WAIT_MINUTES:-5} * 60 ))
 FIXED_INTERVAL_SECONDS_DEFAULT=$(( ${OPS_INTEL_REFRESH_FIXED_INTERVAL_MINUTES:-60} * 60 ))
-# 10 minutes, measured rather than guessed: a healthy full refresh on a ~700 MB store is 35
-# seconds end to end (6s snapshot, then the SQL, the Rill restart and check.sh). A deadline is
-# for a genuinely stuck run, and at this ratio ten minutes is already twenty times the real
-# thing — long enough that a slow disk or a cold Rill start is never mistaken for a stall.
+# 30 minutes. THIS SCALES WITH kandev.db AND HAS TO BE REVISITED AS THE STORE GROWS — the
+# deadline is the whole chain (VACUUM INTO, the SQL, the Rill restart, check.sh), not the
+# snapshot alone.
+#
+# It was 10, from a measured 35-second end-to-end refresh on a ~700 MB store (6s snapshot). That
+# ratio does not hold: measured 2026-09-01 on a 1.5 GB store, VACUUM INTO ran at ~2.9 MB/s with
+# the disk at 100% capacity and agents writing concurrently, so the SNAPSHOT alone needed ~9
+# minutes before 130 MB of CSVs and a ~20s Rill restart. Two consecutive runs died at exactly
+# 10m00s part-way through.
+#
+# A timeout here is not a loud failure. run_with_deadline kills the run WITHOUT stamping, so the
+# dashboard keeps serving the previous snapshot and nothing on the page says it is stale — those
+# two kills cost 12 hours of invisible drift. Prefer a deadline that is too generous: it still
+# bounds a wedged run, and the lock means the only cost of waiting is a later refresh.
 #
 # This was 40 minutes while extract.sh still snapshotted with `.backup`, which restarts its page
 # copy on every write to the source and did not converge at all under a running Kandev. That is
-# fixed at the source (see extract.sh); the deadline no longer has to accommodate it.
-TIMEOUT_MIN="${OPS_INTEL_REFRESH_TIMEOUT_MIN:-10}"
+# fixed at the source (see extract.sh) — VACUUM INTO does converge. It is simply not fast on a
+# multi-gigabyte store, which is what the 10 forgot.
+TIMEOUT_MIN="${OPS_INTEL_REFRESH_TIMEOUT_MIN:-30}"
+# OPERATOR OVERRIDE of the plugin-supplied mode in $SIGNAL. Unset (the default) means
+# "believe the plugin". 0 or 1 OUTRANKS whatever main.go last wrote, and the paired interval
+# below is used with it.
+#
+# Why this exists: $SIGNAL is rewritten by the plugin on every task.moved AND on every plugin
+# restart, from Kandev's stored config. If that stored config is lost, never written, or falls
+# back to the manifest default, the cadence silently reverts to event-driven — which on a busy
+# board demands a refresh every max_wait_minutes (5) against a VACUUM INTO that takes 9-50
+# minutes on a multi-gigabyte store. Those overlap permanently. The operator needs a way to
+# pin the cadence that does not depend on the plugin, the manifest, or a Kandev restart.
+OVERRIDE_EVENT_DRIVEN="${OPS_INTEL_REFRESH_EVENT_DRIVEN:-}"
 REQUIRE_RILL="${OPS_INTEL_REFRESH_REQUIRE_RILL:-1}"
 LOG="${OPS_INTEL_REFRESH_LOG:-$HOME/Library/Logs/kandev-ops-intel-refresh.log}"
 RILL_ORIGIN="${RILL_ORIGIN:-http://localhost:9009}"
@@ -249,6 +279,18 @@ if [[ $FORCE -eq 0 ]]; then
         [[ "${event_driven_s:-}" =~ ^[01]$ ]] || event_driven_s=1
         [[ "${fixed_interval_s:-}" =~ ^[0-9]+$ ]] || fixed_interval_s=$FIXED_INTERVAL_SECONDS_DEFAULT
 
+        # The override wins over the plugin's value. Logged every time it bites, because a
+        # cadence that silently disagrees with what Settings shows is exactly the kind of
+        # split-brain this script's own comments keep arguing against — the operator must be
+        # able to see, in the log, that the env is in charge and what it chose.
+        if [[ "$OVERRIDE_EVENT_DRIVEN" =~ ^[01]$ ]]; then
+            if [[ "$OVERRIDE_EVENT_DRIVEN" != "$event_driven_s" ]]; then
+                log "override: OPS_INTEL_REFRESH_EVENT_DRIVEN=$OVERRIDE_EVENT_DRIVEN outranks \$SIGNAL's event_driven=$event_driven_s"
+            fi
+            event_driven_s="$OVERRIDE_EVENT_DRIVEN"
+            fixed_interval_s=$FIXED_INTERVAL_SECONDS_DEFAULT
+        fi
+
         if [[ "$event_driven_s" == "1" ]]; then
             signal_should_refresh "$now_epoch" "$first_seen" "$last_seen" "$quiet_s" "$max_wait_s" || \
                 skip "pending change $((now_epoch - last_seen))s since last move (quiet ${quiet_s}s) / $((now_epoch - first_seen))s since first pending (max wait ${max_wait_s}s)"
@@ -305,19 +347,54 @@ started=$(date +%s)
 # Killing spares anything named rill: by the time the refresh has started a replacement server,
 # the remaining work is a health poll and check.sh, and taking the new Rill down with the
 # watchdog would leave the operator with no server at all — a worse outcome than a stale one.
+# collect_descendants <pid> <array-name> — every process below <pid>, depth-first.
+# `pgrep -P` is one generation only; this walks the tree so a watchdog kill cannot leave a
+# grandchild holding a database read transaction. See the deadline block below.
+collect_descendants() {
+    local root="$1" name="$2" kid
+    for kid in $(pgrep -P "$root" 2>/dev/null || true); do
+        eval "$name+=($kid)"
+        collect_descendants "$kid" "$name"
+    done
+}
+
 run_with_deadline() {
     local limit=$((TIMEOUT_MIN * 60)) child pid cmd
     ./refresh.sh >> "$LOG" 2>&1 &
     child=$!
     while kill -0 "$child" 2>/dev/null; do
         if (($(date +%s) - started > limit)); then
-            log "refresh TIMED OUT after ${TIMEOUT_MIN}m — terminating (a live-writer .backup can starve)"
-            for pid in $(pgrep -P "$child" 2>/dev/null || true); do
+            log "refresh TIMED OUT after ${TIMEOUT_MIN}m — terminating. NOT stamped: the dashboard keeps serving the previous snapshot. A large kandev.db can simply need longer than the deadline — raise OPS_INTEL_REFRESH_TIMEOUT_MIN before assuming a stall."
+            # EVERY DESCENDANT, NOT JUST DIRECT CHILDREN. The tree is
+            # refresh.sh -> extract.sh -> sqlite3, so `pgrep -P "$child"` reaches
+            # extract.sh and STOPS: the `sqlite3 ... VACUUM INTO` grandchild survives the
+            # deadline, is reparented to launchd, and keeps its read transaction open
+            # forever. That read transaction pins Kandev's WAL, so checkpointing stops and
+            # kandev.db-wal grows without bound. Measured 2026-09-01: one orphan at ppid=1
+            # still running 50m against this 30m deadline, a 2.0 GB WAL whose checkpoint
+            # pointer had been frozen at frame 935 for over an hour, and every Kandev write
+            # queued behind it — surfacing to the user as clarification answers failing with
+            # "context deadline exceeded" after 90 seconds.
+            local -a doomed=()
+            collect_descendants "$child" doomed
+            for pid in "${doomed[@]}"; do
                 cmd="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
                 case "$cmd" in *rill*) continue ;; esac
                 kill -TERM "$pid" 2>/dev/null || true
             done
             kill -TERM "$child" 2>/dev/null || true
+            # TERM is a request. VACUUM INTO does not always take it promptly, and an
+            # ignored TERM is indistinguishable from a clean exit here — so escalate rather
+            # than trust it. Anything still alive after the grace period gets KILL.
+            sleep 5
+            for pid in "${doomed[@]}"; do
+                cmd="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+                [[ -z "$cmd" ]] && continue
+                case "$cmd" in *rill*) continue ;; esac
+                log "deadline: force-killing surviving $cmd (pid $pid)"
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            kill -9 "$child" 2>/dev/null || true
             wait "$child" 2>/dev/null || true
             return 124
         fi
@@ -326,7 +403,15 @@ run_with_deadline() {
     wait "$child"
 }
 
-if run_with_deadline; then
+# Exit 3 from refresh.sh means stages 1 and 2 succeeded and only check.sh's data-quality
+# assertions failed — the new snapshot is written and Rill is serving it. That IS a successful
+# refresh for stamping purposes, and treating it as a failure is what let this job run 594 times
+# with 0 stamps (see refresh.sh's 3/3 verify block). Stamp it, then say loudly that the
+# assertions failed so the content problem stays visible instead of being silently absorbed.
+refresh_rc=0
+run_with_deadline || refresh_rc=$?
+
+if ((refresh_rc == 0 || refresh_rc == 3)); then
     touch "$STAMP"
     # Clear $SIGNAL on success, but ONLY in event-driven mode. There it holds transient
     # per-burst state (first_seen/last_seen) that must reset so the next task.moved starts a
@@ -343,13 +428,16 @@ if run_with_deadline; then
     [[ -f "$SIGNAL" ]] && { read -r _ _ _ _ signal_mode _ < "$SIGNAL" 2>/dev/null || signal_mode=1; }
     [[ "$signal_mode" == "1" ]] && rm -f "$SIGNAL"
     elapsed=$(($(date +%s) - started))
-    log "refresh ok in $((elapsed / 60))m$((elapsed % 60))s"
+    if ((refresh_rc == 3)); then
+        log "refresh ok in $((elapsed / 60))m$((elapsed % 60))s — snapshot live and STAMPED, but check.sh assertions FAILED (see the output above). The dashboard is fresh; the failures are about data content. Retrying would not fix them, so this run counts as done."
+    else
+        log "refresh ok in $((elapsed / 60))m$((elapsed % 60))s"
+    fi
 else
-    rc=$?
-    # refresh.sh ends in check.sh, whose integrity assertions can fail on a snapshot that
-    # extracted perfectly well — so the exit status alone does not say whether the data is
-    # usable. Do not stamp and do not clear $SIGNAL: the next poll (event-driven or backstop)
-    # retries, and a stamped/cleared failure would suppress that.
-    log "refresh FAILED (exit $rc) — see the output above; not stamping, will retry"
-    exit "$rc"
+    # A genuine failure: the snapshot did not land, or Rill was not restarted onto it, or the run
+    # was killed at the deadline (124). Do not stamp and do not clear $SIGNAL — the next poll
+    # (event-driven or backstop) retries, and a stamped/cleared failure would suppress that.
+    # check.sh assertion failures do NOT reach here; refresh.sh reports those as 3, handled above.
+    log "refresh FAILED (exit $refresh_rc) — see the output above; not stamping, will retry"
+    exit "$refresh_rc"
 fi

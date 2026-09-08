@@ -171,9 +171,47 @@ test("negative idle gaps never deflate a step's wall time", () => {
 
 test("each optional query degrades on its own, and says so", () => {
   var cost = [costRow("Spec", "opus", 100, "2026-08-08T05:00:00Z")];
-  var r = assembleLedger(cost, null, null, null, null);
+  var r = assembleLedger(cost, null, null, null, null, null, null, null, null, null, null);
   assert.equal(r.state, "ok", "money still renders when the extras are unreadable");
-  assert.deepEqual(r.degraded, { timing: true, external: true, peers: true, order: true });
+  assert.deepEqual(r.degraded, {
+    timing: true, external: true, peers: true, order: true, context: true,
+  });
+});
+
+// The distinction the panel renders two different ways. A context query that FAILED is this
+// panel's problem and says so; a card that simply has no transcript on disk is not degraded at
+// all — its rail is complete and the chart is an extra it never had.
+test("no transcript rows is not a degraded read", () => {
+  var cost = [costRow("Spec", "opus", 100, "2026-08-08T05:00:00Z")];
+  var r = assembleLedger(cost, [], [], [], ORDER, [], [], [], [], [], []);
+  assert.equal(r.degraded.context, false, "empty is a fact about the card, not a failure");
+  assert.deepEqual(r.context.series, [], "and it draws nothing rather than a flat line");
+  assert.equal(r.context.requests, 0);
+});
+
+test("context is attached to its own step, and a step without any stays null", () => {
+  var cost = [
+    costRow("Spec", "opus", 100, "2026-08-08T05:00:00Z"),
+    costRow("Build", "sonnet", 200, "2026-08-08T09:00:00Z"),
+  ];
+  var byStep = [
+    { step: "Build", requests: 10, peak: 400000, mean_ctx: 250000, over_200k: 7,
+      first_at: "2026-08-08T09:00:00Z" },
+  ];
+  var series = [
+    { t: "2026-08-08T09:00:00Z", peak: 400000, trough: 50000, n: 5 },
+    { t: "2026-08-08T09:30:00Z", peak: 300000, trough: 60000, n: 5 },
+  ];
+  var r = assembleLedger(cost, [], [], [], ORDER, [], [], [], [], byStep, series);
+  var build = r.rail.filter((s) => s.step === "Build")[0];
+  var spec = r.rail.filter((s) => s.step === "Spec")[0];
+  assert.equal(build.context.peak, 400000);
+  assert.equal(build.context.over200k, 7);
+  // A step with spend but no transcript must be null, never zero — a zero renders as "this
+  // step held no context", which is never true of a step that ran.
+  assert.equal(spec.context, null);
+  assert.equal(r.context.peak, 400000, "the card's peak is the max across the series");
+  assert.equal(r.context.requests, 10);
 });
 
 test("an empty order table degrades to first-seen and flags it", () => {
@@ -327,17 +365,16 @@ test("a task id carrying a quote cannot break out of the SQL", () => {
 
 test("every per-card query names a task id, so none can scan the whole store", () => {
   var qs = ledgerQueries("task-1");
-  assert.equal(qs.length, 9);
-  // All but the last are per-card and must say so. The last is the snapshot-freshness probe:
-  // a global property of the extract, not of any card, so it cannot be task-scoped. It is
-  // carved out by name rather than by loosening the check, which is the whole guard against
-  // a per-card query quietly becoming a full scan.
-  qs.slice(0, 7).concat([qs[8]]).forEach((sql, i) => {
-    assert.ok(sql.includes("task-1"), `query ${i} is not scoped to the task`);
-  });
-  var freshness = qs[7];
-  assert.ok(/^SELECT max\(created_at\)/.test(freshness), "the global query is the freshness probe");
-  assert.ok(!/task_id/.test(freshness), "and it is deliberately not card-scoped");
+  assert.equal(qs.length, 11);
+  // Exactly one query is allowed to be global: the snapshot-freshness probe, which is a
+  // property of the extract rather than of any card. It is identified BY SHAPE, and every
+  // other query is then required to be scoped — rather than carving out a fixed index, which
+  // silently stops covering whatever gets appended after it.
+  var globals = qs.filter((sql) => !sql.includes("task-1"));
+  assert.equal(globals.length, 1, "only the freshness probe may scan the whole store");
+  assert.ok(/^SELECT max\(created_at\)/.test(globals[0]),
+    "the one global query is the freshness probe");
+  assert.ok(!/task_id/.test(globals[0]), "and it is deliberately not card-scoped");
 });
 
 // ---------------------------------------------------------------------------------------

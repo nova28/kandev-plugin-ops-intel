@@ -17,6 +17,7 @@
  */
 
 import { COST_MODEL, ACTIVITY_MODEL, TURNS_MODEL, STEPS_MODEL } from "./config.mjs";
+import { REQUESTS_MODEL } from "./config.mjs";
 import { sqlQuote, isUnattributed } from "./format.mjs";
 import { rillQuery } from "./rill.mjs";
 
@@ -146,7 +147,48 @@ export function ledgerQueries(taskId) {
     "   THEN cost_subcents ELSE 0 END), 0) AS inferred" +
     " FROM kandev_cost WHERE task_id = '" + id + "' AND step_attributed = 'yes'";
 
-  return [cost, external, timing, peers, order, modelTiming, presence, freshness, stepSource];
+  // CONTEXT PER STEP. The second half of `requests x context`, and the half no other model on
+  // this page can express. A step's spend is already on the rail; this says whether it was
+  // expensive because it did a lot or because everything it did was re-reading a huge prefix.
+  //
+  // `mean` and `peak` are both kept because they answer different questions and disagree
+  // usefully: a step can hold a modest mean and still have run to the ceiling once, and a step
+  // whose mean IS its peak never got a compaction and simply inherited a full window.
+  //
+  // Ordered by first request, not by name, so it can be zipped onto the rail the panel already
+  // builds from the cost query without re-deriving step order.
+  var contextByStep =
+    "SELECT step_at_event AS step, count(*) AS requests," +
+    " max(context_tokens) AS peak," +
+    " CAST(avg(context_tokens) AS BIGINT) AS mean_ctx," +
+    " count(*) FILTER (WHERE context_tokens > 200000) AS over_200k," +
+    " min(occurred_at) AS first_at" +
+    " FROM " + REQUESTS_MODEL + " WHERE task_id = '" + id + "'" +
+    " AND context_tokens > 0 GROUP BY 1 ORDER BY first_at";
+
+  // CONTEXT OVER TIME — the sawtooth. Every request is a point, so a long card is thousands of
+  // them; bucketing to a fixed 200 keeps the payload flat regardless of card size.
+  //
+  // PEAK AND TROUGH PER BUCKET, NOT A MEAN. The mean of a bucket that straddles a compaction is
+  // a number the session never held, and it erases the only event the chart exists to show. The
+  // envelope keeps the drop visible: peak is where the window got to, trough is what it was cut
+  // back to, and a compaction is exactly a bucket whose trough falls far below the last peak.
+  //
+  // Bucketing is on the TIME axis, not on row order, so idle gaps read as gaps rather than
+  // being compressed away — a step that sat waiting looks different from one that ran flat out.
+  var contextSeries =
+    "WITH r AS (SELECT occurred_at, context_tokens FROM " + REQUESTS_MODEL +
+    " WHERE task_id = '" + id + "' AND context_tokens > 0)," +
+    " s AS (SELECT min(occurred_at) AS t0, max(occurred_at) AS t1 FROM r)" +
+    " SELECT CAST(FLOOR(CASE WHEN epoch(s.t1) = epoch(s.t0) THEN 0" +
+    "   ELSE (epoch(r.occurred_at) - epoch(s.t0)) / (epoch(s.t1) - epoch(s.t0)) * 199 END)" +
+    "   AS INTEGER) AS bucket," +
+    " min(r.occurred_at) AS t, max(r.context_tokens) AS peak," +
+    " min(r.context_tokens) AS trough, count(*) AS n" +
+    " FROM r, s GROUP BY 1 ORDER BY 1";
+
+  return [cost, external, timing, peers, order, modelTiming, presence, freshness, stepSource,
+          contextByStep, contextSeries];
 }
 
 // Below this much recorded agent time, a throughput figure is one or two turns' luck and is
@@ -185,7 +227,30 @@ export function modelRates(models, timingRows) {
  * null, and null always means "could not read", never "no rows".
  */
 export function assembleLedger(cost, external, timing, peers, order, modelTiming, presence,
-                               freshness, stepSource) {
+                               freshness, stepSource, contextByStep, contextSeries) {
+  // Context is the one input that is legitimately ABSENT rather than unreadable: it comes from
+  // transcripts on disk, which Claude Code prunes, and a card whose transcripts are gone has no
+  // rows without anything being broken. `null` (unreadable) and `[]` (nothing recorded) are
+  // therefore kept apart all the way to the panel, which says "not readable" for one and
+  // "no transcript" for the other instead of drawing an empty chart for both.
+  var ctxSteps = {};
+  (contextByStep || []).forEach(function (r) {
+    if (!r || !r.step) return;
+    ctxSteps[String(r.step)] = {
+      requests: Number(r.requests || 0),
+      peak: Number(r.peak || 0),
+      mean: Number(r.mean_ctx || 0),
+      over200k: Number(r.over_200k || 0),
+    };
+  });
+  var series = (contextSeries || []).map(function (r) {
+    return {
+      t: r.t || null,
+      peak: Number(r.peak || 0),
+      trough: Number(r.trough || 0),
+      n: Number(r.n || 0),
+    };
+  }).filter(function (p) { return p.peak > 0; });
   var snapshotAt = freshness && freshness.length ? freshness[0].last_activity || null : null;
   var src = stepSource && stepSource.length ? stepSource[0] : null;
   // "stamp" | "inferred" | "mixed" | null. Mixed means a card whose spend straddles the
@@ -345,6 +410,12 @@ export function assembleLedger(cost, external, timing, peers, order, modelTiming
     return a.firstAt < b.firstAt ? -1 : a.firstAt > b.firstAt ? 1 : 0;
   });
 
+  // Zip context onto the rail the cost query already ordered. Attached by step NAME because
+  // both sides resolve a step the same way (ASOF onto kandev_step_points), so the labels are
+  // the same strings by construction; a step with spend but no transcript simply gets null and
+  // renders as "no context data" rather than as a zero, which would read as a free step.
+  rail.forEach(function (s) { s.context = ctxSteps[s.step] || null; });
+
   // Steps the workflow defines but that hold no spend are simply absent — rendering seven
   // zero rows to explain that a card skipped them would bury the six that cost something.
   var undefinedSteps = rail.filter(function (s) { return position[s.step] == null; })
@@ -417,11 +488,26 @@ export function assembleLedger(cost, external, timing, peers, order, modelTiming
     // A partial read is still worth rendering, but the footer has to admit which parts are
     // missing rather than showing a rail with silently absent hours — or, worse, a rail in
     // observation order that looks like the workflow order and is not.
+    // The sawtooth, and the summary that goes with it. `series` is empty rather than absent
+    // when a card has no transcript on disk — see the note where it is built.
+    context: {
+      series: series,
+      peak: series.reduce(function (m, p) { return p.peak > m ? p.peak : m; }, 0),
+      requests: Object.keys(ctxSteps).reduce(function (n, k) {
+        return n + ctxSteps[k].requests;
+      }, 0),
+      over200k: Object.keys(ctxSteps).reduce(function (n, k) {
+        return n + ctxSteps[k].over200k;
+      }, 0),
+    },
     degraded: {
       timing: timing === null,
       external: external === null,
       peers: peers === null,
       order: order === null || !Object.keys(position).length,
+      // Distinct from "no rows": null means the query itself failed, and only then is the
+      // absence of a chart this panel's problem rather than a pruned transcript.
+      context: contextByStep === null || contextSeries === null,
     },
   };
 }
@@ -495,6 +581,6 @@ export function loadTaskLedger(taskId, query) {
   return Promise.all(ledgerQueries(taskId).map(function (sql) { return run(sql); }))
     .then(function (res) {
       return assembleLedger(res[0], res[1], res[2], res[3], res[4], res[5], res[6], res[7],
-                            res[8]);
+                            res[8], res[9], res[10]);
     });
 }

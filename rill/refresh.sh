@@ -43,11 +43,26 @@ else
         echo "       add it to the plist and re-run: make refresh-agent-install" >&2
         exit 1
     fi
-    pkill -f "rill start" 2>/dev/null || true
-    # Wait for BOTH ports. Rill's gRPC port (49009) lingers after the HTTP port frees, and
-    # starting into it fails with "port in use" in a way that reads like a Rill bug.
+    # STOP THIS PROJECT'S SERVER, NOT EVERY RILL ON THE MACHINE. This used to be
+    # `pkill -f "rill start"`, which matches on the command line and therefore killed any Rill
+    # serving an unrelated project on an unrelated port — once an hour, silently, from a launchd
+    # job that project's owner never installed and cannot see. Ask the port who owns it instead.
+    # This script only ever claims $ORIGIN's port and its gRPC sibling, so the listener there is
+    # the server it started and the only one it has any business stopping.
+    RILL_PORT="${ORIGIN##*:}"
+    RILL_PORT="${RILL_PORT%%/*}"
+    # A malformed ORIGIN (no :port) would leave a non-numeric here and make the arithmetic below
+    # abort the whole refresh under `set -e`. Fall back to the default rather than die.
+    [[ "$RILL_PORT" =~ ^[0-9]+$ ]] || RILL_PORT=9009
+    RILL_PORT_GRPC=$((RILL_PORT + 40000))
+    for pid in $(lsof -tnP -iTCP:"$RILL_PORT" -sTCP:LISTEN 2>/dev/null || true) \
+               $(lsof -tnP -iTCP:"$RILL_PORT_GRPC" -sTCP:LISTEN 2>/dev/null || true); do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    # Wait for BOTH ports. Rill's gRPC port lingers after the HTTP port frees, and starting into
+    # it fails with "port in use" in a way that reads like a Rill bug.
     for _ in $(seq 1 30); do
-        if ! lsof -ti :9009 >/dev/null 2>&1 && ! lsof -ti :49009 >/dev/null 2>&1; then break; fi
+        if ! lsof -ti :"$RILL_PORT" >/dev/null 2>&1 && ! lsof -ti :"$RILL_PORT_GRPC" >/dev/null 2>&1; then break; fi
         sleep 1
     done
     # --allowed-origins is what lets the Kandev plugin tab READ a response rather than an
@@ -101,5 +116,27 @@ else:
     sleep 3
 fi
 
+# EXIT 3 MEANS THE DATA LANDED AND ONLY VERIFICATION FAILED. The distinction is the whole
+# point of this block: stages 1 and 2 have already written the new CSVs and restarted Rill onto
+# them, so the dashboard IS fresh by the time this line runs. check.sh asserts data-QUALITY
+# invariants over that snapshot; a failure here says something about the data, not about whether
+# the refresh worked.
+#
+# Collapsing the two into one non-zero exit produced 0 successes in 594 runs on this install.
+# Three of check.sh's assertions fail deterministically against real data ("documented emptiness
+# claims still hold", "declared ceiling is an observed ceiling", "epoch bases agree"), so
+# auto-refresh.sh never stamped; MIN_GAP_MIN is measured from that stamp, so nothing throttled
+# the retry; and the job re-ran back-to-back for the whole window — a 1.5 GB VACUUM INTO roughly
+# every 12 minutes, permanently, while the snapshot it had already written sat there working.
+#
+# So report it, distinguish it, and let the caller decide. auto-refresh.sh stamps on 3 and logs a
+# warning. A stage 1 or 2 failure still exits non-zero through `set -e` and still must NOT stamp:
+# there the snapshot genuinely did not land, and retrying is the right response.
 echo "==> 3/3 verify"
-./check.sh
+verify_rc=0
+./check.sh || verify_rc=$?
+if ((verify_rc != 0)); then
+    echo "==> verify FAILED (check.sh exit $verify_rc) — the new snapshot IS live and being served;" >&2
+    echo "    these assertions are about its CONTENT, not about the refresh. Exiting 3." >&2
+    exit 3
+fi
