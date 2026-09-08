@@ -5,3 +5,7 @@ server/
 # `rill/extract/extract.sh` and `rill start`, and both hold real telemetry.
 rill/data/
 rill/tmp/
+
+# Python bytecode from rill/extract helpers
+__pycache__/
+*.pyc

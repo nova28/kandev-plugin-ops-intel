@@ -19,7 +19,7 @@ display_name: "Ops Intel"
 description: "Operational cost and efficiency intelligence — spend per model, per build step, and anomaly detection."
 author: "nova28"
 categories: ["tools"]
-repo_url: "https://github.com/kdlbs/kandev-plugin-template"
+repo_url: "https://github.com/nova28/kandev-plugin-ops-intel"
 
 runtime:
   type: binary
