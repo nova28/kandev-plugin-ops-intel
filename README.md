@@ -130,12 +130,38 @@ plugin doesn't reproduce either — it adds what neither can show:
   logic and its known error rate).
 - **Agent time vs. idle time** — nothing upstream measures waiting, which runs ~78% of elapsed time.
 - **Anomaly detection** — nothing upstream does this in any form.
+- **Whether the run happened at all**, sliced by executor, workflow, entry step and model.
+  Kandev surfaces a session's state on the card and nowhere in aggregate, and it records the
+  executor in no queryable form at all. The rate is not evenly distributed — it splits 8x
+  across executors and 3x across entry steps — so a fleet-wide average hides the thing worth
+  fixing. See **Session reliability** below.
 - **The two blind spots**: spend on **deleted cards** (invisible to every per-card total) and
   **external agents** (codex/agy bill to a separate account entirely).
 
 It deliberately shows **no success or completion rate** — Kandev's own success signal counts
 budget-blocked and idle-skipped runs as successes, and mirroring that here would launder a number
 the underlying research exists to distrust.
+
+### Session reliability
+
+The `session_reliability` metrics view counts one thing the store records unambiguously: a
+session the backend **could not run** (`state = 'FAILED'`), with the recorded reason classified
+into an enum inside the extract, where the prose still exists. It counts failures only. The
+complement of `failure_rate` is "did not fail" — which includes cancelled, archived and still
+running — and is deliberately not published as a success rate, for the reason directly above.
+
+What it makes visible that nothing else does:
+
+| Dimension | What today's snapshot says |
+|---|---|
+| Executor | Worktree **2.7%** (57/2124) against the SSH executor's **21.2%** (46/217) |
+| Failure class | The two executors fail differently: SSH is 34/46 `remote executor` (transport), Worktree is `agent silent` (26) plus `workspace prep` (19) |
+| Entry step | Triage **11.5%**, roughly 3x the next-worst step |
+| Never reached a turn | 46 failures never produced a first turn, so they cost nothing measurable and look like idleness |
+
+`failure_class` is populated on **non**-failures too — `card archived` is the largest value in
+the column and is ordinary lifecycle. Filter `is_failed` before reading it as a defect taxonomy;
+`failure_rate` already does.
 
 ## Step analysis in the task composer
 

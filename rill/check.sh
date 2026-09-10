@@ -281,6 +281,50 @@ assert "outcomes coverage gap is deleted-card spend only" "
                (SELECT SUM(cost_subcents)/10000.0 FROM kandev_outcomes) AS b,
                (SELECT SUM(cost_subcents)/10000.0 FROM kandev_cost
                  WHERE cost_attribution <> 'attributed to a card') AS c)"
+
+# EVERY FAILED SESSION MUST LAND IN A NAMED CLASS. `failure_class` is a LIKE ladder over prose
+# Kandev is free to reword, so a message this classifier has never seen falls to 'other' and
+# silently shrinks whichever class it belonged to. That is not hypothetical: the first cut
+# tested only `%ssh:%`, and six remote-transport failures reading `ssh resume: ...` went to
+# 'other' — understating the SSH executor, the exact dimension the model exists to measure.
+# 'other' is legitimate on CANCELLED sessions, where the column holds operator prose
+# ('duplicate of the manual drift run'), so the assertion is scoped to is_failed.
+assert "every failed session lands in a named class" "
+  SELECT COUNT(*) FILTER (WHERE failure_class = 'other') = 0 AS ok,
+         COUNT(*) FILTER (WHERE failure_class <> 'other')::VARCHAR || '/' || COUNT(*)::VARCHAR
+           || ' classified, ' || COUNT(DISTINCT failure_class)::VARCHAR || ' classes' AS detail
+  FROM kandev_session_reliability WHERE is_failed = 'yes'"
+
+# THE EXECUTOR DIMENSION IS A LIVE JOIN, NOT A SNAPSHOT — `task_sessions.executor_snapshot` is
+# empty on every row, so the name comes from `executor_profiles` -> `executors` at extract
+# time. A schema change on either side blanks the column rather than failing, and a dashboard
+# showing one '(unset)' bar is indistinguishable from one showing the truth. 90% is well below
+# today's 93% and well above the 7% a broken join would produce.
+assert "executor resolves for the bulk of sessions" "
+  SELECT COUNT(*) FILTER (WHERE executor <> '(unset)') > COUNT(*) * 0.90 AS ok,
+         COUNT(*) FILTER (WHERE executor <> '(unset)')::VARCHAR || '/' || COUNT(*)::VARCHAR
+           || ' resolved across ' || COUNT(DISTINCT executor)::VARCHAR || ' executors' AS detail
+  FROM kandev_session_reliability"
+
+# THE CACHE SPLIT MUST NOT SILENTLY STOP ARRIVING. Kandev began recording cache reads and
+# writes separately on 2026-08-16; before that only their 20x-mispriced sum exists. The moment
+# a reported event stops carrying the split, any measure built on it quietly reports a partial
+# store as a whole one.
+#
+# SCOPED TO `token_basis = 'reported'`, AND THE EXCLUSION IS A FINDING, NOT A TOLERANCE. Eight
+# post-cutover events carry no split, and all eight are `synthesized` — the adapter sent no
+# usage frame, so Kandev inferred a total from context growth and had nothing to split. A
+# synthesized event CANNOT have one. Writing this as a 99.8% threshold instead would have
+# passed for the wrong reason and gone on passing if reported events started dropping it too.
+assert "reported post-cutover events carry the cache split" "
+  SELECT COUNT(*) FILTER (WHERE tokens_cached_read IS NULL) = 0 AS ok,
+         COUNT(*) FILTER (WHERE tokens_cached_read IS NOT NULL)::VARCHAR || '/' || COUNT(*)::VARCHAR
+           || ' reported events split; write share '
+           || round(100.0 * SUM(tokens_cached_write) / NULLIF(SUM(tokens_cached_read), 0), 1)::VARCHAR
+           || '% of cached input, priced ~20x the read rate' AS detail
+  FROM src_fct_cost_event
+  WHERE CAST(occurred_at AS TIMESTAMP) >= TIMESTAMP '2026-08-17 00:00:00'
+    AND token_basis = 'reported'"
 echo
 fi
 

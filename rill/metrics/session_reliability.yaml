@@ -1,0 +1,158 @@
+# Did the run happen at all, and where does it not. Grain: one agent session.
+#
+# READ `failure_rate` WITH ITS DENOMINATOR VISIBLE. `sessions` is every session in the slice,
+# including CANCELLED and still-RUNNING ones. A slice with four sessions and two failures
+# reads 50% and means nothing; `sessions` is published beside every rate here for that reason.
+#
+# THIS COUNTS FAILURES, NOT SUCCESSES. There is deliberately no success or completion measure
+# — see the model header and CLAUDE.md's domain facts on why Kandev's own success signal is
+# never mirrored in this project. `failure_rate` is the share of sessions the backend could
+# not run. Its complement is not "worked", it is "did not fail", which includes cancellations,
+# archived cards and sessions still open.
+#
+# `failure_class` DESCRIBES ALL SESSIONS, NOT JUST FAILED ONES. `card archived` and
+# `operator stop` are the bulk of the column and are ordinary lifecycle. Filter `is_failed`
+# to 'yes' before reading the class breakdown as a defect taxonomy.
+type: metrics_view
+
+display_name: Session reliability
+description: >-
+  Agent-session failure rate and its recorded reason, sliced by executor, workflow, entry
+  step, model and agent profile. The only view here that measures whether a run started
+  rather than what it cost. Counts failures only — never successes.
+
+model: kandev_session_reliability
+timeseries: session_started_at
+smallest_time_grain: day
+
+dimensions:
+  - name: executor
+    display_name: Executor
+    column: executor
+    description: >-
+      Read from the live executor profile, not a snapshot — `task_sessions.executor_snapshot`
+      is empty on every row. A renamed profile therefore relabels its own history.
+
+  - name: executor_profile
+    display_name: Executor profile
+    column: executor_profile
+
+  - name: failure_class
+    display_name: Failure class
+    column: failure_class
+    description: >-
+      Classified from `task_sessions.error_message` inside the extract, where the prose still
+      exists; only the enum leaves the database. Populated on non-failures too — `card
+      archived` and `operator stop` are lifecycle, not defects. Filter `is_failed` first.
+
+  - name: is_failed
+    display_name: Failed
+    column: is_failed
+
+  - name: session_state
+    display_name: Session state
+    column: session_state
+
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+
+  - name: entry_step
+    display_name: Step the session started in
+    column: entry_step
+    description: >-
+      The step stamped on this session's first turn. `(no turn)` means the session never
+      produced one — which is what most failures look like, not a gap in the data.
+
+  - name: current_step
+    display_name: Step the card sits in now
+    column: current_step
+    description: >-
+      The CARD's step today, not this session's. Slice failures by `entry_step` instead.
+
+  - name: stage_type
+    display_name: Stage type
+    column: stage_type
+
+  - name: model
+    display_name: Model
+    column: model
+    description: The model most of this session's turns ran on. `(no turn)` if it never ran.
+
+  - name: first_model
+    display_name: First model
+    column: first_model
+
+  - name: model_changed_mid_session
+    display_name: Model changed mid-session
+    column: model_changed_mid_session
+
+  - name: agent_profile
+    display_name: Agent profile
+    column: agent_profile
+
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+
+  - name: repository
+    display_name: Repository
+    column: repository
+
+  - name: task_title
+    display_name: Card
+    column: task_title
+
+measures:
+  - name: sessions
+    display_name: Sessions
+    expression: COUNT(*)
+    description: Every session in the slice, whatever its state. The denominator of every rate here.
+
+  - name: failed_sessions
+    display_name: Failed sessions
+    expression: COUNT(*) FILTER (WHERE is_failed = 'yes')
+
+  - name: failure_rate
+    display_name: Failure rate
+    expression: COUNT(*) FILTER (WHERE is_failed = 'yes') * 1.0 / NULLIF(COUNT(*), 0)
+    format_preset: percentage
+    description: Share of sessions the backend could not run. Read `sessions` beside it.
+
+  # A session that fails before its first turn burned setup, not tokens — and is the cheapest
+  # kind of failure to fix and the most expensive to leave, because it looks like idleness.
+  - name: never_started_sessions
+    display_name: Never reached a turn
+    expression: COUNT(*) FILTER (WHERE turns = 0)
+
+  - name: never_started_rate
+    display_name: Never reached a turn (rate)
+    expression: COUNT(*) FILTER (WHERE turns = 0) * 1.0 / NULLIF(COUNT(*), 0)
+    format_preset: percentage
+
+  - name: failed_cost_usd
+    display_name: Cost on failed sessions
+    expression: SUM(cost_subcents) FILTER (WHERE is_failed = 'yes') / 10000.0
+    format_preset: currency_usd
+    description: >-
+      Money spent by sessions that then failed. A floor, not a total — codex/agy bill to a
+      separate account and a session that never reached a turn spent nothing measurable here.
+
+  - name: total_cost_usd
+    display_name: Total cost
+    expression: SUM(cost_subcents) / 10000.0
+    format_preset: currency_usd
+
+  - name: total_turns
+    display_name: Turns
+    expression: SUM(turns)
+
+  - name: agent_hours
+    display_name: Agent hours
+    expression: SUM(agent_seconds) / 3600.0
+    format_preset: humanize
+
+  - name: model_reroute_rate
+    display_name: Mid-session model change
+    expression: COUNT(*) FILTER (WHERE model_changed_mid_session = 'yes') * 1.0 / NULLIF(COUNT(*), 0)
+    format_preset: percentage

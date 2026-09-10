@@ -1,0 +1,103 @@
+# One row per agent session, with WHY it ended beside WHERE it ran.
+#
+# Every other model here measures what work cost. This one measures whether the run happened
+# at all — and the answer is not evenly distributed, which is the whole reason it exists:
+# store-wide the SSH executor fails 21.2% of its sessions against Worktree's 2.7%, and that
+# 8x gap was invisible from every existing surface because `dim_session` carried neither the
+# executor nor the reason.
+#
+# THIS IS NOT KANDEV'S SUCCESS RATE, AND IT IS NOT AN INVERSION OF ONE. CLAUDE.md's domain
+# facts reject Kandev's own success signal because it counts budget-blocked, idle-skipped and
+# user-stopped runs as successes. This model does not count successes at all. It counts one
+# thing the store records unambiguously — `task_sessions.state = 'FAILED'`, a session the
+# backend could not run — and classifies the recorded reason. A CANCELLED session is not a
+# failure here and is not a success either; it is CANCELLED, and it stays that way.
+#
+# `failure_class` IS POPULATED ON NON-FAILURES. `error_message` carries ordinary lifecycle
+# text too — `card archived` is the single largest value in the column and means the card was
+# swept, not that anything broke. Filter on `is_failed` before reading the class distribution,
+# or read the two together. `failure_rate` below already does.
+#
+# STEP ATTRIBUTION IS THE ENTRY STEP, NOT THE CARD'S CURRENT STEP. A session's turns carry
+# `step_at_start` (stamped by the backend at turn creation, post-2026-08-16); the first turn's
+# value is where this session began work. `tasks.workflow_step_id` — published everywhere else
+# as `current_step` — is where the CARD sits NOW, which for a session that failed weeks ago is
+# a different question. Both are here; `entry_step` is the one to slice failures by.
+#
+# A SESSION THAT NEVER PRODUCED A TURN KEEPS ITS ROW. Those are not noise, they are the most
+# interesting rows in the model: `agent silent`, `start race` and most of `remote executor`
+# never reach a first turn, so an INNER JOIN to `fct_turn` would drop precisely the failures
+# this model was built to count. They read `entry_step = '(no turn)'` and `model = '(no turn)'`.
+type: model
+materialize: true
+
+sql: |
+  WITH first_turn AS (
+      SELECT session_id, model, step_at_start
+      FROM (
+          SELECT session_id, model, step_at_start,
+                 ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY turn_index) AS rn
+          FROM src_fct_turn
+      )
+      WHERE rn = 1
+  ),
+  -- The model a session SPENT the most turns on, which is not always the one it started on
+  -- (a rate-limit reroute switches it mid-session). Kept separate from the first turn's model
+  -- so a reroute is visible as the two disagreeing rather than hidden by picking one.
+  dominant_model AS (
+      SELECT session_id, model
+      FROM (
+          SELECT session_id, model, COUNT(*) AS turns,
+                 ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY COUNT(*) DESC, model) AS rn
+          FROM src_fct_turn
+          GROUP BY session_id, model
+      )
+      WHERE rn = 1
+  ),
+  turn_agg AS (
+      SELECT session_id,
+             COUNT(*)                AS turns,
+             SUM(agent_seconds)      AS agent_seconds,
+             SUM(idle_seconds_before) AS idle_seconds
+      FROM src_fct_turn
+      GROUP BY session_id
+  ),
+  cost_agg AS (
+      SELECT session_id, SUM(cost_subcents) AS cost_subcents
+      FROM src_fct_cost_event
+      GROUP BY session_id
+  )
+  SELECT
+      s.session_id,
+      s.task_id,
+      s.session_state,
+      s.is_failed,
+      s.failure_class,
+      s.executor,
+      s.executor_profile,
+      s.agent_profile,
+      s.repository,
+      s.review_status,
+      s.is_primary,
+      COALESCE(ft.step_at_start, '(no turn)') AS entry_step,
+      COALESCE(dm.model,          '(no turn)') AS model,
+      COALESCE(ft.model,          '(no turn)') AS first_model,
+      CASE WHEN COALESCE(dm.model, '') <> COALESCE(ft.model, '') THEN 'yes' ELSE 'no' END AS model_changed_mid_session,
+      t.workspace,
+      t.workflow,
+      t.current_step,
+      t.stage_type,
+      t.task_title,
+      t.task_state,
+      t.is_archived,
+      CAST(s.session_started_at AS TIMESTAMP) AS session_started_at,
+      COALESCE(ta.turns, 0)          AS turns,
+      COALESCE(ta.agent_seconds, 0)  AS agent_seconds,
+      COALESCE(ta.idle_seconds, 0)   AS idle_seconds,
+      COALESCE(ca.cost_subcents, 0)  AS cost_subcents
+  FROM src_dim_session s
+  LEFT JOIN src_dim_task t  ON t.task_id    = s.task_id
+  LEFT JOIN first_turn ft   ON ft.session_id = s.session_id
+  LEFT JOIN dominant_model dm ON dm.session_id = s.session_id
+  LEFT JOIN turn_agg ta     ON ta.session_id = s.session_id
+  LEFT JOIN cost_agg ca     ON ca.session_id = s.session_id

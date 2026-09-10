@@ -194,14 +194,67 @@ FROM session_step_history h;
 -- `cost_subcents` / `tokens_in` / `tokens_out` are carried ONLY so the Rill layer can
 -- expose the discrepancy as a data-quality measure. `tokens_in` excludes cached input and
 -- is wrong by ~5 orders of magnitude (inventory § 3.4). Never aggregate them as volume.
+--
+-- `executor` IS NOT IN `executor_snapshot`. That column is `{}` on all 2,518 rows, so the
+-- name has to come from the live `executor_profiles` -> `executors` join. That makes it a
+-- CURRENT reading, not a snapshot: a renamed profile relabels its history. Accepted, because
+-- the alternative is no executor dimension at all, and the failure rate splits 8x across
+-- this dimension — Worktree 2.7%, the SSH executor 21.2%.
+--
+-- `failure_class` IS CLASSIFIED HERE, NOT DOWNSTREAM, for the same reason `wait_kind` is:
+-- `task_sessions.error_message` is prose — it carries branch names, worktree paths, provider
+-- payloads and shell fragments — so it cannot leave this file. What leaves is the enum.
+--
+-- IT IS NOT A FAILURE FLAG. `error_message` is populated on ordinary lifecycle exits too:
+-- `card archived` (1,091 rows) and `operator stop` are the bulk of the column and are not
+-- defects. Always read it beside `session_state`; `is_failed` is the flag.
 -- ---------------------------------------------------------------------------
 .output data/dim_session.csv
 SELECT
     s.id                                                AS session_id,
     s.task_id                                           AS task_id,
     COALESCE(NULLIF(s.state, ''), '(none)')             AS session_state,
+    CASE WHEN s.state = 'FAILED' THEN 'yes' ELSE 'no' END AS is_failed,
+    CASE
+        WHEN COALESCE(s.error_message, '') = ''                       THEN '(none)'
+        WHEN s.error_message LIKE '%archived%'                        THEN 'card archived'
+        WHEN s.error_message LIKE '%stopped via API%'
+          OR s.error_message LIKE '%stopped by parent%'               THEN 'operator stop'
+        -- Before the workspace branch: a remote resume that fails during environment prep
+        -- still failed because of the transport, and reads as 'ssh' either way.
+        --
+        -- `ssh resume:` DOES NOT MATCH `%ssh:%`. The first cut of this classifier tested only
+        -- the colon form and sent six remote-transport failures — every `ssh resume: missing
+        -- agentctl auth token` and every `agentctl pid not alive` — to 'other', understating
+        -- the executor whose failure rate this model exists to surface. Match `agentctl` too:
+        -- the daemon's name appears in every message of this class and in no other.
+        WHEN s.error_message LIKE '%ssh:%'
+          OR s.error_message LIKE '%ssh resume%'
+          OR s.error_message LIKE '%agentctl%'                        THEN 'remote executor'
+        WHEN s.error_message LIKE '%produced no output%'              THEN 'agent silent'
+        WHEN s.error_message LIKE '%initialize ACP%'
+          OR s.error_message LIKE '%ACP initialize%'                  THEN 'acp handshake'
+        WHEN s.error_message LIKE '%API Error%'
+          OR s.error_message LIKE '%-32603%'                          THEN 'provider api'
+        WHEN s.error_message LIKE '%state changed from CREATED%'      THEN 'start race'
+        -- agentctl answered and refused: a 500 from its start/configure endpoints. Distinct
+        -- from 'remote executor' (never reached it) and from 'provider api' (the model
+        -- refused, not Kandev).
+        WHEN s.error_message LIKE '%request failed with status%'       THEN 'agent control'
+        WHEN s.error_message LIKE '%not ready after resume%'
+          OR s.error_message LIKE '%timeout waiting for agent%'       THEN 'resume timeout'
+        WHEN s.error_message LIKE '%environment preparation%'
+          OR s.error_message LIKE '%workspace reuse is unsafe%'
+          OR s.error_message LIKE '%worktree%'
+          OR s.error_message LIKE '%repository inventory%'
+          OR s.error_message LIKE '%clone URL%'
+          OR s.error_message LIKE '%task environment%'                THEN 'workspace prep'
+        ELSE 'other'
+    END                                                 AS failure_class,
     COALESCE(NULLIF(s.review_status, ''), '(none)')     AS review_status,
     COALESCE(NULLIF(ap.name, ''), '(none)')             AS agent_profile,
+    COALESCE(NULLIF(ep.name, ''), '(unset)')            AS executor_profile,
+    COALESCE(NULLIF(ex.name, ''), '(unset)')            AS executor,
     COALESCE(NULLIF(r.name, ''), '(none)')              AS repository,
     COALESCE(NULLIF(s.base_branch, ''), '(none)')       AS base_branch,
     CASE WHEN s.is_primary = 1 THEN 'yes' ELSE 'no' END AS is_primary,
@@ -215,8 +268,10 @@ SELECT
     s.tokens_in                                         AS rollup_tokens_in_UNTRUSTED,
     s.tokens_out                                        AS rollup_tokens_out
 FROM task_sessions s
-LEFT JOIN agent_profiles ap ON ap.id = s.agent_profile_id
-LEFT JOIN repositories   r  ON r.id  = s.repository_id;
+LEFT JOIN agent_profiles    ap ON ap.id = s.agent_profile_id
+LEFT JOIN repositories      r  ON r.id  = s.repository_id
+LEFT JOIN executor_profiles ep ON ep.id = s.executor_profile_id
+LEFT JOIN executors         ex ON ex.id = ep.executor_id;
 
 
 -- ---------------------------------------------------------------------------
@@ -296,8 +351,29 @@ SELECT
     COALESCE(NULLIF(ap.name, ''), '(none)')           AS agent_profile,
     e.tokens_in                                       AS tokens_in,
     e.tokens_cached_in                                AS tokens_cached_in,
+    -- THE CACHE SPLIT, AND WHY IT SITS BESIDE THE SUM RATHER THAN REPLACING IT.
+    --
+    -- `tokens_cached_in` adds cache READS to cache WRITES, which are priced ~20x apart
+    -- ($0.30 vs $6.00 per million on a 1h write). Kandev began recording the two separately
+    -- on 2026-08-16; 4,982 of 6,125 events carry the split and every event since the cutover
+    -- does. Store-wide the ratio is 39.2B reads against 1.50B writes — a 3.8% write share
+    -- that the summed column prices as if it were all reads.
+    --
+    -- Both are emitted. The sum stays because it is the only cached figure that exists for
+    -- pre-cutover events, and a model that silently switched columns at a date boundary
+    -- would report a step's cost changing when only the recording did. NULL where absent —
+    -- `tokens_cached_read IS NULL` means "not recorded", never "no cache reads".
+    e.tokens_cached_read                              AS tokens_cached_read,
+    e.tokens_cached_write                             AS tokens_cached_write,
     e.tokens_out                                      AS tokens_out,
     e.cost_subcents                                   AS cost_subcents,
+    -- COST PROVENANCE, WHICH THE `token_basis` NOTE BELOW SAYS DOES NOT EXIST. IT DOES NOW.
+    -- CORRECTED 2026-09-11. `cost_source` was added to this table alongside the cache split
+    -- and per-million rates, and it is the honest column that note asks for: it says where
+    -- the dollars came from, not whether the tokens were synthesized. Today it reads
+    -- `provider_reported` on 3,856 events and `unpriced` on 5. Keep both columns — they
+    -- answer different questions and the note below explains why conflating them was a bug.
+    COALESCE(NULLIF(e.cost_source, ''), '(unrecorded)') AS cost_source,
     -- WHAT `estimated` ACTUALLY FLAGS, AND WHAT IT DOES NOT.
     --
     -- This column used to be published as `cost_basis`, with the two values `estimated`
