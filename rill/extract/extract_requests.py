@@ -45,10 +45,16 @@ import csv, glob, json, os, sqlite3, sys
 #
 # CLAUDE_TRANSCRIPTS overrides the default and takes an os.pathsep-separated LIST, so a caller
 # can still pin one root (tests do) without losing the ability to name several.
-_DEFAULT_TRANSCRIPT_ROOTS = [
-    os.path.expanduser("~/.claude/projects"),
-    os.path.expanduser("~/.claude-work/projects"),
-]
+#
+# DISCOVERED, NOT LISTED. Found 2026-09-17: from 2026-09-01 Kandev launched agents with a third
+# config dir, ~/.claude-kandev, and a hard-coded two-root list never saw it. Every Kandev request
+# after that date was missing, not merely unattributed — ~447K assistant records — so the
+# request-to-session join rate read 53% in W36 and 0% in W37 and W38 while the fleet was busier
+# than ever. The failure was silent in exactly the way the note above warns about. So every
+# ~/.claude*/projects directory is scanned, and main() prints a per-root count, so a new config
+# dir shows up as a new line in the extract log rather than as a hole in the dashboard.
+_DEFAULT_TRANSCRIPT_ROOTS = sorted(
+    glob.glob(os.path.expanduser("~/.claude*/projects")))
 TRANSCRIPT_ROOTS = [
     p for p in (
         os.environ["CLAUDE_TRANSCRIPTS"].split(os.pathsep)
@@ -202,8 +208,13 @@ def main():
     # globally sorted, so a file's provenance stays adjacent in the scan order; nothing
     # downstream depends on cross-root ordering because rows carry their own timestamps.
     files = []
+    root_of = {}
     for root in TRANSCRIPT_ROOTS:
-        files.extend(sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)))
+        found = sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
+        files.extend(found)
+        for f in found:
+            root_of[f] = root
+    per_root = {root: 0 for root in TRANSCRIPT_ROOTS}
     for f in files:
         # The directory above `subagents/` is the PARENT session id. This is the only link
         # between a subagent's spend and the step that caused it.
@@ -213,6 +224,13 @@ def main():
             i = parts.index("subagents")
             if i >= 1:
                 parent_sid = parts[i - 1]
+        # A subagent's records carry the PARENT's `sessionId`, so `transcript_session_id` cannot
+        # tell two concurrent subagents apart, or a subagent from its parent: one stream then
+        # interleaves contexts of very different sizes, and a context-size drop at every
+        # main/subagent switch reads as a compaction. The file stem is the subagent's own
+        # identity. Emitted as a separate column so `transcript_session_id` keeps the meaning
+        # kandev_requests.yaml partitions on.
+        own_transcript = os.path.splitext(os.path.basename(f))[0] if parent_sid else ""
         for line in open(f, errors="replace"):
             try:
                 d = json.loads(line)
@@ -225,6 +243,7 @@ def main():
                 if d.get("isSidechain"):
                     sidechain_reqs.add(rid)
                 if rid not in reqs:
+                    per_root[root_of[f]] += 1
                     u = msg.get("usage") or {}
                     cc = u.get("cache_creation") or {}
                     cwd = os.path.normpath(d.get("cwd") or "")
@@ -255,6 +274,7 @@ def main():
                         "tokens_output": u.get("output_tokens", 0) or 0,
                         # The whole prefix this request re-sent. THE actionable number.
                         "context_tokens": read + w1 + w5 + inp,
+                        "agent_transcript_id": own_transcript or d.get("sessionId", ""),
                     }
                 for blk in msg.get("content") or []:
                     if isinstance(blk, dict) and blk.get("type") == "tool_use":
@@ -305,7 +325,10 @@ def main():
         cols = ["request_id", "occurred_at", "session_id", "task_id", "transcript_session_id",
                 "parent_transcript_session_id", "model", "effort", "agent_kind",
                 "tokens_read", "tokens_write_1h", "tokens_write_5m", "tokens_input",
-                "tokens_output", "context_tokens"]
+                "tokens_output", "context_tokens",
+                # Appended last: src_fct_request loads verbatim and every consumer selects
+                # columns by name, so a trailing column changes nothing downstream.
+                "agent_transcript_id"]
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
         for r in reqs.values():
@@ -321,6 +344,8 @@ def main():
 
     matched = sum(1 for r in reqs.values() if r["task_id"])
     subs = sum(1 for r in reqs.values() if r["agent_kind"] == "subagent")
+    for root in TRANSCRIPT_ROOTS:
+        print(f"    root {root}  {per_root.get(root, 0):8d} requests")
     print(f"    fct_request.csv        {len(reqs):8d} rows "
           f"({matched} joined to a card, {subs} subagent, {adopted} adopted from parent)")
     if shared_paths:
