@@ -1,0 +1,12 @@
+# Raw extract, loaded verbatim. All derivation happens downstream in the kandev_* models,
+# so this file never needs editing when the analysis changes.
+#
+# OPTIONAL SOURCE. Produced by extract-telemetry.sql from the claude-telemetry-collector
+# store, which another host may not run at all. extract.sh promotes it when present and
+# omits it without complaint when not, so this model reconciles to zero rows rather than
+# failing when the second store is absent.
+type: model
+
+connector: local_file
+path: data/fct_agent_session.csv
+invalidate_on_change: true

@@ -221,6 +221,26 @@ assert "every session binds to an environment" "
            || COUNT(*) FILTER (WHERE config_epoch = '(unbound)')::VARCHAR || ' unbound' AS detail
   FROM kandev_config_epoch"
 
+# A WORKSPACE PATH IS NOT A KEY, AND THE COST OF FORGETTING THAT IS SILENT MULTIPLICATION.
+# The agent-telemetry source resolves a Claude Code session to a card by matching the agent's
+# cwd against task_sessions.workspace_path. Kandev reuses a worktree across every session that
+# runs in it — 254 of 1106 paths carry more than one session, the worst carries 40 — so joining
+# on the path directly emits one row per (agent session x Kandev session) pair. It did exactly
+# that on first write: 2223 agent sessions became 10893 rows and every dollar was counted ~4.9
+# times. Nothing failed; the totals were simply wrong, and wrong in the direction that makes a
+# dashboard look more impressive.
+#
+# extract-telemetry.sql collapses the Kandev side before joining. This is the assertion that
+# keeps it collapsed. It is cheap and it degrades correctly: a host with no collector has zero
+# rows and zero distinct sessions, which passes.
+assert "agent telemetry is one row per agent session" "
+  SELECT COUNT(*) = COUNT(DISTINCT agent_session_id) AS ok,
+         COUNT(*)::VARCHAR || ' rows, '
+           || COUNT(DISTINCT agent_session_id)::VARCHAR || ' distinct agent sessions, '
+           || COUNT(*) FILTER (WHERE kandev_task_count > 1)::VARCHAR
+           || ' on shared checkouts (task_id deliberately NULL)' AS detail
+  FROM kandev_agent_economics"
+
 # THE DUPLICATED BOUNDARY TABLE MUST STAY IN STEP, AND THE FALLBACK KEY MUST STAY A FALLBACK.
 # The boundaries live in two files (see the header of kandev_config_epoch.yaml). This is the
 # assertion that makes that duplication safe: on every session both keys reach, they must agree —

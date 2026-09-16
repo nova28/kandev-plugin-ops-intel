@@ -1,0 +1,40 @@
+# One row per agent session: how the run BEHAVED, as opposed to what it cost.
+#
+# The source arrives long (one row per session × event type) because the event vocabulary is
+# Claude Code's and grows without warning — 25 distinct names on the 2026-09-14 extract, and a
+# CLI release can add another. Pivoting to a fixed set of columns HERE rather than in the
+# extract means a new event name lands in the CSV and is simply not yet surfaced, instead of
+# breaking a column contract downstream.
+#
+# `compaction_count` is the column to read first. No coding-agent CLI emits context-window
+# utilisation — not Claude Code, not Codex, not Gemini, and the OTel GenAI conventions define
+# no attribute for it — so a compaction is the ONLY observable evidence that a session's
+# context filled up. A step whose sessions compact repeatedly is a step whose prompt is
+# dragging too much context, and this is the only place that shows.
+#
+# `api_retries_exhausted_count` is the other one worth watching: it counts turns that gave up
+# after exhausting retries, which surfaces in Kandev only as a card that mysteriously stopped.
+type: model
+
+sql: >
+  SELECT
+      e.session_id                                    AS agent_session_id,
+      e.task_id,
+      e.workspace_kind,
+      e.is_kandev_task,
+      MAX(e.last_date)                                AS last_date,
+
+      SUM(CASE WHEN e.event_name='tool_result'            THEN e.event_count ELSE 0 END) AS tool_call_count,
+      SUM(CASE WHEN e.event_name='tool_decision'          THEN e.event_count ELSE 0 END) AS tool_decision_count,
+      SUM(CASE WHEN e.event_name='subagent_completed'     THEN e.event_count ELSE 0 END) AS subagent_count,
+      SUM(CASE WHEN e.event_name='compaction'             THEN e.event_count ELSE 0 END) AS compaction_count,
+      SUM(CASE WHEN e.event_name='skill_activated'        THEN e.event_count ELSE 0 END) AS skill_activation_count,
+      SUM(CASE WHEN e.event_name='mcp_server_connection'  THEN e.event_count ELSE 0 END) AS mcp_connection_count,
+      SUM(CASE WHEN e.event_name='user_prompt'            THEN e.event_count ELSE 0 END) AS user_prompt_count,
+      SUM(CASE WHEN e.event_name='api_request'            THEN e.event_count ELSE 0 END) AS api_request_count,
+      SUM(CASE WHEN e.event_name='api_error'              THEN e.event_count ELSE 0 END) AS api_error_count,
+      SUM(CASE WHEN e.event_name='api_refusal'            THEN e.event_count ELSE 0 END) AS api_refusal_count,
+      SUM(CASE WHEN e.event_name='api_retries_exhausted'  THEN e.event_count ELSE 0 END) AS api_retries_exhausted_count,
+      SUM(CASE WHEN e.event_name='internal_error'         THEN e.event_count ELSE 0 END) AS internal_error_count
+  FROM src_fct_agent_session_event e
+  GROUP BY e.session_id, e.task_id, e.workspace_kind, e.is_kandev_task

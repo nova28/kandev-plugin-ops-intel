@@ -1,0 +1,81 @@
+# One row per Claude Code agent session, carrying the card it ran for.
+#
+# WHAT THIS ADDS THAT NOTHING ELSE HERE CAN. Every other model in this project is derived from
+# Kandev's own store, which records what the ORCHESTRATOR saw: a turn, its rolled-up usage, the
+# step it happened under. This model is derived from what the AGENT saw, and three of its
+# columns have no equivalent anywhere in the Kandev store at all:
+#
+#   * `cost_usd_subagent` — spend that went to delegated subagents rather than the main loop.
+#     Kandev bills a turn as one number; the agent knows the turn spawned children and what
+#     they cost. A step whose prompt delegates heavily is invisible in kandev_cost and obvious
+#     here.
+#   * `tokens_cache_read` split from `tokens_input` — measured at 60.6B against 65.8M fresh
+#     input on the 2026-09-14 extract, a ratio near 921:1. Cache reads ARE the bill, and the
+#     lever on them is context size, not model choice. `kandev_cost` cannot see the split.
+#   * `compaction_count` (via kandev_agent_behavior) — the only observable evidence that a
+#     context window filled, since no CLI emits a context-utilisation signal of any kind.
+#
+# GRAIN IS ONE ROW PER AGENT SESSION, and it is guarded upstream. A Kandev worktree path is
+# reused by every session that runs in it, so resolving the path to a card has to collapse the
+# Kandev side first — see extract-telemetry.sql's v_workspace. `kandev_task_count` carries the
+# ambiguity forward: 0 means the session ran outside any Kandev worktree, 1 means task_id is
+# trustworthy, and >1 means several tasks shared that checkout and task_id is deliberately NULL.
+#
+# THE THREE QUERY_SOURCE BUCKETS DO NOT SUM TO THE TOTAL, and that is data, not a bug.
+# `query_source` is absent on roughly a third of cost records — older rows predate the
+# attribute. `cost_usd_unattributed` carries the remainder explicitly rather than letting it
+# vanish into a percentage that silently fails to reach 100.
+type: model
+
+sql: >
+  SELECT
+      a.session_id                                    AS agent_session_id,
+      a.task_id,
+      a.kandev_task_count,
+      a.workspace_kind,
+      a.is_kandev_task,
+      a.first_date,
+      a.last_date,
+      -- Real bounds, for attributing a session to the step it actually ran in rather than to
+      -- wherever its card has since moved. epoch_ns -> TIMESTAMP.
+      to_timestamp(a.first_ts_ns / 1000000000.0)      AS session_started_at,
+      to_timestamp(a.last_ts_ns  / 1000000000.0)      AS session_ended_at,
+      CAST(a.last_date AS TIMESTAMP)                  AS observed_at,
+
+      t.workspace,
+      t.workflow,
+      t.current_step,
+      t.stage_type,
+      t.task_state,
+
+      a.cost_usd,
+      a.cost_usd_main,
+      a.cost_usd_subagent,
+      a.cost_usd_auxiliary,
+      a.cost_usd
+        - a.cost_usd_main
+        - a.cost_usd_subagent
+        - a.cost_usd_auxiliary                        AS cost_usd_unattributed,
+
+      a.tokens_input,
+      a.tokens_output,
+      a.tokens_cache_read,
+      a.tokens_cache_creation,
+      a.tokens_input + a.tokens_cache_read
+        + a.tokens_cache_creation                     AS tokens_context_total,
+
+      a.lines_of_code,
+      a.active_time_seconds,
+
+      COALESCE(b.tool_call_count, 0)             AS tool_call_count,
+      COALESCE(b.subagent_count, 0)              AS subagent_count,
+      COALESCE(b.compaction_count, 0)            AS compaction_count,
+      COALESCE(b.skill_activation_count, 0)      AS skill_activation_count,
+      COALESCE(b.mcp_connection_count, 0)        AS mcp_connection_count,
+      COALESCE(b.user_prompt_count, 0)           AS user_prompt_count,
+      COALESCE(b.api_request_count, 0)           AS api_request_count,
+      COALESCE(b.api_error_count, 0)             AS api_error_count,
+      COALESCE(b.api_retries_exhausted_count, 0) AS api_retries_exhausted_count
+  FROM src_fct_agent_session a
+  LEFT JOIN src_dim_task t ON t.task_id = a.task_id
+  LEFT JOIN kandev_agent_behavior b ON b.agent_session_id = a.session_id

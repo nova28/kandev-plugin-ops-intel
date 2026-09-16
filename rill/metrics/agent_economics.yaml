@@ -1,0 +1,147 @@
+# What the agent saw. Grain: one Claude Code session, carrying the Kandev card it ran for.
+#
+# Every other metrics view here is built from Kandev's own store. This one is built from the
+# agent's OTLP telemetry, and exists for the three questions that store cannot answer:
+# where delegated work sent the money, how much of the bill is context re-reads, and whether
+# a step's sessions are compacting.
+#
+# `cache_read_share` is the measure that earns this view its keep. Ranking steps by total
+# spend tells you which step you ran most; ranking by how much of that spend was re-reading
+# context tells you which step is dragging a context window it does not need — and those two
+# orderings disagree. Cache reads outnumbered fresh input 921:1 on the extract this view was
+# written against, so almost every dollar here is a re-read, not new thinking.
+type: metrics_view
+
+display_name: Agent economics
+description: >-
+  Cost, delegation and context behaviour per agent session, sourced from the
+  claude-telemetry-collector OTLP store rather than from Kandev. Optional: a host running no
+  collector reconciles this view to zero rows. Costs here are Claude Code's own reported
+  figures and will NOT reconcile exactly against Cost & tokens, which meters Kandev's
+  office_cost_events — the two count different things at different grains, and a discrepancy
+  is expected rather than a fault.
+
+model: kandev_agent_economics
+timeseries: observed_at
+smallest_time_grain: day
+
+dimensions:
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  # The card's CURRENT step, not the step it was in when the session ran — dim_task carries
+  # no history. Read it as "where the card sits now", never as "where this spend happened".
+  - name: current_step
+    display_name: Step (card's current)
+    column: current_step
+  - name: stage_type
+    display_name: Stage
+    column: stage_type
+  - name: task_state
+    display_name: Task state
+    column: task_state
+  # 1 only when the session ran in a ~/.kandev/tasks/ worktree, which nothing but Kandev uses.
+  # Filter to 1 for anything that claims to describe Kandev.
+  - name: is_kandev_task
+    display_name: Kandev task session
+    column: is_kandev_task
+  # Why a session did or did not qualify. 'task_worktree' is proof; 'shared_checkout' means the
+  # session merely ran in a directory Kandev's Local executor also uses — which is where you
+  # work by hand, so those sessions are mostly NOT Kandev's; 'none' is everything else.
+  - name: workspace_kind
+    display_name: Workspace kind
+    column: workspace_kind
+  - name: task_id
+    display_name: Task
+    column: task_id
+
+measures:
+  - name: total_cost_usd
+    display_name: Cost (USD)
+    expression: SUM(cost_usd)
+    format_d3: "$,.2f"
+
+  - name: subagent_cost_usd
+    display_name: Subagent cost (USD)
+    expression: SUM(cost_usd_subagent)
+    format_d3: "$,.2f"
+    description: >-
+      Spend that went to delegated subagents rather than the main loop. Kandev bills a turn
+      as a single number and cannot separate these.
+
+  - name: subagent_cost_share
+    display_name: Subagent share
+    expression: SUM(cost_usd_subagent) / NULLIF(SUM(cost_usd), 0)
+    format_d3: ".1%"
+
+  - name: unattributed_cost_usd
+    display_name: Cost with no query_source (USD)
+    expression: SUM(cost_usd_unattributed)
+    format_d3: "$,.2f"
+    description: >-
+      Cost records carrying no query_source attribute — mostly rows predating it. Surfaced
+      rather than hidden so the main/subagent/auxiliary split is visibly incomplete instead
+      of quietly failing to sum to the total.
+
+  - name: cache_read_share
+    display_name: Context re-read share
+    expression: SUM(tokens_cache_read) / NULLIF(SUM(tokens_input + tokens_cache_read + tokens_cache_creation), 0)
+    format_d3: ".2%"
+    description: >-
+      Cache-read tokens as a fraction of all context tokens. High is normal and good for
+      caching, but it also says the bill is dominated by context SIZE, which is a prompt
+      problem rather than a model-choice one.
+
+  - name: total_cache_read_tokens
+    display_name: Cache-read tokens
+    expression: SUM(tokens_cache_read)
+    format_preset: humanize
+
+  - name: total_output_tokens
+    display_name: Output tokens
+    expression: SUM(tokens_output)
+    format_preset: humanize
+
+  - name: session_count
+    display_name: Agent sessions
+    expression: COUNT(*)
+
+  - name: compaction_count
+    display_name: Compactions
+    expression: SUM(compaction_count)
+    description: >-
+      The only observable evidence a context window filled. No coding-agent CLI emits a
+      context-utilisation signal and the OTel GenAI conventions define no attribute for one,
+      so this is the whole of what is knowable about context pressure.
+
+  - name: compactions_per_session
+    display_name: Compactions / session
+    expression: SUM(compaction_count) * 1.0 / NULLIF(COUNT(*), 0)
+    format_d3: ".2f"
+
+  - name: subagents_spawned
+    display_name: Subagents spawned
+    expression: SUM(subagent_count)
+
+  - name: tool_call_count
+    display_name: Tool calls
+    expression: SUM(tool_call_count)
+
+  - name: api_error_count
+    display_name: API errors
+    expression: SUM(api_error_count)
+
+  - name: retries_exhausted
+    display_name: Retries exhausted
+    expression: SUM(api_retries_exhausted_count)
+    description: >-
+      Turns that gave up after exhausting retries. In Kandev these surface only as a card
+      that stopped for no stated reason.
+
+  - name: cost_per_session
+    display_name: Cost / session
+    expression: SUM(cost_usd) / NULLIF(COUNT(*), 0)
+    format_d3: "$,.2f"

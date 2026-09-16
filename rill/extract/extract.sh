@@ -71,11 +71,64 @@ if ! python3 "$PROJECT_DIR/extract/extract_requests.py" "$WORK/data"; then
     rm -f "$WORK/data/fct_request.csv" "$WORK/data/fct_tool_call.csv"
 fi
 
+# THE THIRD SOURCE. The claude-telemetry-collector store holds what the AGENT saw, which is
+# neither what Kandev recorded nor what the transcripts carry: cost split by query_source
+# (main / subagent / auxiliary), the cache token split, and the only compaction and
+# skill-activation signals Claude Code emits at all. See extract-telemetry.sql's header for
+# the join key and why it needs guarding.
+#
+# Optional on the same terms as the transcript source above: another host may run no
+# collector, or run a different agent entirely. It is read live rather than snapshotted —
+# a VACUUM INTO of a 5.7 GB store on every refresh would dominate a cadence measured in
+# minutes — so it opens read-only with a busy timeout and contends politely with the
+# collector's own writes.
+echo "==> extracting agent telemetry (OTLP collector)"
+TELEMETRY_DB="${TELEMETRY_DB:-$HOME/Library/Application Support/claude-telemetry/metrics.db}"
+TELEMETRY_CSVS=(fct_agent_session.csv fct_agent_session_event.csv fct_agent_span.csv)
+if [[ -f "$TELEMETRY_DB" ]]; then
+    # A file: URI is the only way to ask for mode=ro, and the default path contains spaces.
+    TELEMETRY_URI="file:${TELEMETRY_DB// /%20}?mode=ro"
+    # `.read` rather than a stdin redirect: sqlite3 given ANY command argument executes only
+    # the arguments and ignores stdin, so `sqlite3 db ".timeout N" < file.sql` runs the timeout,
+    # reads nothing, and exits 0. That failure is completely silent — it produced no CSVs and no
+    # error on the first run of this block.
+    #
+    # Retried, because one busy timeout is not enough: the store runs in rollback-journal mode, so
+    # a reader is refused while the collector holds its write lock, and the collector commits
+    # continuously. A single attempt hit `database is locked (5)` on 2026-09-16 and the telemetry
+    # tables silently stayed at 2026-09-15. Partial CSVs are discarded per attempt so a retry
+    # never mixes rows from two reads.
+    telemetry_ok=0
+    for attempt in 1 2 3; do
+        if ( cd "$WORK" && sqlite3 "$TELEMETRY_URI" \
+                 ".timeout 30000" \
+                 ".read $PROJECT_DIR/extract/extract-telemetry.sql" ); then
+            telemetry_ok=1
+            break
+        fi
+        for f in "${TELEMETRY_CSVS[@]}"; do rm -f "$WORK/data/$f"; done
+        if [[ $attempt -lt 3 ]]; then
+            echo "    telemetry extract failed (attempt $attempt/3) — retrying in 20s" >&2
+            sleep 20
+        fi
+    done
+    if [[ $telemetry_ok -eq 0 ]]; then
+        echo "    warning: telemetry extract failed after 3 attempts — promoting the rest without it" >&2
+    fi
+    # Exit status is not enough, per the above: assert the files exist. An optional source may
+    # legitimately be absent, but it must not be absent while claiming to have succeeded.
+    for f in "${TELEMETRY_CSVS[@]}"; do
+        [[ -s "$WORK/data/$f" ]] || echo "    warning: telemetry extract produced no $f" >&2
+    done
+else
+    echo "    no collector store at $TELEMETRY_DB — skipping"
+fi
+
 # Promote only if every expected file arrived. A missing file here means extract.sql
 # failed partway, and a partial promotion is the failure mode worth engineering against.
 EXPECTED=(dim_task.csv dim_workflow_step.csv fct_step_transition.csv dim_session.csv fct_turn.csv fct_cost_event.csv fct_pull_request.csv fct_git_snapshot.csv fct_plan_revision.csv fct_message.csv _manifest.csv)
 # Promoted when present, absent without complaint when not — see above.
-OPTIONAL=(fct_request.csv fct_tool_call.csv)
+OPTIONAL=(fct_request.csv fct_tool_call.csv fct_agent_session.csv fct_agent_session_event.csv fct_agent_span.csv)
 for f in "${EXPECTED[@]}"; do
     [[ -s "$WORK/data/$f" ]] || { echo "error: extract produced no $f — not promoting" >&2; exit 1; }
 done
