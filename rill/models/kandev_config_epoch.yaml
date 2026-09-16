@@ -28,6 +28,17 @@
 # 08-19, three days in which config moved with no environment minted. That window is labelled
 # rather than folded into a neighbour, because a row inside it is not evidence for either side.
 #
+# IT WENT STALE AGAIN, AND FOR LONGER — 2026-09-13. This table stopped at ENV-008 while
+# ENVIRONMENTS.md had already minted ENV-009 (09-01 06:33) and ENV-010 (09-02 00:14), so
+# **twelve days of requests were labelled `ENV-008 ceiling 300K` when they ran ENV-009/ENV-010
+# at a 400,000 ceiling.** `check.sh`'s "declared ceiling is an observed ceiling" assertion was
+# FAILING that whole time at **17.1%** against a 1% threshold — the control fired and nobody
+# read it. The lesson is not "keep this table fresh", which the paragraph above already said and
+# which did not work twice. It is that a hand-maintained boundary table needs its staleness to be
+# an assertion too: nothing here compares the last boundary against the newest id upstream, so
+# a missing id looks identical to a quiet fleet. See ENV-009/ENV-010 below and the same note in
+# `kandev_requests.yaml`.
+#
 # ---------------------------------------------------------------------------------------------
 # TWO BASES, AND WHY THE WEAKER ONE IS CARRIED RATHER THAN DROPPED.
 #
@@ -98,7 +109,10 @@ sql: |
               WHEN b.epoch_at < TIMESTAMP '2026-08-16 15:41' THEN 'ENV-005 ceiling 300K'
               WHEN b.epoch_at < TIMESTAMP '2026-08-19 09:03' THEN 'ENV-005 drifted'
               WHEN b.epoch_at < TIMESTAMP '2026-08-21 08:39' THEN 'ENV-007 ceiling 300K'
-              ELSE                                                'ENV-008 ceiling 300K both profiles'
+              WHEN b.epoch_at < TIMESTAMP '2026-09-01 06:33' THEN 'ENV-008 ceiling 300K both profiles'
+              WHEN b.epoch_at < TIMESTAMP '2026-09-01 07:00' THEN 'ENV-009 lean Sonnet, ceiling 300K'
+              WHEN b.epoch_at < TIMESTAMP '2026-09-02 00:14' THEN 'ENV-009 ceiling raised 400K - CONFOUNDED'
+              ELSE                                                'ENV-010 lean fleet ceiling 400K'
           END AS config_epoch,
 
           CASE
@@ -108,9 +122,27 @@ sql: |
               WHEN b.epoch_at < TIMESTAMP '2026-08-14 00:00' THEN '300K'
               WHEN b.epoch_at < TIMESTAMP '2026-08-14 03:48' THEN 'invalid'
               WHEN b.epoch_at < TIMESTAMP '2026-08-14 07:58' THEN 'none'
-              WHEN b.epoch_at < TIMESTAMP '2026-08-16 15:41' THEN '300K'
+              -- ENV-005: the ceiling existed on Sonnet ONLY. The Opus profile gained one at
+              -- ENV-008 ('300000 — new' in that id's profile table), so Opus ran a 1M window here
+              -- and legitimately exceeds 300K. A scalar cannot say 'per profile', so this value
+              -- says which profile it describes and check.sh's '= 300K' test skips the epoch
+              -- rather than flagging documented-correct Opus behaviour as a breach.
+              WHEN b.epoch_at < TIMESTAMP '2026-08-16 15:41' THEN '300K Sonnet only'
               WHEN b.epoch_at < TIMESTAMP '2026-08-19 09:03' THEN 'unrecorded'
-              ELSE                                                '300K'
+              -- ENV-006/ENV-007 carried the same Sonnet-only bite forward; ENV-008 is the id that
+              -- closes it. Measured 2026-09-13 on attributed main-agent requests: ENV-007 1.5%
+              -- over 300K (Opus unbounded), ENV-008 0.0% of 51,558 (both profiles bounded).
+              WHEN b.epoch_at < TIMESTAMP '2026-08-21 08:39' THEN '300K Sonnet only'
+              -- ENV-008 and the first 27 minutes of ENV-009 ran 300K on BOTH profiles.
+              WHEN b.epoch_at < TIMESTAMP '2026-09-01 07:00' THEN '300K'
+              -- The ceiling rose to 400,000 at 2026-09-01T07:00, 27 minutes into ENV-009, and every
+              -- id from ENV-006 on still RECORDED 300000. This column follows the OBSERVED ceiling,
+              -- per the ENV-002 precedent above ('a declared boundary is not an observed one') and
+              -- because check.sh asserts this value against behaviour. Caveat: under ENV-010 the
+              -- ceiling is per-profile — 400K on Sonnet and Opus, 300K on Opus-Low and Fable, unset
+              -- on Haiku — and this model is session-grain with no profile column, so '400K' is
+              -- correct for the two profiles carrying almost all requests and wrong for the tail.
+              ELSE                                                '400K'
           END AS ceiling_declared,
 
           -- The same CASE over the OTHER key, so `check.sh` can compare the two derivations
@@ -125,7 +157,10 @@ sql: |
               WHEN b.transcript_at < TIMESTAMP '2026-08-16 15:41' THEN 'ENV-005 ceiling 300K'
               WHEN b.transcript_at < TIMESTAMP '2026-08-19 09:03' THEN 'ENV-005 drifted'
               WHEN b.transcript_at < TIMESTAMP '2026-08-21 08:39' THEN 'ENV-007 ceiling 300K'
-              ELSE                                                'ENV-008 ceiling 300K both profiles'
+              WHEN b.transcript_at < TIMESTAMP '2026-09-01 06:33' THEN 'ENV-008 ceiling 300K both profiles'
+              WHEN b.transcript_at < TIMESTAMP '2026-09-01 07:00' THEN 'ENV-009 lean Sonnet, ceiling 300K'
+              WHEN b.transcript_at < TIMESTAMP '2026-09-02 00:14' THEN 'ENV-009 ceiling raised 400K - CONFOUNDED'
+              ELSE                                                'ENV-010 lean fleet ceiling 400K'
           END AS epoch_by_transcript,
 
           CASE
@@ -138,7 +173,10 @@ sql: |
               WHEN b.session_at < TIMESTAMP '2026-08-16 15:41' THEN 'ENV-005 ceiling 300K'
               WHEN b.session_at < TIMESTAMP '2026-08-19 09:03' THEN 'ENV-005 drifted'
               WHEN b.session_at < TIMESTAMP '2026-08-21 08:39' THEN 'ENV-007 ceiling 300K'
-              ELSE                                                'ENV-008 ceiling 300K both profiles'
+              WHEN b.session_at < TIMESTAMP '2026-09-01 06:33' THEN 'ENV-008 ceiling 300K both profiles'
+              WHEN b.session_at < TIMESTAMP '2026-09-01 07:00' THEN 'ENV-009 lean Sonnet, ceiling 300K'
+              WHEN b.session_at < TIMESTAMP '2026-09-02 00:14' THEN 'ENV-009 ceiling raised 400K - CONFOUNDED'
+              ELSE                                                'ENV-010 lean fleet ceiling 400K'
           END AS epoch_by_session_start
       FROM bound b
   )

@@ -52,8 +52,53 @@ print(rows[0]["ok"] if rows else "__missing__")' <<<"$out" 2>/dev/null) || [[ "$
     fi
 }
 
+# Same reporting contract as assert(), for a check whose truth lives in files rather than in Rill.
+assert_local() { # assert_local <name> <ok: 0|1> <detail>
+    if [[ "$2" == "0" ]]; then printf '  PASS  %-46s %s\n' "$1" "$3"
+    else                       printf '  FAIL  %-46s %s\n' "$1" "$3"; FAILED=1; fi
+}
+
 if [[ "${1:-}" != "--baseline" ]]; then
 echo "== integrity assertions =="
+
+# THE BOUNDARY TABLE MUST KNOW ABOUT EVERY ENVIRONMENT THAT EXISTS.
+# `kandev_config_epoch` labels each session by a boundary table transcribed BY HAND from
+# ENVIRONMENTS.md. Nothing downstream can tell a missing boundary from a quiet fleet: a newly
+# minted id simply lands in the previous bucket and every figure keeps reconciling, so the
+# store stays internally consistent while describing the wrong machine.
+#
+# It has now happened twice. ENV-005 drifted for three days in August. Then ENV-009 (09-01) and
+# ENV-010 (09-02) were minted while this table still ended at ENV-008, and **twelve days of
+# requests were labelled `ENV-008 ceiling 300K` while running at 400,000** — caught on 09-13 only
+# because someone read the SQL. This is the assertion that makes the next one cost minutes.
+#
+# Deliberately a string check, not a timestamp comparison: the failure mode is an id that exists
+# upstream and is absent here, and that is exactly what this tests. It needs no Rill.
+ENVDOC="../../the operator's environments doc"
+EPOCHMODEL="models/kandev_config_epoch.yaml"
+if [[ -r "$ENVDOC" && -r "$EPOCHMODEL" ]]; then
+    # Only real CASE branches count. Prose mentioning an id must NOT satisfy this — the header of
+    # kandev_config_epoch.yaml discusses ENV-009 and ENV-010 by name, so grepping the whole file
+    # would let a deleted branch hide behind its own postmortem. (Found by negative-testing this
+    # assertion on 2026-09-14: it passed with the ENV-010 branch removed.)
+    branches=$(grep -vE "^[[:space:]]*(--|#)" "$EPOCHMODEL" | grep -E "THEN[[:space:]]*'|ELSE[[:space:]]*'")
+    # An id legitimately has no boundary when it was never separately OBSERVED, and that is a
+    # decision worth naming rather than a gap worth tolerating. ENV-006 was minted and superseded
+    # within hours with zero rows collected against it, so it is folded into ENV-007's branch;
+    # ENVIRONMENTS.md records that. Anything not on this list must have a branch.
+    FOLDED="ENV-006"
+    newest_env=$(grep -oE '^## ENV-[0-9]{3}' "$ENVDOC" | grep -oE 'ENV-[0-9]{3}' | sort -u | tail -1)
+    missing=$(for e in $(grep -oE '^## ENV-[0-9]{3}' "$ENVDOC" | grep -oE 'ENV-[0-9]{3}' | sort -u); do
+                  grep -qw "$e" <<<"$FOLDED" && continue
+                  grep -q "$e" <<<"$branches" || echo "$e"; done | tr '\n' ' ')
+    if [[ -z "$missing" ]]; then
+        assert_local "boundary table knows every environment" 0 "newest is $newest_env, all ids present (folded: $FOLDED)"
+    else
+        assert_local "boundary table knows every environment" 1 "MISSING from $EPOCHMODEL: ${missing% } (newest upstream is $newest_env)"
+    fi
+else
+    assert_local "boundary table knows every environment" 1 "cannot read $ENVDOC or $EPOCHMODEL from $(pwd)"
+fi
 
 # The code-output delta must reconstruct each session's final cumulative diffstat. A session may
 # legitimately differ ONLY if it rewound (rebase/reset drops the cumulative figure). A session
@@ -102,10 +147,21 @@ assert "wait classifier is not leading-token matching" "
 #   n_step_decision_rows = 0  the human-gate metric is genuinely unmeasurable. The day this
 #                             fires, it stops being unmeasurable — that is a good failure,
 #                             and several documents claim otherwise.
+# `workflow_step_decisions` IS NO LONGER EMPTY, and the assertion did its job by saying so.
+# It was empty for long enough that "no per-step decision record exists" was written down and
+# then cited as a fact. Office started writing approvals to it on 2026-08-23 and has kept
+# going — 10 rows across 6 tasks through 2026-09-05, every one decision='approved' with
+# decider_type='agent'. The claim this assertion was defending is simply false now.
+#
+# The assertion is kept, inverted, rather than deleted: the useful property was never "this
+# table is empty", it was "we notice when what we wrote down stops being true". Emptiness is
+# now asserted only for step_history's companion claim, and the decision table is asserted to
+# keep GROWING from a known floor, so a regression that silently stops recording approvals
+# fails here the same way the emptiness claim did.
 assert "documented emptiness claims still hold" "
-  SELECT n_step_history_rows > 0 AND n_step_decision_rows = 0 AS ok,
+  SELECT n_step_history_rows > 0 AND n_step_decision_rows >= 10 AS ok,
          'step_history ' || n_step_history_rows::VARCHAR || ' (want >0), step_decisions '
-           || n_step_decision_rows::VARCHAR || ' (want 0)' AS detail
+           || n_step_decision_rows::VARCHAR || ' (want >=10 since Office began writing 2026-08-23)' AS detail
   FROM src__manifest"
 
 # A DECLARED CEILING MUST BE AN OBSERVED ONE. `kandev_requests.config_epoch` labels each transcript
@@ -121,6 +177,23 @@ assert "documented emptiness claims still hold" "
 # they never had. Cut at the observed boundary, not the declared one.
 #
 # 1% rather than 0%: a single request can cross mid-turn before auto-compact runs between turns.
+#
+# IT MUST ALSO BE THE FLEET'S CEILING, NOT THE OPERATOR'S — added 2026-09-13.
+# This assertion is about a setting on the AGENT PROFILES, so it may only read requests the fleet
+# actually made. Without `task_id IS NOT NULL` it also reads the operator's own interactive sessions
+# in the shared checkout, which no profile ceiling has ever applied to and which run 44.6% over on
+# Opus. That is not a hypothesis: ENV-008's 2026-09-01 verdict in ENVIRONMENTS.md diagnosed exactly
+# this population as a measurement defect, fixed the extract so shared-checkout requests emit
+# UNATTRIBUTED, and recorded "0 of 11,224 attributed requests over 300K". The extract fix landed;
+# this assertion was never narrowed to match the claim it asserts, so it kept reporting the
+# unattributed population and kept failing. Measured 2026-09-13 on ENV-008: 9.5% unfiltered,
+# **0.0% attributed** (0 of 51,558).
+#
+# The cost of that gap was not cosmetic. A permanently-failing assertion is a dormant gate: it
+# trains its reader to skip the line. When the boundary table went stale on 09-01 and this same
+# assertion started reporting a REAL defect — ENV-009/ENV-010 mislabelled as ENV-008 at a 300K
+# ceiling they never ran — the true positive was indistinguishable from the noise it had been
+# emitting for twelve days. **The false positive masked the defect this check exists to catch.**
 assert "declared ceiling is an observed ceiling" "
   WITH e AS (
     SELECT config_epoch,
@@ -128,6 +201,7 @@ assert "declared ceiling is an observed ceiling" "
            COUNT(*) FILTER (WHERE context_tokens > 300000) AS over
     FROM kandev_requests
     WHERE parent_transcript_session_id IS NULL AND ceiling_declared = '300K'
+      AND task_id IS NOT NULL AND task_id <> ''
     GROUP BY 1 HAVING COUNT(*) >= 50)
   SELECT COALESCE(MAX(over * 1.0 / n) < 0.01, TRUE) AS ok,
          COALESCE(string_agg(config_epoch || ' ' || ROUND(100.0*over/n,1)::VARCHAR || '%', ', '),

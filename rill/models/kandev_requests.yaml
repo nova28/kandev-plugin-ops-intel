@@ -172,7 +172,10 @@ sql: |
           WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-16 15:41' THEN 'ENV-005 ceiling 300K'
           WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-19 09:03' THEN 'ENV-005 drifted'
           WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-21 08:39' THEN 'ENV-007 ceiling 300K'
-          ELSE                                                               'ENV-008 ceiling 300K both profiles'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-09-01 06:33' THEN 'ENV-008 ceiling 300K both profiles'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-09-01 07:00' THEN 'ENV-009 lean Sonnet, ceiling 300K'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-09-02 00:14' THEN 'ENV-009 ceiling raised 400K - CONFOUNDED'
+          ELSE                                                               'ENV-010 lean fleet ceiling 400K'
       END AS config_epoch,
 
       -- What that epoch CLAIMS about the compaction ceiling. `check.sh` asserts the claim against
@@ -183,9 +186,18 @@ sql: |
           WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 00:00' THEN '300K'
           WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 03:48' THEN 'invalid'
           WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-14 07:58' THEN 'none'
-          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-16 15:41' THEN '300K'
+          -- ENV-005 and ENV-006/007 bounded Sonnet ONLY; Opus gained its ceiling at ENV-008. The
+          -- label names the profile so check.sh's '= 300K' test skips these rather than reading
+          -- documented-correct unbounded Opus as a breach. See kandev_config_epoch.yaml.
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-16 15:41' THEN '300K Sonnet only'
           WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-19 09:03' THEN 'unrecorded'
-          ELSE                                                               '300K'
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-08-21 08:39' THEN '300K Sonnet only'
+          -- ENV-008 and the first 27 minutes of ENV-009 ran 300K on BOTH profiles.
+          WHEN ts.transcript_first_seen <  TIMESTAMP '2026-09-01 07:00' THEN '300K'
+          -- Observed, not declared: the ceiling rose to 400,000 at 2026-09-01T07:00 while every id
+          -- from ENV-006 on still recorded 300000. See the note in kandev_config_epoch.yaml, and
+          -- the ENV-010 per-profile caveat there (400K Sonnet/Opus, 300K Opus-Low/Fable).
+          ELSE                                                               '400K'
       END AS ceiling_declared,
 
       COALESCE(sp.step, '(step not attributable)')  AS step_at_event,

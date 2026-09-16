@@ -48,7 +48,9 @@
 -- `workflow_step_decisions` were BOTH zero rows (inventory § 3.1) and that no per-event step
 -- was therefore available. That is now half wrong and the half that changed matters:
 -- `session_step_history` carries 580+ rows and IS extracted below as `fct_step_transition`,
--- the real per-event ledger. `workflow_step_decisions` remains genuinely empty.
+-- the real per-event ledger. `workflow_step_decisions` was empty when this note
+-- was written and is NOT any more: Office began writing approvals to it on 2026-08-23 and has
+-- continued, 10 rows across 6 tasks through 2026-09-05. Do not cite it as empty.
 -- Leaving the old note in place had a cost — it was read three separate times on 2026-08-19
 -- as evidence that step history is unavailable, once far enough to nearly block an
 -- experiment on a defect that had already resolved.
