@@ -1,0 +1,42 @@
+# Agent spend by the day it happened. Same sessions and cost as Agent economics, dated by metric
+# delta rather than by session end, so weekly totals are the spend that occurred that week.
+type: metrics_view
+
+display_name: Agent cost by day
+description: >-
+  Claude Code's reported cost per session per day, from the claude-telemetry-collector store.
+  Sums to the same per-session totals as Agent economics; only the dating differs.
+
+model: kandev_agent_cost_daily
+timeseries: spent_on
+smallest_time_grain: day
+
+dimensions:
+  - name: is_kandev_task
+    display_name: Kandev task session
+    column: is_kandev_task
+  - name: workspace_kind
+    display_name: Workspace kind
+    column: workspace_kind
+  - name: attribution_source
+    display_name: Attribution key
+    column: attribution_source
+  - name: workspace
+    display_name: Workspace
+    column: workspace
+  - name: workflow
+    display_name: Workflow
+    column: workflow
+  - name: task_id
+    display_name: Task
+    column: task_id
+
+measures:
+  - name: total_cost_usd
+    display_name: Cost (USD)
+    expression: SUM(cost_usd)
+    format_d3: "$,.2f"
+  - name: subagent_cost_usd
+    display_name: Subagent cost (USD)
+    expression: SUM(cost_usd_subagent)
+    format_d3: "$,.2f"

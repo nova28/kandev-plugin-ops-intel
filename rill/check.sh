@@ -241,6 +241,23 @@ assert "agent telemetry is one row per agent session" "
            || ' on shared checkouts (task_id deliberately NULL)' AS detail
   FROM kandev_agent_economics"
 
+# DATING COST BY DAY MUST NOT CHANGE HOW MUCH THERE IS. kandev_agent_cost_daily re-dates the same
+# metric deltas that kandev_agent_economics sums per session; any gap means one side dropped or
+# duplicated rows. A cent of rounding per session is tolerated.
+#
+# Sessions still running on the extract's last day are excluded. The collector store is read live
+# and the two tables come from separate statements, so a session that keeps spending between them
+# differs by what it spent in those seconds: $0.05 on one live session on 2026-09-17, zero on the
+# other 6,332. That is a read race, not a pipeline defect, and it closes the next day.
+assert "daily agent cost reconciles to session cost" "
+  WITH d AS (SELECT agent_session_id, SUM(cost_usd) c FROM kandev_agent_cost_daily GROUP BY 1),
+       e AS (SELECT * FROM kandev_agent_economics
+             WHERE last_date < (SELECT MAX(last_date) FROM kandev_agent_economics))
+  SELECT COALESCE(MAX(ABS(e.cost_usd - COALESCE(d.c, 0))), 0) < 0.01 AS ok,
+         'max per-session gap \$' || ROUND(COALESCE(MAX(ABS(e.cost_usd - COALESCE(d.c, 0))), 0), 4)::VARCHAR
+           || ' over ' || COUNT(*)::VARCHAR || ' settled sessions' AS detail
+  FROM e LEFT JOIN d USING (agent_session_id)"
+
 # THE DUPLICATED BOUNDARY TABLE MUST STAY IN STEP, AND THE FALLBACK KEY MUST STAY A FALLBACK.
 # The boundaries live in two files (see the header of kandev_config_epoch.yaml). This is the
 # assertion that makes that duplication safe: on every session both keys reach, they must agree —

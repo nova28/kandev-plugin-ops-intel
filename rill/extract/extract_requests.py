@@ -63,6 +63,12 @@ TRANSCRIPT_ROOTS = [
 ]
 KANDEV_DB = os.environ.get("KANDEV_DB", os.path.expanduser("~/.kandev/data/kandev.db"))
 OUT = sys.argv[1] if len(sys.argv) > 1 else "data"
+# Session -> card attribution, one row per Claude session id, ids only. Persisted OUTSIDE data/
+# and merged on every run, because the transcripts it is derived from are deleted by Claude
+# Code's retention sweep: without a durable copy, a session's card vanishes from the telemetry
+# extract the day its transcript does, and a past week's cost silently rewrites itself. Unset,
+# no attribution file is read or written.
+ATTRIBUTION_STATE = os.environ.get("ATTRIBUTION_STATE", "")
 
 # ONLY A CARD WORKTREE MAY CLAIM A PREFIX. Per-card worktrees live under ~/.kandev/tasks/<slug>/,
 # where exactly one card runs, so a cwd beneath one identifies that card. Every other path is a
@@ -145,6 +151,24 @@ def main():
     db = sqlite3.connect(KANDEV_DB)
     ws_task = []
     shared_paths = set()   # dropped, not attributed — reported at the end so it stays visible
+    # IDENTITY BEFORE LOCATION. Kandev records the agent's own session id in
+    # task_sessions.metadata.acp.session_id — for Claude Code that IS the transcript's sessionId
+    # and the telemetry session.id. Where it exists it names the Kandev session and card exactly,
+    # so it outranks any path rule. Found 2026-09-17 by an outside review: 32 transcripts in
+    # worktrees shared by two cards were billed to the wrong one by longest-prefix order, and
+    # 3,122 requests to the wrong session of the right card. Kandev keeps only the LATEST agent
+    # session id per Kandev session, so this covers the current run of each session and the path
+    # join below still carries every earlier one.
+    acp = {}
+    for ksid, tid, meta in db.execute(
+            "SELECT id, task_id, metadata FROM task_sessions WHERE task_id <> ''"):
+        try:
+            a = json.loads(meta or "{}").get("acp")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(a, dict) and a.get("session_id"):
+            acp[a["session_id"]] = (ksid, tid)
+
     for sql in (
             "SELECT DISTINCT task_id, workspace_path FROM task_environments "
             "WHERE workspace_path <> '' AND task_id <> ''",
@@ -162,9 +186,15 @@ def main():
                 shared_paths.add(norm)
                 continue
             ws_task.append((norm, tid))
-    # Longest prefix first (PART 1). Ties keep insertion order, so the environment row —
-    # loaded first above — wins over a session row claiming the same directory.
-    ws_task.sort(key=lambda x: -len(x[0]))
+    # Longest prefix first (PART 1). A worktree can belong to MORE THAN ONE card — a parent and
+    # its subtask share a checkout — so a path keeps every card that names it. The old rule kept
+    # whichever sorted first, and silently billed one card's requests to its sibling.
+    path_tasks = {}
+    for norm, tid in ws_task:
+        path_tasks.setdefault(norm, [])
+        if tid not in path_tasks[norm]:
+            path_tasks[norm].append(tid)
+    ws_paths = sorted(path_tasks, key=lambda x: -len(x))
 
     sessions = {}
     for sid, tid, st, en in db.execute(
@@ -177,26 +207,34 @@ def main():
 
     _cwd_cache = {}
 
+    ambiguous = 0
+
     def resolve(cwd, ts):
+        nonlocal ambiguous
         if not cwd:
             return "", ""
-        tid = _cwd_cache.get(cwd, KeyError)
-        if tid is KeyError:
-            tid = ""
-            for path, t in ws_task:
+        tids = _cwd_cache.get(cwd, KeyError)
+        if tids is KeyError:
+            tids = []
+            for path in ws_paths:
                 if cwd == path or cwd.startswith(path + os.sep):
-                    tid = t
+                    tids = path_tasks[path]
                     break
-            _cwd_cache[cwd] = tid
-        if not tid:
+            _cwd_cache[cwd] = tids
+        if not tids:
             return "", ""
-        cands = sessions.get(tid) or []
-        for st, en, sid in cands:
-            if st <= ts <= en:
-                return sid, tid
-        # Outside every recorded lifetime — keep the card, admit no session. Dropping the row
-        # would understate the card; inventing a session would misplace its step.
-        return "", tid
+        # Every card on this path whose session lifetime contains the request.
+        hits = [(sid, tid) for tid in tids for st, en, sid in (sessions.get(tid) or [])
+                if st <= ts <= en]
+        if len({t for _, t in hits}) == 1:
+            return hits[0]
+        if len(tids) == 1 and not hits:
+            # Outside every recorded lifetime — keep the card, admit no session. Dropping the row
+            # would understate the card; inventing a session would misplace its step.
+            return "", tids[0]
+        # Shared worktree and time does not pick one card: unattributed, not guessed.
+        ambiguous += 1
+        return "", ""
 
     reqs, calls, results, use_tool = {}, [], {}, {}
     sidechain_reqs = set()
@@ -242,17 +280,37 @@ def main():
                 msg = d.get("message") or {}
                 if d.get("isSidechain"):
                     sidechain_reqs.add(rid)
-                if rid not in reqs:
+                u = msg.get("usage") or {}
+                cc = u.get("cache_creation") or {}
+                read = u.get("cache_read_input_tokens", 0) or 0
+                w1 = cc.get("ephemeral_1h_input_tokens", 0) or 0
+                w5 = cc.get("ephemeral_5m_input_tokens", 0) or 0
+                inp = u.get("input_tokens", 0) or 0
+                out_tok = u.get("output_tokens", 0) or 0
+                if rid in reqs:
+                    # ONE RESPONSE IS WRITTEN AS SEVERAL RECORDS, and usage is a running snapshot:
+                    # a streamed turn logs output_tokens 2, 2, then 533 under one requestId. Keeping
+                    # the first record dropped ~11% of output tokens (outside review, 2026-09-17).
+                    # Take the largest value per field — never a sum, because the snapshots are
+                    # cumulative, and a fork's copied records repeat the same values.
+                    r = reqs[rid]
+                    for col, v in (("tokens_read", read), ("tokens_write_1h", w1),
+                                   ("tokens_write_5m", w5), ("tokens_input", inp),
+                                   ("tokens_output", out_tok)):
+                        if v > r[col]:
+                            r[col] = v
+                    r["context_tokens"] = (r["tokens_read"] + r["tokens_write_1h"]
+                                           + r["tokens_write_5m"] + r["tokens_input"])
+                else:
                     per_root[root_of[f]] += 1
-                    u = msg.get("usage") or {}
-                    cc = u.get("cache_creation") or {}
                     cwd = os.path.normpath(d.get("cwd") or "")
                     ts19 = (d.get("timestamp") or "")[:19]
-                    sid, tid = resolve(cwd, ts19)
-                    read = u.get("cache_read_input_tokens", 0) or 0
-                    w1 = cc.get("ephemeral_1h_input_tokens", 0) or 0
-                    w5 = cc.get("ephemeral_5m_input_tokens", 0) or 0
-                    inp = u.get("input_tokens", 0) or 0
+                    tsid = d.get("sessionId", "")
+                    if tsid in acp:
+                        (sid, tid), source = acp[tsid], "acp"
+                    else:
+                        sid, tid = resolve(cwd, ts19)
+                        source = "path" if tid else ""
                     reqs[rid] = {
                         "request_id": rid,
                         "occurred_at": (d.get("timestamp") or "")[:19] + "Z",
@@ -271,10 +329,13 @@ def main():
                         "tokens_write_1h": w1,
                         "tokens_write_5m": w5,
                         "tokens_input": inp,
-                        "tokens_output": u.get("output_tokens", 0) or 0,
+                        "tokens_output": out_tok,
                         # The whole prefix this request re-sent. THE actionable number.
                         "context_tokens": read + w1 + w5 + inp,
                         "agent_transcript_id": own_transcript or d.get("sessionId", ""),
+                        "attribution_source": source,
+                        # Not emitted: whether this cwd is a card worktree, for the session map.
+                        "_card_cwd": cwd.startswith(os.path.normpath(CARD_WORKTREE_PREFIX) + os.sep),
                     }
                 for blk in msg.get("content") or []:
                     if isinstance(blk, dict) and blk.get("type") == "tool_use":
@@ -304,6 +365,7 @@ def main():
             got = by_transcript.get(r["parent_transcript_session_id"])
             if got:
                 r["session_id"], r["task_id"] = got
+                r["attribution_source"] = "parent"
                 adopted += 1
 
     for use_id, (rid, nm, cls) in use_tool.items():
@@ -328,8 +390,10 @@ def main():
                 "tokens_output", "context_tokens",
                 # Appended last: src_fct_request loads verbatim and every consumer selects
                 # columns by name, so a trailing column changes nothing downstream.
-                "agent_transcript_id"]
-        w = csv.DictWriter(fh, fieldnames=cols)
+                "agent_transcript_id",
+                # acp | path | parent | '' — which rule attributed the row.
+                "attribution_source"]
+        w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for r in reqs.values():
             w.writerow(r)
@@ -342,18 +406,101 @@ def main():
         for c in calls:
             w.writerow(c)
 
+    if ATTRIBUTION_STATE:
+        write_attribution(reqs, acp, db)
+
     matched = sum(1 for r in reqs.values() if r["task_id"])
+    by_source = {}
+    for r in reqs.values():
+        by_source[r["attribution_source"] or "none"] = by_source.get(r["attribution_source"] or "none", 0) + 1
     subs = sum(1 for r in reqs.values() if r["agent_kind"] == "subagent")
     for root in TRANSCRIPT_ROOTS:
         print(f"    root {root}  {per_root.get(root, 0):8d} requests")
     print(f"    fct_request.csv        {len(reqs):8d} rows "
           f"({matched} joined to a card, {subs} subagent, {adopted} adopted from parent)")
+    print(f"    attribution            {by_source}; {ambiguous} shared-worktree requests left "
+          f"unattributed")
     if shared_paths:
         print(f"    shared checkouts       {len(shared_paths):8d} paths NOT used for attribution "
               f"(requests there are unattributed, not billed to a card)")
         for p in sorted(shared_paths)[:5]:
             print(f"      - {p}")
     print(f"    fct_tool_call.csv      {len(calls):8d} rows")
+
+
+ATTRIBUTION_COLS = ["session_id", "task_id", "kandev_task_count", "workspace_kind",
+                    "is_kandev_task", "attribution_source", "last_seen"]
+
+
+def write_attribution(reqs, acp, db):
+    """One row per Claude session id -> card, merged into the persisted state file.
+
+    The telemetry extract has no per-request grain, so a session's whole cost goes to one label.
+    That label must therefore claim only what EVERY request in the session supports:
+
+      acp          the session is Kandev's by identity. is_kandev_task=1 whatever the checkout;
+                   workspace_kind still reports where it ran.
+      task_worktree  path-attributed, one card, every request in that card's worktree.
+      mixed        some requests resolved to a card and some did not, or to several cards. Cost
+                   cannot be split at session grain, so it is not billed as Kandev work.
+      none         nothing resolved.
+
+    A row from this run replaces the stored row for the same session; a stored row whose
+    transcript has since been deleted is kept. Written to a temp file and renamed, so a failed
+    run never leaves a truncated state.
+    """
+    per = {}
+    for r in reqs.values():
+        sid = r["transcript_session_id"]
+        if not sid:
+            continue
+        p = per.setdefault(sid, {"tasks": set(), "unattr": 0, "shared": 0, "acp": False,
+                                 "last": ""})
+        if r["task_id"]:
+            p["tasks"].add(r["task_id"])
+        else:
+            p["unattr"] += 1
+        if not r["_card_cwd"]:
+            p["shared"] += 1
+        p["acp"] = p["acp"] or r["attribution_source"] == "acp"
+        p["last"] = max(p["last"], r["occurred_at"])
+    rows = {}
+    for sid, p in per.items():
+        n = len(p["tasks"])
+        if p["acp"]:
+            kind = "task_worktree" if not p["shared"] else "shared_checkout"
+            rows[sid] = [sid, acp[sid][1], 1, kind, 1, "acp", p["last"]]
+        elif n == 1 and not p["unattr"] and not p["shared"]:
+            rows[sid] = [sid, next(iter(p["tasks"])), 1, "task_worktree", 1, "transcript", p["last"]]
+        elif n:
+            rows[sid] = [sid, next(iter(p["tasks"])) if n == 1 else "", n, "mixed", 0,
+                         "transcript", p["last"]]
+        else:
+            rows[sid] = [sid, "", 0, "none", 0, "transcript", p["last"]]
+    # Kandev sessions whose transcript is already gone still carry their identity.
+    for asid, (_, tid) in acp.items():
+        rows.setdefault(asid, [asid, tid, 1, "unknown", 1, "acp", ""])
+
+    stored = {}
+    if os.path.exists(ATTRIBUTION_STATE):
+        with open(ATTRIBUTION_STATE, newline="") as fh:
+            for r in csv.DictReader(fh):
+                stored[r["session_id"]] = [r.get(c, "") for c in ATTRIBUTION_COLS]
+    kept = sum(1 for k in stored if k not in rows)
+    for k, v in stored.items():
+        if k not in rows:
+            rows[k] = v
+        elif rows[k][3] == "unknown" and v[3] not in ("", "unknown"):
+            rows[k][3] = v[3]   # identity row with no transcript: keep the kind seen earlier
+    os.makedirs(os.path.dirname(ATTRIBUTION_STATE) or ".", exist_ok=True)
+    tmp = ATTRIBUTION_STATE + ".tmp"
+    with open(tmp, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(ATTRIBUTION_COLS)
+        w.writerows(rows.values())
+    os.replace(tmp, ATTRIBUTION_STATE)
+    print(f"    session attribution    {len(rows):8d} sessions ({kept} kept from earlier runs "
+          f"whose transcripts are gone) -> {ATTRIBUTION_STATE}")
 
 
 if __name__ == "__main__":

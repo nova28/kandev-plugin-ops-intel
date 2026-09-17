@@ -34,12 +34,16 @@ sql: >
       a.kandev_task_count,
       a.workspace_kind,
       a.is_kandev_task,
+      -- acp | cwd | transcript: which key tied the session to a card. See extract-telemetry.sql.
+      a.attribution_source,
       a.first_date,
       a.last_date,
       -- Real bounds, for attributing a session to the step it actually ran in rather than to
       -- wherever its card has since moved. epoch_ns -> TIMESTAMP.
       to_timestamp(a.first_ts_ns / 1000000000.0)      AS session_started_at,
       to_timestamp(a.last_ts_ns  / 1000000000.0)      AS session_ended_at,
+      -- The session's LAST day: lifetime cost lands in the week a session ended. For spend by
+      -- the day it happened, use the Agent cost by day view (kandev_agent_cost_daily).
       CAST(a.last_date AS TIMESTAMP)                  AS observed_at,
 
       t.workspace,

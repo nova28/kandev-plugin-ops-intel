@@ -91,16 +91,63 @@ FROM k.task_sessions ks
 WHERE ks.workspace_path <> ''
 GROUP BY ks.workspace_path;
 
-CREATE TEMP VIEW v_session AS
+-- THREE KEYS, IN ORDER OF HOW MUCH THEY KNOW. extract.sh hands over session_attribution.csv, one
+-- id-only row per Claude session built by extract_requests.py and persisted across runs (the
+-- transcripts it is derived from are deleted after 30 days; the state is not).
+--
+--   1. acp         Kandev's own record of the agent's session id (task_sessions.metadata). It names
+--                  the card by identity, so it overrides the directory: an outside review on
+--                  2026-09-17 found 32 sessions in worktrees shared by two cards billed to the wrong
+--                  one by the path rules.
+--   2. cwd         the collector's directory, resolved through v_workspace above. Unchanged.
+--   3. transcript  sessions with telemetry but no usable `sessions` row. The collector did not sync
+--                  ~/.claude-kandev from 2026-09-01 to 2026-09-17, and a view driven from `sessions`
+--                  dropped those sessions and their cost outright. The label is 'task_worktree' only
+--                  when EVERY request resolved to one card inside its worktree; a session that also
+--                  ran elsewhere is 'mixed' and not counted as Kandev work, because its cost cannot
+--                  be split at this grain.
+--
+-- NOT EXISTS, never NOT IN: `sessions.session_id` is a nullable TEXT PRIMARY KEY, and a single
+-- NULL would make every NOT IN test NULL and drop branch 3 without a word.
+.import --csv --schema temp session_attribution.csv attribution
+
+CREATE TEMP TABLE v_session AS
+SELECT
+    a.session_id,
+    NULLIF(a.task_id, '')                                                 AS task_id,
+    CAST(a.kandev_task_count AS INTEGER)                                  AS kandev_task_count,
+    a.workspace_kind,
+    CAST(a.is_kandev_task AS INTEGER)                                     AS is_kandev_task,
+    'acp'                                                                 AS attribution_source
+FROM temp.attribution a
+WHERE a.attribution_source = 'acp'
+UNION ALL
 SELECT
     s.session_id,
     w.task_id                                                             AS task_id,
     COALESCE(w.task_count, 0)                                             AS kandev_task_count,
     COALESCE(w.workspace_kind, 'none')                                    AS workspace_kind,
-    CASE WHEN w.workspace_kind = 'task_worktree' THEN 1 ELSE 0 END        AS is_kandev_task
+    CASE WHEN w.workspace_kind = 'task_worktree' THEN 1 ELSE 0 END        AS is_kandev_task,
+    'cwd'                                                                 AS attribution_source
 FROM sessions s
 LEFT JOIN v_workspace w ON w.workspace_path = s.cwd
-WHERE s.cwd LIKE '/%';
+WHERE s.cwd LIKE '/%'
+  AND s.session_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM temp.attribution a
+                  WHERE a.session_id = s.session_id AND a.attribution_source = 'acp')
+UNION ALL
+SELECT
+    a.session_id,
+    NULLIF(a.task_id, '')                                                 AS task_id,
+    CAST(a.kandev_task_count AS INTEGER)                                  AS kandev_task_count,
+    a.workspace_kind,
+    CAST(a.is_kandev_task AS INTEGER)                                     AS is_kandev_task,
+    'transcript'                                                          AS attribution_source
+FROM temp.attribution a
+WHERE a.attribution_source <> 'acp'
+  AND NOT EXISTS (SELECT 1 FROM sessions s
+                  WHERE s.session_id = a.session_id AND s.cwd LIKE '/%');
+CREATE INDEX temp.v_session_id ON v_session(session_id);
 
 -- ---------------------------------------------------------------------------
 -- fct_agent_session: one row per Claude Code session.
@@ -153,10 +200,38 @@ SELECT
     CAST(SUM(CASE WHEN m.metric_name='claude_code.lines_of_code.count'
                    THEN m.value ELSE 0 END) AS INTEGER)                      AS lines_of_code,
     ROUND(SUM(CASE WHEN m.metric_name='claude_code.active_time.total'
-                   THEN m.value ELSE 0 END), 2)                              AS active_time_seconds
+                   THEN m.value ELSE 0 END), 2)                              AS active_time_seconds,
+    s.attribution_source
 FROM v_session s
 JOIN metrics m ON m.session_id = s.session_id
-GROUP BY s.session_id, s.task_id, s.kandev_task_count, s.workspace_kind, s.is_kandev_task;
+GROUP BY s.session_id, s.task_id, s.kandev_task_count, s.workspace_kind, s.is_kandev_task,
+         s.attribution_source;
+
+-- ---------------------------------------------------------------------------
+-- fct_agent_session_day: the same cost, dated by when it was SPENT.
+--
+-- fct_agent_session carries one lifetime total per session, and the dashboard's timeseries is
+-- the session's last_date — so a session that ran Sunday to Tuesday put all its cost in the week
+-- it ended. On 2026-09-17 that moved ISO W36 from $16,406 (by metric date) to $15,717 (by end
+-- date). The metric rows are deltas with their own date, so summing per (session, date) gives the
+-- exact daily split; per-session totals still reconcile (check.sh asserts it).
+-- ---------------------------------------------------------------------------
+.once data/fct_agent_session_day.csv
+SELECT
+    s.session_id,
+    m.date,
+    s.task_id,
+    s.workspace_kind,
+    s.is_kandev_task,
+    ROUND(SUM(m.value), 6)                                                   AS cost_usd,
+    ROUND(SUM(CASE WHEN json_extract(m.extra,'$.query_source.stringValue')='main'
+                   THEN m.value ELSE 0 END), 6)                              AS cost_usd_main,
+    ROUND(SUM(CASE WHEN json_extract(m.extra,'$.query_source.stringValue')='subagent'
+                   THEN m.value ELSE 0 END), 6)                              AS cost_usd_subagent,
+    s.attribution_source
+FROM v_session s
+JOIN metrics m ON m.session_id = s.session_id AND m.metric_name = 'claude_code.cost.usage'
+GROUP BY s.session_id, m.date, s.task_id, s.workspace_kind, s.is_kandev_task, s.attribution_source;
 
 -- ---------------------------------------------------------------------------
 -- fct_agent_session_event: per-session counts of the event types that describe
@@ -176,7 +251,8 @@ SELECT
     e.event_name,
     COUNT(*)      AS event_count,
     MIN(e.date)   AS first_date,
-    MAX(e.date)   AS last_date
+    MAX(e.date)   AS last_date,
+    s.attribution_source
 FROM v_session s
 JOIN events e ON e.session_id = s.session_id
 WHERE e.event_name IN (
@@ -185,7 +261,8 @@ WHERE e.event_name IN (
     'mcp_server_connection', 'user_prompt', 'assistant_response',
     'permission_mode_changed', 'internal_error'
 )
-GROUP BY s.session_id, s.task_id, s.kandev_task_count, s.workspace_kind, s.is_kandev_task, e.event_name;
+GROUP BY s.session_id, s.task_id, s.kandev_task_count, s.workspace_kind, s.is_kandev_task, e.event_name,
+         s.attribution_source;
 
 -- ---------------------------------------------------------------------------
 -- fct_agent_span: the trace tier.
@@ -214,6 +291,7 @@ SELECT
     s.is_kandev_task,
     sp.model,
     sp.tool_name,
-    sp.status_code
+    sp.status_code,
+    s.attribution_source
 FROM spans sp
 LEFT JOIN v_session s ON s.session_id = sp.session_id;

@@ -9,3 +9,6 @@ rill/tmp/
 # Python bytecode from rill/extract helpers
 __pycache__/
 *.pyc
+
+# Persisted session -> card attribution (ids only); outlives the transcripts it is derived from.
+rill/state/

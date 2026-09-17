@@ -1,0 +1,23 @@
+# Agent cost by the day it was SPENT, one row per (Claude Code session, date).
+#
+# kandev_agent_economics is session grain and dated by the session's last day, so a session
+# running across a week boundary puts its whole cost in the week it ended. This model is built
+# from dated metric deltas instead, so a week here is the money actually spent that week. Use it
+# for any "cost per week" question; use kandev_agent_economics for per-session behaviour.
+type: model
+
+sql: >
+  SELECT
+      d.session_id                               AS agent_session_id,
+      CAST(d.date AS TIMESTAMP)                  AS spent_on,
+      d.task_id,
+      d.workspace_kind,
+      d.is_kandev_task,
+      d.attribution_source,
+      t.workspace,
+      t.workflow,
+      d.cost_usd,
+      d.cost_usd_main,
+      d.cost_usd_subagent
+  FROM src_fct_agent_session_day d
+  LEFT JOIN src_dim_task t ON t.task_id = d.task_id

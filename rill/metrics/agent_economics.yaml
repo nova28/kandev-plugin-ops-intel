@@ -43,20 +43,26 @@ dimensions:
   - name: task_state
     display_name: Task state
     column: task_state
-  # 1 only when the session ran in a ~/.kandev/tasks/ worktree, which nothing but Kandev uses.
-  # Filter to 1 for anything that claims to describe Kandev.
+  # 1 when the session is Kandev's: by Kandev's own record of the agent session id (any checkout),
+  # or by running only in a ~/.kandev/tasks/ worktree. Filter to 1 for anything that claims to
+  # describe Kandev.
   - name: is_kandev_task
     display_name: Kandev task session
     column: is_kandev_task
   # Why a session did or did not qualify. 'task_worktree' is proof; 'shared_checkout' means the
   # session merely ran in a directory Kandev's Local executor also uses — which is where you
-  # work by hand, so those sessions are mostly NOT Kandev's; 'none' is everything else.
+  # work by hand, so those sessions are mostly NOT Kandev's, unless attribution_source is 'acp';
+  # 'mixed' ran partly inside a card worktree and partly elsewhere, so its cost cannot be billed
+  # to the card; 'unknown' is an identity match whose transcript is gone; 'none' is the rest.
   - name: workspace_kind
     display_name: Workspace kind
     column: workspace_kind
   - name: task_id
     display_name: Task
     column: task_id
+  - name: attribution_source
+    display_name: Attribution key
+    column: attribution_source
 
 measures:
   - name: total_cost_usd

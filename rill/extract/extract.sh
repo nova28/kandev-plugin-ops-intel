@@ -37,7 +37,17 @@ if [[ ! -f "$KANDEV_DB" ]]; then
     exit 1
 fi
 
-command -v sqlite3 >/dev/null || { echo "error: sqlite3 not on PATH" >&2; exit 1; }
+# WHICH sqlite3 MATTERS. macOS ships /usr/bin/sqlite3 built with a low function-argument limit, and
+# Kandev v0.94 (2026-09-17) added a trigger calling json_object() with 11 arguments. That CLI cannot
+# parse the schema at all and reports "database disk image is malformed" — on a store that passes
+# PRAGMA quick_check. Prefer Homebrew's build; SQLITE3=/path overrides.
+if [[ -z "${SQLITE3:-}" ]]; then
+    for c in /opt/homebrew/opt/sqlite/bin/sqlite3 /usr/local/opt/sqlite/bin/sqlite3 sqlite3; do
+        command -v "$c" >/dev/null && { SQLITE3="$c"; break; }
+    done
+fi
+command -v "${SQLITE3:-}" >/dev/null || { echo "error: sqlite3 not found (set SQLITE3=/path)" >&2; exit 1; }
+sqlite3() { "$SQLITE3" "$@"; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -66,9 +76,13 @@ mkdir -p "$WORK/data"
 # because an optional second source was unavailable would be the wrong trade. The request
 # models carry `usage_basis` so absence reads as "not observable" rather than as zero cost.
 echo "==> extracting request grain (Claude Code transcripts)"
-if ! python3 "$PROJECT_DIR/extract/extract_requests.py" "$WORK/data"; then
+# Session attribution is state, not output: kept across runs because transcripts are not.
+ATTRIBUTION_STATE="${ATTRIBUTION_STATE:-$PROJECT_DIR/state/session_attribution.csv}"
+requests_ok=1
+if ! ATTRIBUTION_STATE="$ATTRIBUTION_STATE" python3 "$PROJECT_DIR/extract/extract_requests.py" "$WORK/data"; then
     echo "    warning: request extract failed — promoting the rest without it" >&2
     rm -f "$WORK/data/fct_request.csv" "$WORK/data/fct_tool_call.csv"
+    requests_ok=0
 fi
 
 # THE THIRD SOURCE. The claude-telemetry-collector store holds what the AGENT saw, which is
@@ -84,7 +98,7 @@ fi
 # collector's own writes.
 echo "==> extracting agent telemetry (OTLP collector)"
 TELEMETRY_DB="${TELEMETRY_DB:-$HOME/Library/Application Support/claude-telemetry/metrics.db}"
-TELEMETRY_CSVS=(fct_agent_session.csv fct_agent_session_event.csv fct_agent_span.csv)
+TELEMETRY_CSVS=(fct_agent_session.csv fct_agent_session_day.csv fct_agent_session_event.csv fct_agent_span.csv)
 if [[ -f "$TELEMETRY_DB" ]]; then
     # A file: URI is the only way to ask for mode=ro, and the default path contains spaces.
     TELEMETRY_URI="file:${TELEMETRY_DB// /%20}?mode=ro"
@@ -98,6 +112,26 @@ if [[ -f "$TELEMETRY_DB" ]]; then
     # continuously. A single attempt hit `database is locked (5)` on 2026-09-16 and the telemetry
     # tables silently stayed at 2026-09-15. Partial CSVs are discarded per attempt so a retry
     # never mixes rows from two reads.
+    #
+    # SESSION -> CARD ATTRIBUTION, handed to the SQL as an id-only CSV. The collector knows a
+    # session's directory only while its session file is live under a config dir it syncs; it
+    # missed ~/.claude-kandev from 2026-09-01 until 2026-09-17, so thousands of Kandev sessions have
+    # telemetry and no usable `sessions` row. extract_requests.py resolves each Claude session to a
+    # card — by Kandev's recorded agent session id first, transcript paths second — and merges the
+    # result into $ATTRIBUTION_STATE, which outlives the transcripts it came from. Copied beside
+    # snapshot.db, never under data/, so it is not promoted.
+    #
+    # LOUD WHEN THIN. If the request extract failed this run, the stored state still carries every
+    # earlier session, so the fallback degrades to "stale" rather than "empty" — but say so. With no
+    # state at all, thousands of sessions would drop out of the telemetry tables and the totals
+    # would read as a quiet week.
+    if [[ -s "$ATTRIBUTION_STATE" ]]; then
+        cp "$ATTRIBUTION_STATE" "$WORK/session_attribution.csv"
+        [[ $requests_ok -eq 1 ]] || echo "    WARNING: request extract failed — telemetry attribution uses stored state from $(date -r "$ATTRIBUTION_STATE" '+%Y-%m-%d %H:%M')" >&2
+    else
+        echo "    WARNING: no session attribution state at $ATTRIBUTION_STATE — telemetry sessions without a collector cwd will be DROPPED" >&2
+        echo "session_id,task_id,kandev_task_count,workspace_kind,is_kandev_task,attribution_source,last_seen" > "$WORK/session_attribution.csv"
+    fi
     telemetry_ok=0
     for attempt in 1 2 3; do
         if ( cd "$WORK" && sqlite3 "$TELEMETRY_URI" \
@@ -128,7 +162,7 @@ fi
 # failed partway, and a partial promotion is the failure mode worth engineering against.
 EXPECTED=(dim_task.csv dim_workflow_step.csv fct_step_transition.csv dim_session.csv fct_turn.csv fct_cost_event.csv fct_pull_request.csv fct_git_snapshot.csv fct_plan_revision.csv fct_message.csv _manifest.csv)
 # Promoted when present, absent without complaint when not — see above.
-OPTIONAL=(fct_request.csv fct_tool_call.csv fct_agent_session.csv fct_agent_session_event.csv fct_agent_span.csv)
+OPTIONAL=(fct_request.csv fct_tool_call.csv fct_agent_session.csv fct_agent_session_day.csv fct_agent_session_event.csv fct_agent_span.csv)
 for f in "${EXPECTED[@]}"; do
     [[ -s "$WORK/data/$f" ]] || { echo "error: extract produced no $f — not promoting" >&2; exit 1; }
 done
