@@ -168,19 +168,46 @@ for f in "${EXPECTED[@]}"; do
 done
 
 mkdir -p "$DATA_DIR"
+promoted=()
 for f in "${EXPECTED[@]}"; do
     mv "$WORK/data/$f" "$DATA_DIR/$f"
+    promoted+=("$f")
 done
 for f in "${OPTIONAL[@]}"; do
-    [[ -s "$WORK/data/$f" ]] && mv "$WORK/data/$f" "$DATA_DIR/$f"
+    [[ -s "$WORK/data/$f" ]] && { mv "$WORK/data/$f" "$DATA_DIR/$f"; promoted+=("$f"); }
 done
 
+# A HALF-REFRESHED data/ MUST SAY SO. An optional source that fails leaves its PREVIOUS file in
+# place — deleting a good telemetry extract over one locked read would be worse — so the directory
+# can hold two different moments at once. That happened on 2026-09-19: the telemetry read lost all
+# three attempts to the collector's write lock, the rest was promoted on top of files from 76
+# minutes earlier, and nothing downstream could tell. `_manifest.csv` only ever described the
+# Kandev snapshot. This writes the per-file truth instead, and check.sh asserts the skew.
+{
+    echo "file,extracted_at_utc,rows,status"
+    for f in "${EXPECTED[@]}" "${OPTIONAL[@]}"; do
+        [[ -s "$DATA_DIR/$f" ]] || continue
+        st=stale
+        for p in "${promoted[@]}"; do [[ "$p" == "$f" ]] && { st=fresh; break; }; done
+        printf '%s,%s,%d,%s\n' "$f" \
+            "$(date -u -r "$DATA_DIR/$f" +%Y-%m-%dT%H:%M:%SZ)" \
+            "$(($(wc -l < "$DATA_DIR/$f") - 1))" "$st"
+    done
+} > "$DATA_DIR/_freshness.csv"
+
 echo "==> wrote $DATA_DIR"
+stale_n=0
 for f in "${EXPECTED[@]}" "${OPTIONAL[@]}"; do
+    [[ -s "$DATA_DIR/$f" ]] || continue
+    st=""
+    if ! printf '%s\n' "${promoted[@]}" | grep -qx "$f"; then
+        st="  STALE from $(date -u -r "$DATA_DIR/$f" +%H:%MZ)"
+        stale_n=$((stale_n + 1))
+    fi
     # -1 for the header row.
-    [[ -s "$DATA_DIR/$f" ]] && \
-        printf '    %-22s %8d rows\n' "$f" "$(($(wc -l < "$DATA_DIR/$f") - 1))"
+    printf '    %-26s %8d rows%s\n' "$f" "$(($(wc -l < "$DATA_DIR/$f") - 1))" "$st"
 done
+[[ $stale_n -eq 0 ]] || echo "    WARNING: $stale_n file(s) are from an earlier run — data/ mixes two moments; see _freshness.csv" >&2
 
 echo
 echo "Next:  rill start $PROJECT_DIR"

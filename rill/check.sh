@@ -61,6 +61,34 @@ assert_local() { # assert_local <name> <ok: 0|1> <detail>
 if [[ "${1:-}" != "--baseline" ]]; then
 echo "== integrity assertions =="
 
+# EVERY TABLE MUST DESCRIBE THE SAME MOMENT. An optional source that fails its extract leaves the
+# PREVIOUS file in place, so data/ can hold two moments at once and every cross-source total is
+# then silently wrong. Found 2026-09-19: the telemetry read lost three attempts to the collector's
+# write lock and the rest was promoted over telemetry files 76 minutes older.
+#
+# Reads extract.sh's _freshness.csv rather than Rill, because the defect is about the FILES, and a
+# missing freshness file is itself a finding (an extract from before this check existed).
+FRESH="data/_freshness.csv"
+if [[ -r "$FRESH" ]]; then
+    skew=$(python3 - "$FRESH" <<'PY'
+import csv, sys, datetime as dt
+rows = list(csv.DictReader(open(sys.argv[1])))
+ts = [dt.datetime.strptime(r["extracted_at_utc"], "%Y-%m-%dT%H:%M:%SZ") for r in rows]
+stale = [r["file"] for r in rows if r["status"] != "fresh"]
+mins = round((max(ts) - min(ts)).total_seconds() / 60) if ts else 0
+print(f'{mins}|{len(rows)}|{",".join(stale[:3])}')
+PY
+    )
+    mins=${skew%%|*}; rest=${skew#*|}; nfiles=${rest%%|*}; stale=${rest#*|}
+    if [[ $mins -le 30 && -z "$stale" ]]; then
+        assert_local "every table describes the same extract" 0 "$nfiles files within ${mins}m"
+    else
+        assert_local "every table describes the same extract" 1 "spread ${mins}m over $nfiles files; stale: ${stale:-none}"
+    fi
+else
+    assert_local "every table describes the same extract" 1 "no $FRESH — re-run extract.sh (pre-2026-09-19 extract)"
+fi
+
 # THE BOUNDARY TABLE MUST KNOW ABOUT EVERY ENVIRONMENT THAT EXISTS.
 # `kandev_config_epoch` labels each session by a boundary table transcribed BY HAND from
 # ENVIRONMENTS.md. Nothing downstream can tell a missing boundary from a quiet fleet: a newly
