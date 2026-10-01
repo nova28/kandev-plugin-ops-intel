@@ -125,7 +125,7 @@ sql: |
   -- is therefore cut at the OBSERVED boundary, and the declared-but-unobserved window is named as
   -- its own value rather than folded into either neighbour.
   --
-  -- BOUNDARIES COME FROM `the operator's environments doc` and must be extended
+  -- BOUNDARIES COME FROM the operator's environments doc (path via `ENVIRONMENTS_DOC` in check.sh) and must be extended
   -- when an ENV id is minted. They are not self-maintaining -- but they are self-CHECKING:
   -- `check.sh` asserts that an epoch declaring a ceiling actually observes one, so config that
   -- changes without a mint (which happened, unnoticed, for three days from 08-16) fails the

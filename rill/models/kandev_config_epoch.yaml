@@ -23,7 +23,7 @@
 # duplication honest, and it is why the copy is acceptable rather than a bug waiting to happen.
 # If you edit a boundary here, edit it in `kandev_requests.yaml` too and re-run `./check.sh`.
 #
-# Boundaries come from `the operator's environments doc`, which is hand-
+# Boundaries come from the operator's environments doc (path via `ENVIRONMENTS_DOC` in check.sh), which is hand-
 # maintained and has gone stale before: ENV-005 drifted on 08-16 and was not superseded until
 # 08-19, three days in which config moved with no environment minted. That window is labelled
 # rather than folded into a neighbour, because a row inside it is not evidence for either side.

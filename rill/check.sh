@@ -102,9 +102,13 @@ fi
 #
 # Deliberately a string check, not a timestamp comparison: the failure mode is an id that exists
 # upstream and is absent here, and that is exactly what this tests. It needs no Rill.
-ENVDOC="../../the operator's environments doc"
+# Path to the hand-maintained environments doc this table is checked against. It lives outside
+# this repo, so it is opt-in: set ENVIRONMENTS_DOC to enable the assertion; unset, it is skipped.
+ENVDOC="${ENVIRONMENTS_DOC:-}"
 EPOCHMODEL="models/kandev_config_epoch.yaml"
-if [[ -r "$ENVDOC" && -r "$EPOCHMODEL" ]]; then
+if [[ -z "$ENVDOC" ]]; then
+    echo "  skip  boundary table knows every environment (ENVIRONMENTS_DOC not set)"
+elif [[ -r "$ENVDOC" && -r "$EPOCHMODEL" ]]; then
     # Only real CASE branches count. Prose mentioning an id must NOT satisfy this — the header of
     # kandev_config_epoch.yaml discusses ENV-009 and ENV-010 by name, so grepping the whole file
     # would let a deleted branch hide behind its own postmortem. (Found by negative-testing this
