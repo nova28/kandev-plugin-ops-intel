@@ -14,7 +14,7 @@
 # instead of only polling. See main.go and rill/auto-refresh.sh's SIGNAL-DRIVEN FAST PATH.
 id: "kandev-plugin-ops-intel"
 api_version: 1
-version: "0.33.0"
+version: "0.33.1"
 display_name: "Ops Intel"
 description: "Operational cost and efficiency intelligence — spend per model, per build step, and anomaly detection."
 author: "nova28"

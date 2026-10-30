@@ -57,6 +57,34 @@ Four metrics views, one per grain:
 
 Plus two canvases: `/canvas/overview` and `/canvas/step_deep_dive`.
 
+## Economic ownership is unverified
+
+Step labels describe board observations or session-window allocations, not verified ownership
+of the billed work. A parked Review session may recover while its card is in Create MR;
+its next turn then has a Create MR stamp even if it only checks Review state. Cumulative
+provider usage can flush earlier activity on that wake. A stamp proves the board position
+was read, not that the dollars were consumed performing that stage.
+
+`kandev_cost.step_observation` exposes observation versus inference and
+`work_step_verification` is `unverified` for every event: this extract has no provider
+billing-interval/work-owner receipt. Totals and existing step allocations are preserved.
+The legacy `clean_cost_subcents` / `clean_attribution_share` IDs remain compatible but now
+mean **single-label allocation**, not confidence. `board_stamp_cost_share` separately shows
+how much spend carries a board observation. Neither ratio makes a stage total exact.
+Do not guess which dollars to move between steps; inspect the sessions and provider receipts.
+
+Offline regression (Python with DuckDB and PyYAML installed):
+
+```bash
+python3 rill/test_step_cost_allocation.py  # from repository root
+```
+
+This executes the shipped cost SQL against recovered, mixed-window and unallocated fixtures,
+asserting uncertainty, event grain and total preservation. `make test` covers the panel copy.
+For rollout, reconcile/restart the Rill project to load changed models and metrics, rebuild
+and package the plugin, then reload open tabs after a verified install. No live refresh or
+plugin reinstall is performed by the offline test.
+
 ## Which step dimension to use
 
 Every fact table carries two, and picking the wrong one silently answers a different question:
@@ -66,11 +94,11 @@ Every fact table carries two, and picking the wrong one silently answers a diffe
   `kandev_step_points`, a timeline built from the ~400 `workflow_step_name` stamps Kandev
   writes onto messages. The two fact tables resolve it differently, on purpose:
   - `kandev_turns` ASOF-joins on `started_at`, because a turn's work happens *after* its
-    start — a turn beginning at the same instant as a stamp belongs to the step being entered.
+    start. This is a timing convention, not proof of what a recovered session worked on.
   - `kandev_cost` resolves its step from the event's **turn stamp** wherever it has one.
     Kandev stamps `workflow_step_id_at_start` on every turn and `turn_id` on every cost event
     from 2026-08-16, so from that date the step is a join, not a reconstruction.
-    `step_attribution_basis = 'turn stamp'` marks those rows.
+    `step_attribution_basis = 'turn stamp'` marks those observations; economic ownership remains unverified.
   - Before the cutover there is no stamp, and `kandev_cost` falls back to a window rule. It
     does **not** ASOF-join: a cost event looks *backwards*, billing the work done since the
     previous event, and Kandev flushes those events at a step transition — so "nearest stamp

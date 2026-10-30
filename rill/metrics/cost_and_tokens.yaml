@@ -49,8 +49,8 @@ dimensions:
     display_name: Step (when spent)
     column: step_at_event
     description: >-
-      The step that owned the window this spend bills, resolved against the step timeline.
-      THIS is the one to group by when asking what a step costs.
+      The board-step allocation label, from a turn stamp or reconstructed session window.
+      Use it to navigate spend; it is not proof that the billed work belongs to that stage.
   - name: step_attributed
     display_name: Step resolved
     column: step_attributed
@@ -59,12 +59,21 @@ dimensions:
       ~21% of spend. Filter to 'yes' before comparing steps, or the unattributed pile
       reads as a step.
   - name: step_attribution_basis
-    display_name: Step attribution basis
+    display_name: Board-step allocation basis
     column: step_attribution_basis
     description: >-
-      Whether `step_at_event` is a fact about the window or a majority verdict over one
-      that crossed a step boundary (142 of 668 events). Check it before quoting a single
-      step's total as exact.
+      Method used to select the board-step label. A turn stamp observes the card position;
+      it does not verify what a recovered session did or when cumulative usage was consumed.
+      No basis here proves exact economic step ownership.
+  - name: step_observation
+    display_name: Board-step observation
+    column: step_observation
+  - name: work_step_verification
+    display_name: Economic work-step verification
+    column: work_step_verification
+    description: >-
+      Unverified: the extract has no provider billing-interval/work-owner receipt. Keep
+      total spend, but investigate sessions before interpreting a stage total as work cost.
   - name: current_step
     display_name: Card's current step
     column: current_step

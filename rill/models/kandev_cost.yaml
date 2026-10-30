@@ -14,7 +14,7 @@
 #
 # Every event from 2026-08-16 onward carries `turn_id`, and its turn carries
 # `step_at_start` — the step Kandev read off the card when it created the turn, in the same
-# transaction. That is a READING of the step, and it replaces the window reconstruction
+# transaction. That is a reading of BOARD POSITION, not verified work ownership. It replaces the window reconstruction
 # below wherever it exists. `step_attribution_basis = 'turn stamp'` marks those rows.
 #
 # WHY THE WINDOW RULE HAD TO BE DEMOTED — IT IS WRONG ON MULTI-PROFILE WORKFLOWS.
@@ -89,7 +89,7 @@ materialize: true
 
 sql: |
   WITH
-  -- THE STAMP. One row per event that can be resolved exactly, via its turn.
+  -- THE STAMP. One row per event with an observed board position, via its turn.
   --
   -- `NULLIF(turn_id, '')` because the extract emits empty string, not NULL, for the
   -- pre-cutover events; and `step_at_start IS NOT NULL` because a turn whose stamp write
@@ -259,26 +259,23 @@ sql: |
           ELSE                                          'attributed to a card'
       END AS cost_attribution,
 
-      -- The step this event's spend belongs to: the turn's own stamp where there is one,
-      -- otherwise the step that owned the window it bills. See the attribution note in the
-      -- header — this is what makes "what does Review cost" answerable at all, because the
-      -- cost table has no step column and the card's `current_step` is where the card ended
-      -- up, not where the money went.
+      -- An allocation label, not verified economic ownership. A recovered Review session can
+      -- wake while the card is in Create MR; its turn stamp then reads Create MR. Provider
+      -- cumulative usage can flush earlier work at that wake. Keep the label for navigation,
+      -- but never promote the stamp into proof of what the billed work did.
       COALESCE(st.step, a.step, '(step not attributable)') AS step_at_event,
       CASE WHEN st.step IS NULL AND a.step IS NULL THEN 'no' ELSE 'yes' END AS step_attributed,
+      CASE
+          WHEN st.step IS NOT NULL THEN 'board position observed at turn start'
+          WHEN a.step IS NOT NULL THEN 'session-window allocation inferred'
+          ELSE 'no board-step allocation'
+      END AS step_observation,
+      -- This extract has no provider billing-interval/work-owner receipt. Uniformly explicit
+      -- uncertainty is preferable to guessing which stamped rows were resumed or mixed.
+      'unverified' AS work_step_verification,
 
-      -- HOW MUCH TO TRUST THAT LABEL. Three tiers, and the gap between the first and the
-      -- other two is the difference between a reading and a reconstruction:
-      --
-      --   'turn stamp'                  exact. Kandev read the step off the card when it
-      --                                 created the turn.
-      --   'window sat in one step'      inferred, but from a window that never left a step.
-      --   'dominant of N steps ...'     inferred, and a majority verdict over a window that
-      --                                 crossed a boundary.
-      --
-      -- Anything other than 'turn stamp' is pre-2026-08-16 data and carries the
-      -- multi-profile error described in the header. Filter on it before quoting a single
-      -- step's total as exact — `kandev_card_steps.clean_cost_subcents` exists for that.
+      -- Preserve the existing basis values for downstream queries. They describe HOW a
+      -- label was selected, not whether the dollars were proven to belong to that activity.
       CASE
           WHEN st.step IS NOT NULL     THEN 'turn stamp'
           WHEN a.step IS NULL          THEN 'not attributable'

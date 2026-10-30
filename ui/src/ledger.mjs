@@ -257,7 +257,7 @@ export function assembleLedger(cost, external, timing, peers, order, modelTiming
   // 2026-08-16 turn_id cutover; part of its rail is read and part reconstructed.
   //
   // A card with neither (no attributed spend at all) is null, not "stamp" — an empty sum is
-  // not evidence of an exact reading.
+  // not evidence even of a board-position reading.
   var stamped = src ? Number(src.stamped || 0) : 0;
   var inferred = src ? Number(src.inferred || 0) : 0;
   var stepBasis = !src || (!stamped && !inferred) ? null

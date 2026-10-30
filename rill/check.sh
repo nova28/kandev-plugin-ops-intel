@@ -487,7 +487,7 @@ rows = resp.get("data")
 if rows is None:
     print("  (query failed: {})".format(str(resp.get("message", resp))[:150]))
     rows = []
-print("  {:<18}{:>10}{:>9}{:>12}".format("step", "cost", "in:out", "clean attr"))
+print("  {:<18}{:>10}{:>9}{:>12}".format("step", "cost", "in:out", "single label"))
 for r in rows:
     print("  {:<18}{:>10,.2f}{:>9,.0f}{:>11,.0f}%".format(
         str(r["step"])[:17], r["cost_usd"] or 0, r["in_per_out"] or 0, (r["clean_attr"] or 0) * 100))'

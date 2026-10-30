@@ -11,11 +11,10 @@
 # those two readings and demote the other, and the whole reason this grain was added is that
 # both are asked constantly.
 #
-# THE ONE THING TO READ FIRST, EVERY TIME: `Clean attribution share`. Kandev records no step on
-# a cost event, so every dollar here was assigned to a step by reconstruction. At a low clean
-# share a row is describing that reconstruction as much as it is describing the step. This is
-# not a caveat to file away — it is the difference between "PR Fixup churns at 725:1" and the
-# 524:1 it actually reads on clean windows, which was the same as Build.
+# ALLOCATION IS NOT WORK OWNERSHIP. Single-label allocation share distinguishes board
+# stamps/one-slice windows from multi-step majority labels. It is not a confidence score:
+# a recovered session can work Review after the card moves to Create MR, and a cumulative
+# bill can flush earlier work. Every step total is a navigation aid, not a verified work bill.
 #
 # NO SUCCESS OR COMPLETION RATE, here as everywhere in this project. The store has no outcome
 # label, and the success signal Kandev computes counts budget-blocked and user-stopped runs as
@@ -91,13 +90,21 @@ measures:
     format_preset: currency_usd
     valid_percent_of_total: false
 
+  # Compatibility ID retained; this is allocation shape, not a confidence score.
   - name: clean_attribution_share
-    display_name: Clean attribution share
+    display_name: Single-label allocation share
     description: >-
-      How much of this row's spend came from a billing window that sat entirely inside one
-      step, rather than crossing a boundary and being assigned by message-count majority. Read
-      every other ratio on the row through it.
+      Spend labelled by a board stamp or a one-slice session window. A high share does not
+      establish economic work ownership: recovered sessions and cumulative usage can bill
+      earlier activity under a later board position. No exact stage-cost claim is supported.
     expression: SUM(clean_cost_subcents) / NULLIF(SUM(cost_subcents), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: board_stamp_cost_share
+    display_name: Board-stamped spend share
+    description: Spend with a board position observed at turn start; work ownership remains unverified.
+    expression: SUM(board_stamp_cost_subcents) / NULLIF(SUM(cost_subcents), 0)
     format_preset: percentage
     valid_percent_of_total: false
 

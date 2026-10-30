@@ -54,7 +54,7 @@ export function createStepAnalysisAction(host) {
 
     var ready = ledger && ledger.state === "ok";
     var label = ready
-      ? fmtUsd(ledger.total) + " attributed across workflow steps" +
+      ? fmtUsd(ledger.total) + " allocated across board steps" +
         (ledger.external ? "; " + ledger.external + " external calls are unpriced" : "")
       : "Open step analysis";
 

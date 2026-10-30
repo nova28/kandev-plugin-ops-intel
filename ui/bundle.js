@@ -222,6 +222,14 @@
     return "hsl(" + h + ", 34%, 55%)";
   }
 
+  // These describe label provenance only, never economic ownership of a billing interval.
+  function stepSourceDescription(basis) {
+    if (basis === "stamp") return "Step source: board stamps; billed work ownership unverified";
+    if (basis === "inferred") return "Step source: inferred session windows; billed work ownership unverified";
+    if (basis === "mixed") return "Step source: board stamps + inferred windows; billed work ownership unverified";
+    return null;
+  }
+
 
   // ====================================================================================
   // ui/src/clipboard.mjs
@@ -725,7 +733,7 @@
     // 2026-08-16 turn_id cutover; part of its rail is read and part reconstructed.
     //
     // A card with neither (no attributed spend at all) is null, not "stamp" — an empty sum is
-    // not evidence of an exact reading.
+    // not evidence even of a board-position reading.
     var stamped = src ? Number(src.stamped || 0) : 0;
     var inferred = src ? Number(src.inferred || 0) : 0;
     var stepBasis = !src || (!stamped && !inferred) ? null
@@ -1980,13 +1988,9 @@
             return a == null ? null : jsx("div", null,
               "Snapshot " + fmtDuration(a) + " old");
           })(),
-          data.stepBasis === "stamp"
-            ? jsx("div", null, "Step source: turn stamps (exact)")
-            : data.stepBasis === "inferred"
-              ? jsx("div", null, "Step source: billing windows (approximate)")
-              : data.stepBasis === "mixed"
-                ? jsx("div", null, "Step source: turn stamps + billing windows")
-                : null,
+          stepSourceDescription(data.stepBasis)
+            ? jsx("div", null, stepSourceDescription(data.stepBasis))
+            : null,
           data.verdict > 0
             ? jsx("div", null, fmtUsd(data.verdict) + " uses multi-step attribution")
             : null,
@@ -2073,7 +2077,7 @@
 
       var ready = ledger && ledger.state === "ok";
       var label = ready
-        ? fmtUsd(ledger.total) + " attributed across workflow steps" +
+        ? fmtUsd(ledger.total) + " allocated across board steps" +
           (ledger.external ? "; " + ledger.external + " external calls are unpriced" : "")
         : "Open step analysis";
 

@@ -525,7 +525,7 @@ function withSource(rows) {
   return assembleLedger(cost, [], [], [], ORDER, [], [{ in_snapshot: 1 }], [], rows);
 }
 
-test("a card attributed entirely from turn stamps is reported as exact", () => {
+test("a card allocated entirely from turn stamps reports its observation source", () => {
   assert.equal(withSource([{ stamped: 5000, inferred: 0 }]).stepBasis, "stamp");
 });
 
