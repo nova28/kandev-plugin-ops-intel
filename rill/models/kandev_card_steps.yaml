@@ -27,10 +27,9 @@
 # carried for the same reason it is carried there: at a low clean share this row's ratios
 # describe an attribution guess as much as they describe the step. Read them together.
 #
-# `clean` means 'turn stamp' OR 'window sat in one step'. The first is exact and the second
-# is a sound inference; what it excludes is the majority-verdict case. Do not narrow it back
-# to the window value alone — that would drop every post-2026-08-16 row, which is to say all
-# the rows whose attribution is a reading rather than a guess.
+# `clean_cost_subcents` is a compatibility name for single-label allocation dollars:
+# board-stamped OR one-slice-window rows. It is NOT verified economic work attribution.
+# A recovered session can have a board stamp from another stage and flush prior usage.
 type: model
 materialize: true
 
@@ -50,6 +49,8 @@ sql: |
           -- `top_model` to whichever alias happened to appear more often.
           mode(model_family)                    AS top_model,
           COUNT(DISTINCT model_family)          AS models_used,
+          SUM(cost_subcents) FILTER (WHERE step_attribution_basis = 'turn stamp')
+                                                AS board_stamp_cost_subcents,
           SUM(cost_subcents) FILTER (WHERE step_attribution_basis IN ('turn stamp', 'window sat in one step'))
                                                 AS clean_cost_subcents
       FROM kandev_cost
@@ -163,6 +164,7 @@ sql: |
       COALESCE(c.top_model, '(no metered spend)') AS top_model,
       COALESCE(c.models_used, 0)          AS models_used,
       COALESCE(c.clean_cost_subcents, 0)  AS clean_cost_subcents,
+      COALESCE(c.board_stamp_cost_subcents, 0) AS board_stamp_cost_subcents,
 
       COALESCE(t.turns, 0)                AS turns,
       COALESCE(t.sessions, 0)             AS sessions,

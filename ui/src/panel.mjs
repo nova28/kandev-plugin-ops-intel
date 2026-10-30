@@ -21,7 +21,7 @@ import { copyTextToClipboard } from "./clipboard.mjs";
 // Two lines from one module because the build takes only single-line named imports; it says
 // so loudly rather than emitting a bundle with a stray `import` in it.
 import { fmtUsd, fmtDuration, fmtCount, modelColor, OFF_LEDGER } from "./format.mjs";
-import { fmtMTok, fmtTokenSplit, snapshotAge } from "./format.mjs";
+import { fmtMTok, fmtTokenSplit, snapshotAge, stepSourceDescription } from "./format.mjs";
 import { loadTaskLedger, stepSegments, stepTotal, mergeBy } from "./ledger.mjs";
 import { lastQueryError } from "./rill.mjs";
 
@@ -927,13 +927,9 @@ export function createTaskCostPanel(host) {
           return a == null ? null : jsx("div", null,
             "Snapshot " + fmtDuration(a) + " old");
         })(),
-        data.stepBasis === "stamp"
-          ? jsx("div", null, "Step source: turn stamps (exact)")
-          : data.stepBasis === "inferred"
-            ? jsx("div", null, "Step source: billing windows (approximate)")
-            : data.stepBasis === "mixed"
-              ? jsx("div", null, "Step source: turn stamps + billing windows")
-              : null,
+        stepSourceDescription(data.stepBasis)
+          ? jsx("div", null, stepSourceDescription(data.stepBasis))
+          : null,
         data.verdict > 0
           ? jsx("div", null, fmtUsd(data.verdict) + " uses multi-step attribution")
           : null,

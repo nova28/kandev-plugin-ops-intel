@@ -2,9 +2,8 @@ module github.com/nova28/kandev-plugin-ops-intel
 
 go 1.26.0
 
-// Private plugin: the Kandev module is not published to a proxy, so the SDK is
-// resolved from the local checkout. Repoint this if the checkout moves.
-require github.com/kandev/kandev v0.0.0
+// Resolve the public SDK from the sibling Kandev checkout (pluginsdk/ since #4534).
+require github.com/kdlbs/kandev/pluginsdk v0.0.0
 
 require (
 	github.com/fatih/color v1.13.0 // indirect
@@ -15,12 +14,12 @@ require (
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/oklog/run v1.1.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
-	google.golang.org/grpc v1.82.1 // indirect
+	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
+	google.golang.org/grpc v1.83.2 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace github.com/kandev/kandev => ../o/kandev/apps/backend
+replace github.com/kdlbs/kandev/pluginsdk => ../o/kandev/pluginsdk

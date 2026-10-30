@@ -111,3 +111,15 @@ test("an unknowable age is null, never a fabricated number", () => {
   // Clock skew, or a snapshot stamped in the future. Better to say nothing than "-3.0h old".
   assert.equal(snapshotAge("2026-08-12T14:00:00Z", now), null);
 });
+
+
+// Recovered sessions can work Review while the card stamp reads Create MR.
+// Every allocated label source must disclose that economic ownership is unverified.
+test("step labels never claim verified work ownership", async () => {
+  const { stepSourceDescription } = await import("../ui/src/format.mjs");
+  for (const basis of ["stamp", "inferred", "mixed"]) {
+    assert.match(stepSourceDescription(basis), /ownership unverified/);
+    assert.doesNotMatch(stepSourceDescription(basis), /\(exact\)/);
+  }
+  assert.equal(stepSourceDescription(null), null);
+});

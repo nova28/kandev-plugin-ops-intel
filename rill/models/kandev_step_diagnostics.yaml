@@ -68,15 +68,10 @@ sql: |
           mode(model_family)                    AS top_model,
           COUNT(DISTINCT model_family)          AS models_used,
 
-          -- HOW SOLID IS THIS ROW'S STEP ASSIGNMENT. `step_attributed = 'yes'` is a coarse
-          -- filter: it admits both an event whose billing window sat entirely inside one step
-          -- and one whose window crossed a boundary and was assigned to whichever step held
-          -- the majority of its messages. Only 47% of spend in this store is the former.
-          --
-          -- Carrying this is not bookkeeping. Blending the two silently is what let PR Fixup
-          -- read 725:1 input:output — "the worst churn on the board" — when the figure
-          -- restricted to clean windows is 524:1, against Build's 523. The ratio was an
-          -- artifact of soft attribution and one card, and nothing on the step table said so.
+          -- Legacy `clean` name means single-label allocation, not economic certainty.
+          -- Stamps observe board position; one-slice windows describe a session timeline.
+          SUM(cost_subcents) FILTER (WHERE step_attribution_basis = 'turn stamp')
+                                                AS board_stamp_cost_subcents,
           SUM(cost_subcents) FILTER (WHERE step_attribution_basis IN ('turn stamp', 'window sat in one step'))
                                                 AS clean_cost_subcents
       FROM kandev_cost
@@ -215,6 +210,7 @@ sql: |
       COALESCE(c.top_model, '(no metered spend)')   AS top_model,
       COALESCE(c.models_used, 0)          AS models_used,
       COALESCE(c.clean_cost_subcents, 0)  AS clean_cost_subcents,
+      COALESCE(c.board_stamp_cost_subcents, 0) AS board_stamp_cost_subcents,
 
       COALESCE(t.turns, 0)                AS turns,
       COALESCE(t.sessions, 0)             AS sessions,

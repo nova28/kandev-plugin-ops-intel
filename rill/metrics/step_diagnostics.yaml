@@ -192,16 +192,21 @@ measures:
     expression: SUM(cost_events)
     format_preset: humanize
 
+  # Compatibility ID retained; this is allocation shape, not a confidence score.
   - name: clean_attribution_share
-    display_name: Share of spend cleanly attributed
+    display_name: Single-label allocation share
     description: >-
-      How much of this row's spend came from a billing window that sat entirely inside one
-      step, rather than one that crossed a boundary and was assigned by message-count
-      majority. Read every other ratio on this row through it: at a low share the step's
-      figures are describing an attribution guess as much as the step. PR Fixup reads 725:1
-      input:output overall and 524:1 restricted to clean windows — indistinguishable from
-      Build — and nothing here said so until this measure existed.
+      Spend labelled by a board stamp or a one-slice session window. A high share does not
+      establish economic work ownership: recovered sessions and cumulative usage can bill
+      earlier activity under a later board position. No exact stage-cost claim is supported.
     expression: SUM(clean_cost_subcents) / NULLIF(SUM(cost_subcents), 0)
+    format_preset: percentage
+    valid_percent_of_total: false
+
+  - name: board_stamp_cost_share
+    display_name: Board-stamped spend share
+    description: Spend with a board position observed at turn start; work ownership remains unverified.
+    expression: SUM(board_stamp_cost_subcents) / NULLIF(SUM(cost_subcents), 0)
     format_preset: percentage
     valid_percent_of_total: false
 

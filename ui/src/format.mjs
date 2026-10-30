@@ -125,3 +125,11 @@ export function modelColor(name) {
   for (var j = 0; j < n.length; j++) h = (h * 31 + n.charCodeAt(j)) % 360;
   return "hsl(" + h + ", 34%, 55%)";
 }
+
+// These describe label provenance only, never economic ownership of a billing interval.
+export function stepSourceDescription(basis) {
+  if (basis === "stamp") return "Step source: board stamps; billed work ownership unverified";
+  if (basis === "inferred") return "Step source: inferred session windows; billed work ownership unverified";
+  if (basis === "mixed") return "Step source: board stamps + inferred windows; billed work ownership unverified";
+  return null;
+}
