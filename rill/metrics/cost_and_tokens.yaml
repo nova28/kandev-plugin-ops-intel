@@ -46,7 +46,7 @@ dimensions:
     display_name: Workflow
     column: workflow
   - name: step_at_event
-    display_name: Step (when spent)
+    display_name: Board-step allocation
     column: step_at_event
     description: >-
       The board-step allocation label, from a turn stamp or reconstructed session window.
